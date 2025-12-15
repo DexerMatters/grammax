@@ -1,189 +1,411 @@
+use core::fmt;
 use std::{collections::HashSet, ops};
 
-use crate::words::Matcher;
+use crate::words::{EndOfInput, Matcher, StartOfInput};
 
 #[derive(Debug, Clone, Copy)]
 pub enum GrammarError {
-    NoTermination,
+    UndecidableRule(&'static str),
+    AlwaysFails,
 }
 
 pub type Result<T> = std::result::Result<T, GrammarError>;
 
-pub type Rule = fn() -> Grammar;
+pub type Rule = fn() -> GrammarNode;
 
-pub enum Grammar {
+pub enum GrammarNode {
     Terminal(Box<dyn Matcher>),
-    Choice(Vec<Grammar>),
-    Sequence(Vec<Grammar>),
-    Reference(Rule),
+    Choice(Vec<GrammarNode>),
+    Sequence(Vec<GrammarNode>),
+    Reference(Rule, &'static str),
+}
+
+pub(crate) enum _GrammarNode {
+    Terminal(Box<dyn Matcher>),
+    Choice(Vec<_GrammarNode>),
+    Sequence(Vec<_GrammarNode>),
+    Tagged(usize, Box<_GrammarNode>),
+    Mu(usize),
+}
+
+pub struct Grammar {
+    nodes: Option<_GrammarNode>,
+    rules: Vec<_GrammarNode>,
+    tags: Vec<&'static str>,
 }
 
 impl Grammar {
-    pub fn eval(&self) -> Option<GrammarError> {
-        todo!()
+    pub fn new(grammar: GrammarNode) -> Result<Self> {
+        let mut g = Grammar {
+            nodes: None,
+            rules: Vec::new(),
+            tags: Vec::new(),
+        };
+        g.normalize(grammar);
+
+        if let Some(rule_idx) = g.undecidable_rule() {
+            return Err(GrammarError::UndecidableRule(g.tags[rule_idx]));
+        }
+
+        Ok(g)
     }
 
-    pub fn is_terminable(&self) -> Option<Rule> {
-        fn helper(g: &Grammar, visited: &mut HashSet<usize>) -> Option<Rule> {
+    fn normalize(&mut self, g: GrammarNode) {
+        if self.nodes.is_some() {
+            return;
+        }
+
+        use std::collections::HashMap;
+
+        let mut rule_map: HashMap<usize, usize> = HashMap::new();
+        let mut stack: HashSet<usize> = HashSet::new();
+
+        fn helper(
+            g: GrammarNode,
+            rules: &mut Vec<_GrammarNode>,
+            tags: &mut Vec<&'static str>,
+            rule_map: &mut HashMap<usize, usize>,
+            stack: &mut HashSet<usize>,
+        ) -> _GrammarNode {
             match g {
-                Grammar::Terminal(_) => None,
-                Grammar::Choice(gs) | Grammar::Sequence(gs) => {
-                    for g in gs {
-                        if let Some(r) = helper(g, visited) {
-                            return Some(r);
-                        }
-                    }
-                    None
+                GrammarNode::Terminal(matcher) => _GrammarNode::Terminal(matcher),
+                GrammarNode::Choice(choices) => {
+                    let normalized_choices: Vec<_GrammarNode> = choices
+                        .into_iter()
+                        .map(|c| helper(c, rules, tags, rule_map, stack))
+                        .collect();
+                    _GrammarNode::Choice(normalized_choices)
                 }
-                Grammar::Reference(r) => {
-                    let ptr = *r as usize;
-                    if visited.contains(&ptr) {
-                        return Some(*r);
+                GrammarNode::Sequence(seq) => {
+                    let normalized_seq: Vec<_GrammarNode> = seq
+                        .into_iter()
+                        .map(|s| helper(s, rules, tags, rule_map, stack))
+                        .collect();
+                    _GrammarNode::Sequence(normalized_seq)
+                }
+                GrammarNode::Reference(rule, name) => {
+                    let rule_ptr = rule as usize;
+
+                    // Check if we're in a recursive loop
+                    if stack.contains(&rule_ptr) {
+                        let rule_index = *rule_map
+                            .get(&rule_ptr)
+                            .expect("Rule should be in map if it's on the stack");
+                        return _GrammarNode::Mu(rule_index);
                     }
-                    visited.insert(ptr);
-                    helper(&r(), visited)
+
+                    // Check if we've already processed this rule
+                    if let Some(&rule_index) = rule_map.get(&rule_ptr) {
+                        return _GrammarNode::Mu(rule_index);
+                    }
+
+                    // Allocate a new rule index
+                    let rule_index = rules.len();
+                    rule_map.insert(rule_ptr, rule_index);
+                    tags.push(name);
+
+                    // Reserve space in rules vector with a placeholder
+                    // We use EndOfInput as a temporary placeholder
+                    rules.push(_GrammarNode::Terminal(Box::new(EndOfInput)));
+
+                    // Mark this rule as being processed (on the stack)
+                    stack.insert(rule_ptr);
+
+                    // Expand the rule first to get its content
+                    let expanded = helper(rule(), rules, tags, rule_map, stack);
+
+                    // Remove from stack after processing
+                    stack.remove(&rule_ptr);
+
+                    // Update the rule in the rules vector
+                    let tagged = _GrammarNode::Tagged(rule_index, Box::new(expanded));
+                    rules[rule_index] = tagged;
+
+                    _GrammarNode::Mu(rule_index)
                 }
             }
         }
-        let mut visited = HashSet::new();
-        helper(self, &mut visited)
+
+        let node = helper(
+            g,
+            &mut self.rules,
+            &mut self.tags,
+            &mut rule_map,
+            &mut stack,
+        );
+        self.nodes = Some(node);
     }
 
-    pub fn will_always_fail(&self) -> bool {}
+    fn undecidable_rule(&self) -> Option<usize> {
+        let n = self.rules.len();
+        let mut nullable = vec![false; n];
+        let mut changed = true;
+
+        // Fixpoint computation for nullable
+        while changed {
+            changed = false;
+            for (i, rule) in self.rules.iter().enumerate() {
+                if !nullable[i] {
+                    if self.is_nullable(rule, &nullable) {
+                        nullable[i] = true;
+                        changed = true;
+                    }
+                }
+            }
+        }
+
+        // Cycle detection
+        let mut visited = vec![false; n];
+        let mut stack = vec![false; n];
+
+        for i in 0..n {
+            if self.find_cycle(i, &nullable, &mut visited, &mut stack) {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    fn is_nullable(&self, node: &_GrammarNode, nullable_rules: &[bool]) -> bool {
+        match node {
+            _GrammarNode::Terminal(m) => m.is_nullable(),
+            _GrammarNode::Choice(opts) => opts.iter().any(|o| self.is_nullable(o, nullable_rules)),
+            _GrammarNode::Sequence(seq) => seq.iter().all(|s| self.is_nullable(s, nullable_rules)),
+            _GrammarNode::Tagged(_, inner) => self.is_nullable(inner, nullable_rules),
+            _GrammarNode::Mu(idx) => nullable_rules[*idx],
+        }
+    }
+
+    fn find_cycle(
+        &self,
+        idx: usize,
+        nullable_rules: &[bool],
+        visited: &mut [bool],
+        stack: &mut [bool],
+    ) -> bool {
+        if stack[idx] {
+            return true;
+        }
+        if visited[idx] {
+            return false;
+        }
+
+        visited[idx] = true;
+        stack[idx] = true;
+
+        let calls = self.get_non_consuming_calls(&self.rules[idx], nullable_rules);
+        for target in calls {
+            if self.find_cycle(target, nullable_rules, visited, stack) {
+                return true;
+            }
+        }
+
+        stack[idx] = false;
+        false
+    }
+
+    fn get_non_consuming_calls(&self, node: &_GrammarNode, nullable_rules: &[bool]) -> Vec<usize> {
+        let mut calls = Vec::new();
+        match node {
+            _GrammarNode::Terminal(_) => {}
+            _GrammarNode::Choice(opts) => {
+                for o in opts {
+                    calls.extend(self.get_non_consuming_calls(o, nullable_rules));
+                }
+            }
+            _GrammarNode::Sequence(seq) => {
+                for item in seq {
+                    calls.extend(self.get_non_consuming_calls(item, nullable_rules));
+                    if !self.is_nullable(item, nullable_rules) {
+                        break;
+                    }
+                }
+            }
+            _GrammarNode::Tagged(_, inner) => {
+                calls.extend(self.get_non_consuming_calls(inner, nullable_rules))
+            }
+            _GrammarNode::Mu(idx) => calls.push(*idx),
+        }
+        calls
+    }
 }
 
-pub fn t<M>(s: M) -> Grammar
+impl fmt::Display for Grammar {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Helper function to format _GrammarNode
+        fn format_node(
+            node: &_GrammarNode,
+            f: &mut fmt::Formatter<'_>,
+            tags: &[&'static str],
+            in_sequence: bool,
+        ) -> fmt::Result {
+            match node {
+                _GrammarNode::Terminal(matcher) => {
+                    write!(f, "{}", matcher.display())
+                }
+                _GrammarNode::Choice(choices) => {
+                    if in_sequence {
+                        write!(f, "( ")?;
+                    }
+                    for (i, choice) in choices.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, " | ")?;
+                        }
+                        format_node(choice, f, tags, false)?;
+                    }
+                    if in_sequence {
+                        write!(f, " )")?;
+                    }
+                    Ok(())
+                }
+                _GrammarNode::Sequence(seq) => {
+                    for (i, item) in seq.iter().enumerate() {
+                        if i > 0 {
+                            write!(f, " ")?;
+                        }
+                        format_node(item, f, tags, true)?;
+                    }
+                    Ok(())
+                }
+                _GrammarNode::Tagged(idx, _inner) => write!(f, "<{}>", tags[*idx]),
+                _GrammarNode::Mu(idx) => write!(f, "<{}>", tags[*idx]),
+            }
+        }
+
+        // Write the main grammar if it exists
+        if let Some(ref node) = self.nodes {
+            format_node(node, f, &self.tags, false)?;
+            writeln!(f)?;
+        }
+
+        // Write all the rules in BNF format
+        for rule in self.rules.iter() {
+            // Extract the tag index and inner content from Tagged wrapper
+            if let _GrammarNode::Tagged(tag_idx, inner) = rule {
+                write!(f, "<{}> ::= ", self.tags[*tag_idx])?;
+                format_node(inner, f, &self.tags, false)?;
+                writeln!(f)?;
+            } else {
+                // This shouldn't happen, but handle it gracefully
+                format_node(rule, f, &self.tags, false)?;
+                writeln!(f)?;
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[inline]
+pub fn t<M>(s: M) -> GrammarNode
 where
     M: Matcher + 'static,
 {
-    Grammar::Terminal(Box::new(s))
+    GrammarNode::Terminal(Box::new(s))
 }
 
-pub fn r(f: fn() -> Grammar) -> Grammar {
-    Grammar::Reference(f)
+#[macro_export]
+macro_rules! r {
+    ($f:expr) => {
+        GrammarNode::Reference($f, stringify!($f))
+    };
 }
 
-impl ops::Add for Grammar {
-    type Output = Grammar;
+#[inline]
+pub fn r_named(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
+    GrammarNode::Reference(f, name)
+}
 
-    fn add(self, rhs: Grammar) -> Grammar {
+#[inline]
+pub fn end() -> GrammarNode {
+    t(EndOfInput)
+}
+
+#[inline]
+pub fn start() -> GrammarNode {
+    t(StartOfInput)
+}
+
+#[inline]
+pub fn choice<I>(choices: I) -> GrammarNode
+where
+    I: IntoIterator<Item = GrammarNode>,
+{
+    GrammarNode::Choice(choices.into_iter().collect())
+}
+
+#[inline]
+pub fn seq<I>(seq: I) -> GrammarNode
+where
+    I: IntoIterator<Item = GrammarNode>,
+{
+    GrammarNode::Sequence(seq.into_iter().collect())
+}
+
+impl ops::Add for GrammarNode {
+    type Output = GrammarNode;
+
+    fn add(self, rhs: GrammarNode) -> GrammarNode {
         match (self, rhs) {
-            (Grammar::Sequence(mut left_seq), Grammar::Sequence(right_seq)) => {
+            (GrammarNode::Sequence(mut left_seq), GrammarNode::Sequence(right_seq)) => {
                 left_seq.extend(right_seq);
-                Grammar::Sequence(left_seq)
+                GrammarNode::Sequence(left_seq)
             }
-            (Grammar::Sequence(mut left_seq), right) => {
+            (GrammarNode::Sequence(mut left_seq), right) => {
                 left_seq.push(right);
-                Grammar::Sequence(left_seq)
+                GrammarNode::Sequence(left_seq)
             }
-            (left, Grammar::Sequence(mut right_seq)) => {
+            (left, GrammarNode::Sequence(mut right_seq)) => {
                 let mut new_seq = vec![left];
                 new_seq.append(&mut right_seq);
-                Grammar::Sequence(new_seq)
+                GrammarNode::Sequence(new_seq)
             }
-            (left, right) => Grammar::Sequence(vec![left, right]),
+            (left, right) => GrammarNode::Sequence(vec![left, right]),
         }
     }
 }
 
-impl ops::BitOr for Grammar {
-    type Output = Grammar;
+impl ops::BitOr for GrammarNode {
+    type Output = GrammarNode;
 
-    fn bitor(self, rhs: Grammar) -> Grammar {
+    fn bitor(self, rhs: GrammarNode) -> GrammarNode {
         match (self, rhs) {
-            (Grammar::Choice(mut left_choices), Grammar::Choice(right_choices)) => {
+            (GrammarNode::Choice(mut left_choices), GrammarNode::Choice(right_choices)) => {
                 left_choices.extend(right_choices);
-                Grammar::Choice(left_choices)
+                GrammarNode::Choice(left_choices)
             }
-            (Grammar::Choice(mut left_choices), right) => {
+            (GrammarNode::Choice(mut left_choices), right) => {
                 left_choices.push(right);
-                Grammar::Choice(left_choices)
+                GrammarNode::Choice(left_choices)
             }
-            (left, Grammar::Choice(mut right_choices)) => {
+            (left, GrammarNode::Choice(mut right_choices)) => {
                 let mut new_choices = vec![left];
                 new_choices.append(&mut right_choices);
-                Grammar::Choice(new_choices)
+                GrammarNode::Choice(new_choices)
             }
-            (left, right) => Grammar::Choice(vec![left, right]),
+            (left, right) => GrammarNode::Choice(vec![left, right]),
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::any::type_name_of_val;
-
     use super::*;
 
     #[test]
-    fn test_choice_combination() {
-        fn test() -> Grammar {
-            t("expr") | t("term") | t("factor")
+    fn display_grammar() {
+        fn a() -> GrammarNode {
+            t("a") + r!(a) + end() | r!(b)
         }
 
-        println!("{}", type_name_of_val(&test));
-    }
-
-    #[test]
-    fn test_is_terminable() {
-        // A = A @ T and A = T @ A are terminable
-        // A = A and A = B; B = A are non-terminable
-
-        // Case 1: A = A + T (Sequence)
-        fn rule_a_seq() -> Grammar {
-            r(rule_a_seq) + t("T")
+        fn b() -> GrammarNode {
+            r![a] | t("b") | t("c")
         }
-        assert!(
-            rule_a_seq().is_terminable().is_none(),
-            "A = A + T should be terminable"
-        );
 
-        // Case 2: A = T + A (Sequence)
-        fn rule_a_seq_2() -> Grammar {
-            t("T") + r(rule_a_seq_2)
+        let grammar = Grammar::new(r!(a));
+        match grammar {
+            Ok(g) => println!("{}", g),
+            Err(e) => println!("Error: {:?}", e),
         }
-        assert!(
-            rule_a_seq_2().is_terminable().is_none(),
-            "A = T + A should be terminable"
-        );
-
-        // Case 3: A = A | T (Choice)
-        fn rule_a_choice() -> Grammar {
-            r(rule_a_choice) | t("T")
-        }
-        assert!(
-            rule_a_choice().is_terminable().is_none(),
-            "A = A | T should be terminable"
-        );
-
-        // Case 4: A = T | A (Choice)
-        fn rule_a_choice_2() -> Grammar {
-            t("T") | r(rule_a_choice_2)
-        }
-        assert!(
-            rule_a_choice_2().is_terminable().is_none(),
-            "A = T | A should be terminable"
-        );
-
-        // Case 5: A = A (Loop)
-        fn rule_loop() -> Grammar {
-            r(rule_loop)
-        }
-        assert!(
-            rule_loop().is_terminable().is_some(),
-            "A = A should be non-terminable"
-        );
-
-        // Case 6: A = B; B = A (Mutual Loop)
-        fn rule_b() -> Grammar {
-            r(rule_a_mutual)
-        }
-        fn rule_a_mutual() -> Grammar {
-            r(rule_b)
-        }
-        assert!(
-            rule_a_mutual().is_terminable().is_some(),
-            "A = B; B = A should be non-terminable"
-        );
     }
 }

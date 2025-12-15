@@ -4,3 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+concurrent-queue = "2.5.0"
+dashmap = "6.1.0"
+parking_lot = "0.12.5"

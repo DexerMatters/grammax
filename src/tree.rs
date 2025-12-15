@@ -6,56 +6,39 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::grammar::GrammarError;
+use crate::words::Span;
+
 type GreenId = usize;
 
-type RuleId = usize;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl Span {
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-}
-
-impl ops::Add for Span {
-    type Output = Span;
-
-    fn add(self, other: Span) -> Span {
-        Span {
-            start: self.start,
-            end: other.end,
-        }
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Tag {
+    Rule(usize),
+    Error(GrammarError),
 }
 
 pub struct RedNode {
     pub parent: Option<Box<RedNode>>,
-    pub span: Span,
-    pub data: GreenId,
+    pub offset: usize,
+    pub green: GreenId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GreenNode {
-    pub rule_id: RuleId,
+    pub tag: Tag,
+    pub width: usize,
     pub children: Vec<GreenId>,
 }
 
 pub(crate) struct TreeAlloc {
-    nodes: Vec<GreenNode>,
+    nodes: boxcar::Vec<GreenNode>,
     dedup: DashMap<u64, Vec<usize>>,
 }
-
-pub(crate) type TreeArena = Arc<TreeAlloc>;
 
 impl TreeAlloc {
     pub fn new() -> Self {
         Self {
-            nodes: Vec::new(),
+            nodes: boxcar::Vec::new(),
             dedup: DashMap::new(),
         }
     }
@@ -64,8 +47,12 @@ impl TreeAlloc {
         &self.nodes[id]
     }
 
-    pub fn alloc(&mut self, rule_id: RuleId, children: Vec<GreenId>) -> GreenId {
-        let node = GreenNode { rule_id, children };
+    pub fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId {
+        let node = GreenNode {
+            tag,
+            children,
+            width,
+        };
 
         let mut hasher = DefaultHasher::new();
         node.hash(&mut hasher);
@@ -79,9 +66,13 @@ impl TreeAlloc {
             }
         }
 
-        let idx = self.nodes.len();
+        let idx = self.nodes.count();
         self.nodes.push(node);
         self.dedup.entry(hash).or_default().push(idx);
         idx
+    }
+
+    pub fn new_placeholder(&self, width: usize) -> GreenId {
+        self.alloc(Tag::Error(GrammarError::Placeholder), vec![], width)
     }
 }

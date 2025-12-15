@@ -3,13 +3,20 @@ use std::{collections::HashSet, ops};
 
 use crate::words::{EndOfInput, Matcher, StartOfInput};
 
-#[derive(Debug, Clone, Copy)]
-pub enum GrammarError {
-    UndecidableRule(&'static str),
+#[derive(Debug, Clone)]
+pub enum EvaluationError {
+    UndecidableRule(String),
     AlwaysFails,
 }
 
-pub type Result<T> = std::result::Result<T, GrammarError>;
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum GrammarError {
+    Placeholder,
+    RuleMismatch { expected: usize },
+    TokenMismatch { expected: String },
+}
+
+pub type Result<T> = std::result::Result<T, EvaluationError>;
 
 pub type Rule = fn() -> GrammarNode;
 
@@ -18,6 +25,9 @@ pub enum GrammarNode {
     Choice(Vec<GrammarNode>),
     Sequence(Vec<GrammarNode>),
     Reference(Rule, &'static str),
+    Optional(Box<GrammarNode>),
+    Some(Box<GrammarNode>),
+    Many(Box<GrammarNode>),
 }
 
 pub(crate) enum _GrammarNode {
@@ -25,13 +35,12 @@ pub(crate) enum _GrammarNode {
     Choice(Vec<_GrammarNode>),
     Sequence(Vec<_GrammarNode>),
     Tagged(usize, Box<_GrammarNode>),
-    Mu(usize),
 }
 
 pub struct Grammar {
     nodes: Option<_GrammarNode>,
     rules: Vec<_GrammarNode>,
-    tags: Vec<&'static str>,
+    tags: Vec<String>,
 }
 
 impl Grammar {
@@ -44,7 +53,7 @@ impl Grammar {
         g.normalize(grammar);
 
         if let Some(rule_idx) = g.undecidable_rule() {
-            return Err(GrammarError::UndecidableRule(g.tags[rule_idx]));
+            return Err(EvaluationError::UndecidableRule(g.tags[rule_idx].clone()));
         }
 
         Ok(g)
@@ -63,25 +72,27 @@ impl Grammar {
         fn helper(
             g: GrammarNode,
             rules: &mut Vec<_GrammarNode>,
-            tags: &mut Vec<&'static str>,
+            tags: &mut Vec<String>,
             rule_map: &mut HashMap<usize, usize>,
             stack: &mut HashSet<usize>,
+            parent_name: Option<&str>,
         ) -> _GrammarNode {
+            use _GrammarNode::*;
             match g {
-                GrammarNode::Terminal(matcher) => _GrammarNode::Terminal(matcher),
+                GrammarNode::Terminal(matcher) => Terminal(matcher),
                 GrammarNode::Choice(choices) => {
                     let normalized_choices: Vec<_GrammarNode> = choices
                         .into_iter()
-                        .map(|c| helper(c, rules, tags, rule_map, stack))
+                        .map(|c| helper(c, rules, tags, rule_map, stack, parent_name))
                         .collect();
-                    _GrammarNode::Choice(normalized_choices)
+                    Choice(normalized_choices)
                 }
                 GrammarNode::Sequence(seq) => {
                     let normalized_seq: Vec<_GrammarNode> = seq
                         .into_iter()
-                        .map(|s| helper(s, rules, tags, rule_map, stack))
+                        .map(|s| helper(s, rules, tags, rule_map, stack, parent_name))
                         .collect();
-                    _GrammarNode::Sequence(normalized_seq)
+                    Sequence(normalized_seq)
                 }
                 GrammarNode::Reference(rule, name) => {
                     let rule_ptr = rule as usize;
@@ -91,37 +102,91 @@ impl Grammar {
                         let rule_index = *rule_map
                             .get(&rule_ptr)
                             .expect("Rule should be in map if it's on the stack");
-                        return _GrammarNode::Mu(rule_index);
+                        return Mu(rule_index);
                     }
 
                     // Check if we've already processed this rule
                     if let Some(&rule_index) = rule_map.get(&rule_ptr) {
-                        return _GrammarNode::Mu(rule_index);
+                        return Mu(rule_index);
                     }
 
                     // Allocate a new rule index
                     let rule_index = rules.len();
                     rule_map.insert(rule_ptr, rule_index);
-                    tags.push(name);
+                    tags.push(name.to_string());
 
                     // Reserve space in rules vector with a placeholder
                     // We use EndOfInput as a temporary placeholder
-                    rules.push(_GrammarNode::Terminal(Box::new(EndOfInput)));
+                    rules.push(Terminal(Box::new(EndOfInput)));
 
                     // Mark this rule as being processed (on the stack)
                     stack.insert(rule_ptr);
 
                     // Expand the rule first to get its content
-                    let expanded = helper(rule(), rules, tags, rule_map, stack);
+                    let expanded = helper(rule(), rules, tags, rule_map, stack, Some(name));
 
                     // Remove from stack after processing
                     stack.remove(&rule_ptr);
 
                     // Update the rule in the rules vector
-                    let tagged = _GrammarNode::Tagged(rule_index, Box::new(expanded));
+                    let tagged = Tagged(rule_index, Box::new(expanded));
                     rules[rule_index] = tagged;
 
-                    _GrammarNode::Mu(rule_index)
+                    Mu(rule_index)
+                }
+                GrammarNode::Optional(inner) => {
+                    let inner_node = helper(*inner, rules, tags, rule_map, stack, parent_name);
+                    let epsilon = Terminal(Box::new(""));
+                    Choice(vec![inner_node, epsilon])
+                }
+                GrammarNode::Many(inner) => {
+                    let rule_index = rules.len();
+                    let name = parent_name.unwrap_or("anonymous");
+                    let new_tag = format!("_{}", name);
+                    tags.push(new_tag.clone());
+
+                    rules.push(Terminal(Box::new(EndOfInput)));
+
+                    let inner_node = helper(*inner, rules, tags, rule_map, stack, Some(&new_tag));
+
+                    let recursive = Mu(rule_index);
+                    let seq = Sequence(vec![inner_node, recursive]);
+                    let epsilon = Terminal(Box::new(""));
+                    let body = Choice(vec![seq, epsilon]);
+
+                    rules[rule_index] = Tagged(rule_index, Box::new(body));
+
+                    Mu(rule_index)
+                }
+                GrammarNode::Some(inner) => {
+                    let inner_rule_index = rules.len();
+                    let name = parent_name.unwrap_or("anonymous");
+                    let inner_tag = format!("{}_some_elem", name);
+                    tags.push(inner_tag.clone());
+
+                    rules.push(Terminal(Box::new(EndOfInput)));
+
+                    let inner_node = helper(*inner, rules, tags, rule_map, stack, Some(&inner_tag));
+                    rules[inner_rule_index] = Tagged(inner_rule_index, Box::new(inner_node));
+
+                    let inner_ref = Mu(inner_rule_index);
+
+                    let many_rule_index = rules.len();
+                    let many_tag = format!("_{}", name);
+                    tags.push(many_tag);
+
+                    rules.push(Terminal(Box::new(EndOfInput)));
+
+                    let recursive = Mu(many_rule_index);
+                    let inner_ref_for_many = Mu(inner_rule_index);
+
+                    let seq = Sequence(vec![inner_ref_for_many, recursive]);
+                    let epsilon = Terminal(Box::new(""));
+                    let body = Choice(vec![seq, epsilon]);
+
+                    rules[many_rule_index] = Tagged(many_rule_index, Box::new(body));
+
+                    Sequence(vec![inner_ref, Mu(many_rule_index)])
                 }
             }
         }
@@ -132,6 +197,7 @@ impl Grammar {
             &mut self.tags,
             &mut rule_map,
             &mut stack,
+            None,
         );
         self.nodes = Some(node);
     }
@@ -236,7 +302,7 @@ impl fmt::Display for Grammar {
         fn format_node(
             node: &_GrammarNode,
             f: &mut fmt::Formatter<'_>,
-            tags: &[&'static str],
+            tags: &[String],
             in_sequence: bool,
         ) -> fmt::Result {
             match node {
@@ -327,6 +393,21 @@ pub fn start() -> GrammarNode {
 }
 
 #[inline]
+pub fn opt(node: GrammarNode) -> GrammarNode {
+    GrammarNode::Optional(Box::new(node))
+}
+
+#[inline]
+pub fn some(node: GrammarNode) -> GrammarNode {
+    GrammarNode::Some(Box::new(node))
+}
+
+#[inline]
+pub fn many(node: GrammarNode) -> GrammarNode {
+    GrammarNode::Many(Box::new(node))
+}
+
+#[inline]
 pub fn choice<I>(choices: I) -> GrammarNode
 where
     I: IntoIterator<Item = GrammarNode>,
@@ -395,15 +476,21 @@ mod tests {
     #[test]
     fn display_grammar() {
         fn a() -> GrammarNode {
-            t("a") + r!(a) + end() | r!(b)
+            some(t("6"))
         }
 
         fn b() -> GrammarNode {
-            r![a] | t("b") | t("c")
+            many(t("7"))
         }
 
         let grammar = Grammar::new(r!(a));
         match grammar {
+            Ok(g) => println!("{}", g),
+            Err(e) => println!("Error: {:?}", e),
+        }
+
+        let grammar_b = Grammar::new(r!(b));
+        match grammar_b {
             Ok(g) => println!("{}", g),
             Err(e) => println!("Error: {:?}", e),
         }

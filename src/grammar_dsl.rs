@@ -4,12 +4,13 @@ use crate::words::Matcher;
 
 pub type RuleFn = fn() -> GrammarNode;
 
+
 pub enum GrammarNode {
     Terminal(Box<dyn Matcher>),
     Choice(Vec<GrammarNode>),
     Sequence(Vec<GrammarNode>),
     Reference(RuleFn, &'static str),
-    // Optional(Box<GrammarNode>),
+    Optional(Box<GrammarNode>),
     // Some(Box<GrammarNode>),
     // Many(Box<GrammarNode>),
 }

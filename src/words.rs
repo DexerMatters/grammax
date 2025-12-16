@@ -4,7 +4,7 @@ use std::{
     ops::{self, Index, IndexMut},
 };
 
-use crate::core::utils::Span;
+use crate::utils::Span;
 
 #[derive(Debug, Clone)]
 pub struct EndOfInput;
@@ -59,6 +59,10 @@ pub trait Matcher: Debug {
         String::from("<terminal>")
     }
     fn is_nullable(&self) -> bool;
+
+    fn is_consuming(&self) -> bool {
+        !self.is_nullable()
+    }
 
     fn then<U>(self, other: U) -> Sequence<Self, U>
     where

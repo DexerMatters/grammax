@@ -62,3 +62,7 @@ impl From<Range> for ops::RangeFrom<usize> {
         ops::RangeFrom { start: range.start }
     }
 }
+
+pub(crate) trait Unzip<A, B> {
+    fn unzip2(self) -> (Vec<A>, Vec<B>);
+}

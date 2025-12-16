@@ -6,8 +6,8 @@ use std::sync::Arc;
 
 use dashmap::DashMap;
 
+use crate::core::utils::Span;
 use crate::grammar::GrammarError;
-use crate::words::Span;
 
 type GreenId = usize;
 

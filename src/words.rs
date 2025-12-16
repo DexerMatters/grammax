@@ -1,37 +1,21 @@
 use std::{
     collections::btree_map::Range,
+    fmt::Debug,
     ops::{self, Index, IndexMut},
 };
 
+use crate::core::utils::Span;
+
+#[derive(Debug, Clone)]
 pub struct EndOfInput;
+#[derive(Debug, Clone)]
 pub struct StartOfInput;
+#[derive(Debug, Clone)]
 pub struct Alternative<T, U>(T, U);
+#[derive(Debug, Clone)]
 pub struct Sequence<T, U>(T, U);
-
+#[derive(Debug, Clone)]
 pub struct Repeat<T, R: ops::RangeBounds<usize>>(T, R);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
-}
-
-impl Span {
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-}
-
-impl ops::Add for Span {
-    type Output = Span;
-
-    fn add(self, other: Span) -> Span {
-        Span {
-            start: self.start,
-            end: other.end,
-        }
-    }
-}
 
 pub trait Lexical<T>
 where
@@ -69,7 +53,7 @@ pub struct State<'a> {
     position: usize,
 }
 
-pub trait Matcher {
+pub trait Matcher: Debug {
     fn matches(&self, state: &mut State) -> bool;
     fn display(&self) -> String {
         String::from("<terminal>")
@@ -204,7 +188,7 @@ where
 impl<R, T> Matcher for Repeat<T, R>
 where
     T: Matcher,
-    R: ops::RangeBounds<usize>,
+    R: ops::RangeBounds<usize> + Debug,
 {
     fn matches(&self, state: &mut State) -> bool {
         use std::ops::Bound;

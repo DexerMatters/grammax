@@ -5,7 +5,7 @@ use std::sync::{
 
 use concurrent_queue::ConcurrentQueue;
 
-use crate::{grammar::Grammar, tree::*, words::Span};
+use crate::{core::utils::Span, grammar::Grammar, tree::*};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Edit {

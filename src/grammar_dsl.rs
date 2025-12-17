@@ -4,15 +4,14 @@ use crate::words::Matcher;
 
 pub type RuleFn = fn() -> GrammarNode;
 
-
 pub enum GrammarNode {
     Terminal(Box<dyn Matcher>),
     Choice(Vec<GrammarNode>),
     Sequence(Vec<GrammarNode>),
     Reference(RuleFn, &'static str),
     Optional(Box<GrammarNode>),
-    // Some(Box<GrammarNode>),
-    // Many(Box<GrammarNode>),
+    Some(Box<GrammarNode>),
+    Many(Box<GrammarNode>),
 }
 
 impl GrammarNode {
@@ -28,6 +27,15 @@ pub enum NormalizedNode {
     Sequence(Vec<NormalizedNode>),
     Reference(usize),
     Placeholder,
+}
+
+impl NormalizedNode {
+    pub fn is_reference(&self) -> bool {
+        matches!(self, NormalizedNode::Reference(_))
+    }
+    pub fn null() -> Self {
+        NormalizedNode::Sequence(vec![])
+    }
 }
 
 #[inline]
@@ -48,6 +56,11 @@ pub fn choice(nodes: impl IntoIterator<Item = GrammarNode>) -> GrammarNode {
 #[inline]
 pub fn seq(nodes: impl IntoIterator<Item = GrammarNode>) -> GrammarNode {
     GrammarNode::Sequence(nodes.into_iter().collect())
+}
+
+#[inline]
+pub fn opt(node: impl Into<GrammarNode>) -> GrammarNode {
+    GrammarNode::Optional(Box::new(node.into()))
 }
 
 #[macro_export]

@@ -60,9 +60,7 @@ pub trait Matcher: Debug {
     }
     fn is_nullable(&self) -> bool;
 
-    fn is_consuming(&self) -> bool {
-        !self.is_nullable()
-    }
+    fn is_consuming(&self) -> bool;
 
     fn then<U>(self, other: U) -> Sequence<Self, U>
     where
@@ -107,6 +105,10 @@ impl Matcher for &str {
     fn is_nullable(&self) -> bool {
         self.len() == 0
     }
+
+    fn is_consuming(&self) -> bool {
+        self.len() > 0
+    }
 }
 
 impl Matcher for char {
@@ -127,6 +129,10 @@ impl Matcher for char {
     fn is_nullable(&self) -> bool {
         false
     }
+
+    fn is_consuming(&self) -> bool {
+        true
+    }
 }
 
 impl Matcher for EndOfInput {
@@ -141,6 +147,10 @@ impl Matcher for EndOfInput {
     fn is_nullable(&self) -> bool {
         true
     }
+
+    fn is_consuming(&self) -> bool {
+        false
+    }
 }
 
 impl Matcher for StartOfInput {
@@ -154,6 +164,10 @@ impl Matcher for StartOfInput {
 
     fn is_nullable(&self) -> bool {
         true
+    }
+
+    fn is_consuming(&self) -> bool {
+        false
     }
 }
 
@@ -174,6 +188,9 @@ where
     fn is_nullable(&self) -> bool {
         self.0.is_nullable() || self.1.is_nullable()
     }
+    fn is_consuming(&self) -> bool {
+        self.0.is_consuming() || self.1.is_consuming()
+    }
 }
 
 impl<T, U> Matcher for Sequence<T, U>
@@ -186,6 +203,9 @@ where
     }
     fn is_nullable(&self) -> bool {
         self.0.is_nullable() && self.1.is_nullable()
+    }
+    fn is_consuming(&self) -> bool {
+        self.0.is_consuming() || self.1.is_consuming()
     }
 }
 
@@ -233,5 +253,16 @@ where
         };
 
         min == 0 || self.0.is_nullable()
+    }
+    fn is_consuming(&self) -> bool {
+        use std::ops::Bound;
+
+        let min = match self.1.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+
+        min > 0 && self.0.is_consuming()
     }
 }

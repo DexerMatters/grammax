@@ -1,13 +1,10 @@
-use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops;
-use std::sync::Arc;
 
 use dashmap::DashMap;
 
 use crate::grammar::GrammarError;
-use crate::utils::Span;
 
 type GreenId = usize;
 
@@ -47,6 +44,10 @@ impl TreeAlloc {
         &self.nodes[id]
     }
 
+    pub fn get_node_mut(&mut self, id: GreenId) -> &mut GreenNode {
+        self.nodes.get_mut(id).unwrap()
+    }
+
     pub fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId {
         let node = GreenNode {
             tag,
@@ -74,5 +75,19 @@ impl TreeAlloc {
 
     pub fn new_placeholder(&self, width: usize) -> GreenId {
         self.alloc(Tag::Error(GrammarError::Placeholder), vec![], width)
+    }
+}
+
+impl ops::Index<GreenId> for TreeAlloc {
+    type Output = GreenNode;
+
+    fn index(&self, index: GreenId) -> &Self::Output {
+        &self.nodes[index]
+    }
+}
+
+impl ops::IndexMut<GreenId> for TreeAlloc {
+    fn index_mut(&mut self, index: GreenId) -> &mut Self::Output {
+        self.nodes.get_mut(index).unwrap()
     }
 }

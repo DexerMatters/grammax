@@ -1,14 +1,31 @@
 use core::fmt;
-use std::{collections::HashSet, hash};
+use std::hash;
 
-use indexmap::{IndexSet, set::MutableValues};
+use indexmap::IndexSet;
 
-use crate::grammar_dsl::*;
+use crate::{core::grammar::*, grammar_dsl::*};
 
 #[derive(Debug, Clone)]
 pub enum EvaluationError {
     UndecidableRule(String),
-    AlwaysFails,
+    AlwaysFails(String),
+}
+
+impl fmt::Display for EvaluationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EvaluationError::UndecidableRule(name) => {
+                write!(
+                    f,
+                    "The rule '{}' is an infinite recursion without consuming input.",
+                    name
+                )
+            }
+            EvaluationError::AlwaysFails(name) => {
+                write!(f, "The rule '{}' always fails to match input.", name)
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -18,12 +35,35 @@ pub enum GrammarError {
     TokenMismatch { expected: String },
 }
 
-pub type Result<T> = std::result::Result<T, EvaluationError>;
+pub type Result<T> = std::result::Result<T, Vec<EvaluationError>>;
 
 #[derive(Debug)]
 pub struct Rule {
-    pub name: &'static str,
+    pub name: RuleName,
     pub node: NormalizedNode,
+
+    pub properties: RuleProperties,
+}
+
+impl Rule {
+    pub fn new(name: impl Into<RuleName>, node: NormalizedNode) -> Self {
+        Self {
+            name: name.into(),
+            node,
+            properties: DEFAULT_RULE_PROPS,
+        }
+    }
+
+    pub fn placeholder(name: impl Into<RuleName>) -> Self {
+        Self {
+            name: name.into(),
+            node: NormalizedNode {
+                kind: NormalizedNodeKind::Placeholder,
+                properties: DEFAULT_RULE_NODE_PROPS,
+            },
+            properties: DEFAULT_RULE_PROPS,
+        }
+    }
 }
 
 impl hash::Hash for Rule {
@@ -45,10 +85,16 @@ pub struct Grammar {
 }
 
 impl TryFrom<GrammarNode> for Grammar {
-    type Error = EvaluationError;
+    type Error = Vec<EvaluationError>;
     fn try_from(node: GrammarNode) -> Result<Self> {
         let mut rules = IndexSet::new();
-        let start = normalize(node, &mut rules)?;
+        let mut start = normalize(node, &mut rules, &mut Vec::new())?;
+
+        // Pass 2: Update rule properties (is_recursive and is_trivial)
+        update_rule_properties(&mut rules);
+
+        // Pass 3: Inline trivial non-recursive rules
+        start = inline_trivial_rules(&mut rules, start);
 
         // Shift all references by 1 to make room for START at index 0
         let shifted_rules: IndexSet<Rule> = rules
@@ -59,25 +105,32 @@ impl TryFrom<GrammarNode> for Grammar {
             })
             .collect();
 
-        let start_rule = Rule {
-            name: "START",
-            node: shift_references(start, 1),
-        };
+        let start_rule = Rule::new("START", shift_references(start, 1));
 
         let mut final_rules = IndexSet::new();
         final_rules.insert(start_rule);
         final_rules.extend(shifted_rules);
 
-        Ok(Grammar { rules: final_rules })
+        // START is inserted after the earlier passes, so analyze properties again
+        // to populate its node properties (nullable/consuming/depths).
+        update_more_rule_properties(&mut final_rules);
+
+        // Diagnose grammar for errors
+        let errors = diagnose_grammar(&final_rules);
+        if errors.is_empty() {
+            Ok(Self { rules: final_rules })
+        } else {
+            Err(errors)
+        }
     }
 }
 
 impl fmt::Display for Grammar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use NormalizedNode as N;
+        use NormalizedNodeKind as N;
 
         fn needs_paren(node: &NormalizedNode) -> bool {
-            matches!(node, N::Choice(_))
+            matches!(node.kind, N::Choice(_))
         }
 
         fn fmt_node(
@@ -86,16 +139,12 @@ impl fmt::Display for Grammar {
             cur_idx: usize,
             f: &mut fmt::Formatter<'_>,
         ) -> fmt::Result {
-            match node {
+            match &node.kind {
                 N::Terminal(m) => write!(f, "{}", m.display()),
-                N::Reference(idx) => {
-                    let name = grammar
-                        .rules
-                        .get_index(*idx)
-                        .map(|r| r.name)
-                        .unwrap_or("<unknown>");
-                    write!(f, "{}", name)
-                }
+                N::Reference(idx) => match grammar.rules.get_index(*idx) {
+                    Some(r) => write!(f, "{}", r.name),
+                    None => write!(f, "<invalid-ref-{}>", idx),
+                },
                 N::Placeholder => write!(f, "<placeholder>"),
                 N::Sequence(parts) => {
                     let mut first = true;
@@ -121,7 +170,7 @@ impl fmt::Display for Grammar {
                             write!(f, " | ")?;
                         }
                         first = false;
-                        if matches!(a, N::Sequence(_)) {
+                        if matches!(a.kind, N::Sequence(_)) {
                             write!(f, "(")?;
                             fmt_node(grammar, a, cur_idx, f)?;
                             write!(f, ")")?;
@@ -146,8 +195,9 @@ impl fmt::Display for Grammar {
 }
 
 fn shift_references(node: NormalizedNode, offset: usize) -> NormalizedNode {
-    use NormalizedNode as N;
-    match node {
+    use NormalizedNodeKind as N;
+    let NormalizedNode { kind, properties } = node;
+    let new_kind = match kind {
         N::Reference(idx) => N::Reference(idx + offset),
         N::Choice(nodes) => N::Choice(
             nodes
@@ -161,68 +211,11 @@ fn shift_references(node: NormalizedNode, offset: usize) -> NormalizedNode {
                 .map(|n| shift_references(n, offset))
                 .collect(),
         ),
-        n => n,
-    }
-}
-
-fn normalize(node: GrammarNode, rules: &mut IndexSet<Rule>) -> Result<NormalizedNode> {
-    normalize_impl(node, rules, &mut HashSet::new())
-}
-
-fn normalize_impl(
-    node: GrammarNode,
-    rules: &mut IndexSet<Rule>,
-    in_progress: &mut HashSet<&'static str>,
-) -> Result<NormalizedNode> {
-    use GrammarNode as G;
-    use NormalizedNode as N;
-    match node {
-        G::Terminal(m) => Ok(N::Terminal(m)),
-        G::Choice(choices) => choices
-            .into_iter()
-            .map(|n| normalize_impl(n, rules, in_progress))
-            .collect::<Result<Vec<_>>>()
-            .map(N::Choice),
-        G::Sequence(seq) => seq
-            .into_iter()
-            .map(|n| normalize_impl(n, rules, in_progress))
-            .collect::<Result<Vec<_>>>()
-            .map(N::Sequence),
-        G::Optional(opt) => Ok(N::Choice(vec![
-            normalize_impl(*opt, rules, in_progress)?,
-            N::null(),
-        ])),
-        G::Reference(f, name) => {
-            let proto = Rule {
-                name,
-                node: N::Placeholder,
-            };
-            // If the rule is already defined, use the existing reference
-            if let Some(idx) = rules.get_index_of(&proto) {
-                Ok(N::Reference(idx))
-            }
-            // If the rule is currently being processed, we have a cycle - use placeholder
-            else if in_progress.contains(name) {
-                Ok(N::Reference(rules.len()))
-            }
-            // Otherwise, define the rule
-            else {
-                let idx = rules.len();
-                rules.insert(Rule {
-                    name,
-                    node: N::Placeholder,
-                });
-                in_progress.insert(name);
-                let node = normalize_impl(f(), rules, in_progress)?;
-                in_progress.remove(name);
-                // Update the placeholder rule with the actual normalized node
-                if let Some(rule) = rules.get_index_mut2(idx) {
-                    rule.node = node;
-                }
-                Ok(N::Reference(idx))
-            }
-        }
-        _ => unimplemented!(),
+        other => other,
+    };
+    NormalizedNode {
+        kind: new_kind,
+        properties,
     }
 }
 
@@ -233,19 +226,28 @@ mod tests {
 
     #[test]
     fn test_normalize_terminal() {
-        fn a() -> GrammarNode {
-            t("a") + r!(b)
+        fn term() -> GrammarNode {
+            t("a")
         }
 
-        fn b() -> GrammarNode {
-            t("b") + r!(c)
+        fn expr() -> GrammarNode {
+            (r!(expr) + t("+") + r!(term)) | r!(term)
         }
 
-        fn c() -> GrammarNode {
-            t("c") + r!(a)
-        }
+        let grammar = Grammar::try_from(r!(expr));
 
-        let grammar = Grammar::try_from(a()).unwrap();
-        println!("{:#?}", grammar.rules);
+        match grammar {
+            Err(errors) => {
+                println!("Grammar has errors:");
+                errors.iter().for_each(|e| println!(" - {}", e));
+            }
+            Ok(grammar) => {
+                println!("Number of rules: {}", grammar.rules.len());
+                println!("Grammar:\n{}", grammar);
+                for (idx, rule) in grammar.rules.iter().enumerate() {
+                    println!("Rule {}: {:#?}", idx, rule);
+                }
+            }
+        }
     }
 }

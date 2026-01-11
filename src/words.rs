@@ -1,5 +1,4 @@
 use std::{
-    collections::btree_map::Range,
     fmt::Debug,
     ops::{self, Index, IndexMut},
 };
@@ -55,9 +54,7 @@ pub struct State<'a> {
 
 pub trait Matcher: Debug {
     fn matches(&self, state: &mut State) -> bool;
-    fn display(&self) -> String {
-        String::from("<terminal>")
-    }
+    fn display(&self) -> String;
     fn is_nullable(&self) -> bool;
 
     fn is_consuming(&self) -> bool;
@@ -84,6 +81,24 @@ pub trait Matcher: Debug {
         R: ops::RangeBounds<usize>,
     {
         Repeat(self, range)
+    }
+}
+
+impl Matcher for () {
+    fn matches(&self, _state: &mut State) -> bool {
+        true
+    }
+
+    fn display(&self) -> String {
+        String::from("ε")
+    }
+
+    fn is_nullable(&self) -> bool {
+        true
+    }
+
+    fn is_consuming(&self) -> bool {
+        false
     }
 }
 
@@ -185,6 +200,9 @@ where
             self.1.matches(state)
         }
     }
+    fn display(&self) -> String {
+        format!("({}/{})", self.0.display(), self.1.display())
+    }
     fn is_nullable(&self) -> bool {
         self.0.is_nullable() || self.1.is_nullable()
     }
@@ -200,6 +218,9 @@ where
 {
     fn matches(&self, state: &mut State) -> bool {
         self.0.matches(state) && self.1.matches(state)
+    }
+    fn display(&self) -> String {
+        format!("({} {})", self.0.display(), self.1.display())
     }
     fn is_nullable(&self) -> bool {
         self.0.is_nullable() && self.1.is_nullable()
@@ -242,6 +263,9 @@ where
             state.position = original_position;
             false
         }
+    }
+    fn display(&self) -> String {
+        format!("({:?} x {:?})", self.0.display(), self.1)
     }
     fn is_nullable(&self) -> bool {
         use std::ops::Bound;

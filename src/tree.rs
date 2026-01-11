@@ -4,8 +4,6 @@ use std::ops;
 
 use dashmap::DashMap;
 
-use crate::grammar::GrammarError;
-
 type GreenId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

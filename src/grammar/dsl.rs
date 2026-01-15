@@ -3,7 +3,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::words::Matcher;
+use crate::parsec::words::Matcher;
 
 #[derive(Clone)]
 pub enum GrammarNode {

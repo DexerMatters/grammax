@@ -1,4 +1,4 @@
-mod analysis;
+pub(crate) mod analysis;
 pub mod dsl;
 mod norm;
 
@@ -7,10 +7,23 @@ mod tests;
 
 use std::fmt;
 
+use dashmap::DashSet;
+
 #[macro_export]
 macro_rules! r {
     ($fn:ident) => {
         crate::grammar::dsl::r($fn, stringify!($fn))
+    };
+}
+
+#[macro_export]
+macro_rules! new_grammar {
+    ($start: ident where $($name: ident -> $node: expr)*) => {
+        {
+            use crate::{grammar::dsl::*, r};
+            $(fn $name() -> GrammarNode { $node })*
+            crate::grammar::Grammar::new($start(), stringify!($start))
+        }
     };
 }
 
@@ -25,7 +38,7 @@ pub enum GrammarInfo {
 
 pub struct Grammar {
     pub(crate) analysis: analysis::GrammarGraphAnalysis,
-    table: norm::RuleTable,
+    pub(crate) table: norm::RuleTable,
     errors: Vec<GrammarError>,
     infos: Vec<GrammarInfo>,
 }
@@ -80,7 +93,7 @@ impl fmt::Display for Grammar {
 
         // Collect unique infos and errors to avoid duplicates
         let unique_recursions = {
-            let mut seen = std::collections::HashSet::new();
+            let seen = DashSet::new();
             self.infos
                 .iter()
                 .filter_map(|info| match info {
@@ -97,7 +110,7 @@ impl fmt::Display for Grammar {
         };
 
         let unique_relays = {
-            let mut seen = std::collections::HashSet::new();
+            let seen = DashSet::new();
             self.infos
                 .iter()
                 .filter_map(|info| match info {

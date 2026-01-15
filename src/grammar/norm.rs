@@ -1,6 +1,6 @@
-use std::{collections::HashSet, fmt, ops, rc::Rc};
+use std::{fmt, ops, rc::Rc};
 
-use crate::{grammar::dsl::GrammarNode, words::Matcher};
+use crate::{grammar::dsl::GrammarNode, parsec::words::Matcher};
 
 #[derive(Clone, Debug)]
 pub enum NormalizedGrammarNode {
@@ -11,6 +11,7 @@ pub enum NormalizedGrammarNode {
 }
 
 use NormalizedGrammarNode::*;
+use dashmap::{DashMap, DashSet};
 
 impl ops::Add for NormalizedGrammarNode {
     type Output = NormalizedGrammarNode;
@@ -214,20 +215,19 @@ impl RuleTable {
     pub fn compute_from(&mut self, start: GrammarNode, start_name: &'static str) {
         let mut rule_names: Vec<&'static str> = vec![start_name];
         let mut rules: Vec<NormalizedGrammarNode> = Vec::new();
-        let mut rule_map: std::collections::HashMap<&'static str, GrammarNode> =
-            std::collections::HashMap::new();
+        let mut rule_map: DashMap<&'static str, GrammarNode> = DashMap::new();
 
         // Store the start rule
         rule_map.insert(start_name, start.clone());
 
         // First pass: discover all referenced rule names and their nodes
-        let mut discovered_refs: HashSet<&'static str> = HashSet::new();
+        let mut discovered_refs: DashSet<&'static str> = DashSet::new();
         self.discover_and_collect_references(&start, &mut discovered_refs, &mut rule_map);
 
         // Add discovered references to rule_names in order
         for name in discovered_refs.iter() {
-            if *name != start_name && !rule_names.contains(name) {
-                rule_names.push(name);
+            if *name != start_name && !rule_names.contains(&name) {
+                rule_names.push(&name);
             }
         }
 
@@ -235,12 +235,12 @@ impl RuleTable {
         self.rule_names = rule_names.clone();
 
         // Now normalize each rule in order
-        let mut visited: HashSet<&'static str> = HashSet::new();
+        let mut visited: DashSet<&'static str> = DashSet::new();
 
         for rule_name in rule_names.iter() {
             if let Some(grammar_node) = rule_map.get(rule_name) {
                 let (normalized, anon_rules, anon_names) =
-                    self.normalize_node(grammar_node, &mut visited);
+                    self.normalize_node(&grammar_node, &mut visited);
                 rules.push(normalized);
 
                 // Add anonymous rules created from Repetition
@@ -322,8 +322,8 @@ impl RuleTable {
     fn discover_and_collect_references(
         &self,
         node: &GrammarNode,
-        discovered: &mut HashSet<&'static str>,
-        rule_map: &mut std::collections::HashMap<&'static str, GrammarNode>,
+        discovered: &mut DashSet<&'static str>,
+        rule_map: &mut DashMap<&'static str, GrammarNode>,
     ) {
         match node {
             GrammarNode::Terminal(_) => {}
@@ -356,7 +356,7 @@ impl RuleTable {
     fn normalize_node(
         &self,
         node: &GrammarNode,
-        visited: &mut HashSet<&'static str>,
+        visited: &mut DashSet<&'static str>,
     ) -> (
         NormalizedGrammarNode,
         Vec<NormalizedGrammarNode>,

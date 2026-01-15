@@ -47,13 +47,8 @@ impl<T: Clone + PartialEq + Eq> Lexical<T> for Vec<T> {
     }
 }
 
-pub struct State<'a> {
-    input: &'a str,
-    position: usize,
-}
-
 pub trait Matcher: Debug {
-    fn matches(&self, state: &mut State) -> bool;
+    fn matches(&self, input: &str, pos: &mut usize) -> bool;
     fn display(&self) -> String;
     fn is_nullable(&self) -> bool;
 
@@ -85,7 +80,7 @@ pub trait Matcher: Debug {
 }
 
 impl Matcher for () {
-    fn matches(&self, _state: &mut State) -> bool {
+    fn matches(&self, _input: &str, _pos: &mut usize) -> bool {
         true
     }
 
@@ -103,10 +98,10 @@ impl Matcher for () {
 }
 
 impl Matcher for &str {
-    fn matches(&self, state: &mut State) -> bool {
-        let end_pos = state.position + self.len();
-        if end_pos <= state.input.len() && &state.input[state.position..end_pos] == *self {
-            state.position = end_pos;
+    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+        let end_pos = *pos + self.len();
+        if end_pos <= input.len() && &input[*pos..end_pos] == *self {
+            *pos = end_pos;
             true
         } else {
             false
@@ -127,10 +122,10 @@ impl Matcher for &str {
 }
 
 impl Matcher for char {
-    fn matches(&self, state: &mut State) -> bool {
-        if let Some(next_char) = state.input[state.position..].chars().next() {
+    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+        if let Some(next_char) = input[*pos..].chars().next() {
             if next_char == *self {
-                state.position += next_char.len_utf8();
+                *pos += next_char.len_utf8();
                 return true;
             }
         }
@@ -151,8 +146,8 @@ impl Matcher for char {
 }
 
 impl Matcher for EndOfInput {
-    fn matches(&self, state: &mut State) -> bool {
-        state.position >= state.input.len()
+    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+        *pos >= input.len()
     }
 
     fn display(&self) -> String {
@@ -169,8 +164,8 @@ impl Matcher for EndOfInput {
 }
 
 impl Matcher for StartOfInput {
-    fn matches(&self, state: &mut State) -> bool {
-        state.position == 0
+    fn matches(&self, _input: &str, pos: &mut usize) -> bool {
+        *pos == 0
     }
 
     fn display(&self) -> String {
@@ -191,13 +186,13 @@ where
     T: Matcher,
     U: Matcher,
 {
-    fn matches(&self, state: &mut State) -> bool {
-        let original_position = state.position;
-        if self.0.matches(state) {
+    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+        let original_position = *pos;
+        if self.0.matches(input, pos) {
             true
         } else {
-            state.position = original_position;
-            self.1.matches(state)
+            *pos = original_position;
+            self.1.matches(input, pos)
         }
     }
     fn display(&self) -> String {
@@ -216,8 +211,8 @@ where
     T: Matcher,
     U: Matcher,
 {
-    fn matches(&self, state: &mut State) -> bool {
-        self.0.matches(state) && self.1.matches(state)
+    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+        self.0.matches(input, pos) && self.1.matches(input, pos)
     }
     fn display(&self) -> String {
         format!("({} {})", self.0.display(), self.1.display())
@@ -235,7 +230,7 @@ where
     T: Matcher,
     R: ops::RangeBounds<usize> + Debug,
 {
-    fn matches(&self, state: &mut State) -> bool {
+    fn matches(&self, input: &str, pos: &mut usize) -> bool {
         use std::ops::Bound;
 
         let min = match self.1.start_bound() {
@@ -250,17 +245,17 @@ where
             Bound::Unbounded => usize::MAX,
         };
 
-        let original_position = state.position;
+        let original_position = *pos;
         let mut count = 0;
 
-        while count < max && self.0.matches(state) {
+        while count < max && self.0.matches(input, pos) {
             count += 1;
         }
 
         if count >= min && count <= max {
             true
         } else {
-            state.position = original_position;
+            *pos = original_position;
             false
         }
     }

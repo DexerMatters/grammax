@@ -11,6 +11,7 @@ pub enum GrammarNode {
     Alternative(Vec<GrammarNode>),
     Sequence(Vec<GrammarNode>),
     Reference(fn() -> GrammarNode, &'static str),
+    Field(&'static str, Box<GrammarNode>),
     Repetition {
         node: Box<GrammarNode>,
         min: usize,
@@ -34,6 +35,14 @@ pub fn alt(nodes: Vec<GrammarNode>) -> GrammarNode {
     GrammarNode::Alternative(nodes)
 }
 
+pub fn opt(node: GrammarNode) -> GrammarNode {
+    GrammarNode::Repetition {
+        node: Box::new(node),
+        min: 0,
+        max: Some(1),
+    }
+}
+
 pub fn many(node: GrammarNode) -> GrammarNode {
     GrammarNode::Repetition {
         node: Box::new(node),
@@ -48,6 +57,10 @@ pub fn some(node: GrammarNode) -> GrammarNode {
         min: 1,
         max: None,
     }
+}
+
+pub fn field(name: &'static str, node: GrammarNode) -> GrammarNode {
+    GrammarNode::Field(name, Box::new(node))
 }
 
 pub fn repeat<R: RangeBounds<usize>>(node: GrammarNode, range: R) -> GrammarNode {

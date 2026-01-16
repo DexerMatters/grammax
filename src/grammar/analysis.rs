@@ -1,243 +1,56 @@
-use std::{cell::OnceCell, fs, io, path::Path, rc::Rc};
+use std::rc::Rc;
 
 use dashmap::{DashMap, DashSet};
-use ndarray::Array2;
 
 use crate::{
-    grammar::norm::{NormalizedGrammarNode, RuleTable},
+    grammar::{
+        ir::{NormalizedGrammarNode, RefIx, State},
+        norm::RuleTable,
+    },
     parsec::words::Matcher,
 };
-
-type RefIx = usize;
-
-#[derive(Clone, Debug)]
-pub enum State {
-    Tok(RefIx, Rc<dyn Matcher>),
-    Seq(RefIx, usize, usize), // sequence: (left_state, right_state)
-    Alt(RefIx, usize, usize), // alternative: (left_state, right_state)
-}
 
 impl State {
     pub fn ref_ix(&self) -> RefIx {
         match self {
-            State::Tok(ix, _) | State::Seq(ix, _, _) | State::Alt(ix, _, _) => *ix,
+            State::Tok(ix, _)
+            | State::Seq(ix, _)
+            | State::Alt(ix, _)
+            | State::LeftRec(ix, _, _) => *ix,
+        }
+    }
+
+    /// Get child state indices for this state
+    pub fn children(&self) -> &[usize] {
+        match self {
+            State::Tok(_, _) => &[],
+            State::Seq(_, children) | State::Alt(_, children) => children,
+            State::LeftRec(_, _, _) => &[],
         }
     }
 }
 
 #[derive(Clone, Debug)]
-pub struct GrammarGraphAnalysis {
+pub struct GrammarStateAnalysis {
     pub states: Vec<State>,
-    pub distance_matrix: OnceCell<Array2<f32>>,
-    pub closure_matrix: OnceCell<Array2<f32>>,
-
-    pub left_distance_matrix: OnceCell<Array2<f32>>,
-    pub left_closure_matrix: OnceCell<Array2<f32>>,
-
-    pub terminal_states: OnceCell<Vec<usize>>,
-    pub recursive_states: OnceCell<Vec<usize>>,
-    pub infinite_states: OnceCell<Vec<usize>>,
+    pub start_state: usize,
 }
 
-impl GrammarGraphAnalysis {
+impl GrammarStateAnalysis {
     pub fn from_table(table: &RuleTable, start: usize) -> Self {
         let rule_edges = rule_reference_edges(table);
         let is_recursive = recursive_rules(&rule_edges);
 
         let mut builder = Builder::new(table, is_recursive);
-        builder.rule(start);
+        let start_state = builder.rule(start);
         Self {
             states: builder.states,
-
-            distance_matrix: OnceCell::new(),
-            closure_matrix: OnceCell::new(),
-
-            left_distance_matrix: OnceCell::new(),
-            left_closure_matrix: OnceCell::new(),
-
-            terminal_states: OnceCell::new(),
-            recursive_states: OnceCell::new(),
-            infinite_states: OnceCell::new(),
+            start_state,
         }
-    }
-
-    pub fn export(&self, path: impl AsRef<Path>) -> Result<(), io::Error> {
-        let mut file = fs::File::create(path)?;
-
-        Ok(())
     }
 
     pub fn rule_set(&self) -> DashSet<usize> {
         self.states.iter().map(|s| s.ref_ix()).collect()
-    }
-
-    pub fn terminal_states(&self) -> &Vec<usize> {
-        self.terminal_states.get_or_init(|| {
-            self.states
-                .iter()
-                .enumerate()
-                .filter_map(|(i, state)| match state {
-                    State::Tok(_, _) => Some(i),
-                    _ => None,
-                })
-                .collect()
-        })
-    }
-
-    pub fn recursive_states(&self) -> &Vec<usize> {
-        self.recursive_states.get_or_init(|| {
-            let transitive_closure = self.transitive_closure();
-            transitive_closure
-                .diag()
-                .indexed_iter()
-                .filter_map(|(i, &value)| if !value.is_nan() { Some(i) } else { None })
-                .collect()
-        })
-    }
-
-    pub fn left_recursive_states(&self) -> Vec<usize> {
-        let left_closure = self.left_transitive_closure();
-        left_closure
-            .diag()
-            .indexed_iter()
-            .filter_map(|(i, &value)| if !value.is_nan() { Some(i) } else { None })
-            .collect()
-    }
-
-    pub fn infinite_states(&self) -> &Vec<usize> {
-        self.infinite_states.get_or_init(|| {
-            let transitive_closure = self.transitive_closure();
-            transitive_closure
-                .indexed_iter()
-                .filter_map(|((i, j), &value)| {
-                    if i == j && value.is_infinite() {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-                .collect()
-        })
-    }
-
-    pub fn distance_matrix(&self) -> &Array2<f32> {
-        self.distance_matrix
-            .get_or_init(|| self.compute_distance_matrix())
-    }
-
-    fn compute_distance_matrix(&self) -> Array2<f32> {
-        let n = self.states.len();
-        // Initialize with NaN for non-reachable states
-        let mut mat = Array2::from_elem((n, n), f32::NAN);
-
-        for i in 0..n {
-            match &self.states[i] {
-                State::Seq(_, l, r) => {
-                    mat[(i, *l)] = 1.0;
-                    mat[(i, *r)] = 1.0;
-                }
-                State::Alt(_, l, r) => {
-                    mat[(i, *l)] = 1.0;
-                    mat[(i, *r)] = 1.0;
-                }
-                _ => {}
-            }
-        }
-
-        mat
-    }
-
-    pub fn left_distance_matrix(&self) -> &Array2<f32> {
-        self.left_distance_matrix
-            .get_or_init(|| self.compute_left_distance_matrix())
-    }
-
-    fn compute_left_distance_matrix(&self) -> Array2<f32> {
-        let n = self.states.len();
-        // Initialize with NaN for non-reachable states
-        let mut mat = Array2::from_elem((n, n), f32::NAN);
-
-        for i in 0..n {
-            match &self.states[i] {
-                State::Seq(_, l, _) => match &self.states[*l] {
-                    State::Tok(_, _) => {
-                        mat[(*l, i)] = 1.0;
-                    }
-                },
-                State::Alt(_, l, _) => {
-                    mat[(*l, i)] = 1.0;
-                }
-                _ => {}
-            }
-        }
-
-        mat
-    }
-
-    pub fn transitive_closure(&self) -> &Array2<f32> {
-        self.closure_matrix
-            .get_or_init(|| self.compute_transitive_closure())
-    }
-
-    fn compute_transitive_closure(&self) -> Array2<f32> {
-        self.compute_closure_impl(self.distance_matrix())
-    }
-
-    pub fn left_transitive_closure(&self) -> &Array2<f32> {
-        self.left_closure_matrix
-            .get_or_init(|| self.compute_left_closure())
-    }
-
-    fn compute_left_closure(&self) -> Array2<f32> {
-        self.compute_closure_impl(self.left_distance_matrix())
-    }
-
-    fn compute_closure_impl(&self, distance_matrix: &Array2<f32>) -> Array2<f32> {
-        let n = self.states.len();
-        let mut dist = distance_matrix.clone();
-
-        // Mark all direct self-loops as infinite (cannot improve these paths)
-        for i in 0..n {
-            if !dist[(i, i)].is_nan() {
-                dist[(i, i)] = f32::INFINITY;
-            }
-        }
-
-        // Floyd-Warshall with state-aware operations:
-        // - For Seq states: add costs (both branches required)
-        // - For Alt states: take minimum (choose cheaper alternative)
-        for k in 0..n {
-            for i in 0..n {
-                for j in 0..n {
-                    // Skip diagonal updates if already marked as infinite
-                    if i == j && dist[(i, j)].is_infinite() {
-                        continue;
-                    }
-
-                    let i_to_k = dist[(i, k)];
-                    let k_to_j = dist[(k, j)];
-
-                    if i_to_k.is_nan() || k_to_j.is_nan() {
-                        continue;
-                    }
-                    if i_to_k.is_infinite() || k_to_j.is_infinite() {
-                        continue;
-                    }
-
-                    let via_k = match &self.states[k] {
-                        State::Seq(_, _, _) => i_to_k + k_to_j,
-                        State::Alt(_, _, _) => i_to_k.min(k_to_j),
-                        State::Tok(_, _) => i_to_k + k_to_j,
-                    };
-
-                    if dist[(i, j)].is_nan() || dist[(i, j)] > via_k {
-                        dist[(i, j)] = via_k;
-                    }
-                }
-            }
-        }
-
-        dist
     }
 }
 
@@ -270,8 +83,8 @@ struct Builder<'a> {
 
     states: Vec<State>,
     tok: DashMap<(RefIx, String), usize>,
-    seq: DashMap<(RefIx, usize, usize), usize>,
-    alt: DashMap<(RefIx, usize, usize), usize>,
+    seq: DashMap<(RefIx, Vec<usize>), usize>,
+    alt: DashMap<(RefIx, Vec<usize>), usize>,
 
     root: Vec<usize>,
     built: Vec<bool>,
@@ -291,7 +104,7 @@ impl<'a> Builder<'a> {
             built: vec![false; n],
         };
 
-        // Allocate placeholders only for recursive rules.
+        // Allocate placeholders only for recursive rules
         for ix in 0..n {
             if this.is_recursive[ix] {
                 this.root[ix] = this.states.len();
@@ -307,6 +120,24 @@ impl<'a> Builder<'a> {
             return self.root[ix];
         }
         self.built[ix] = true;
+
+        if let Some(info) = &self.table.left_rec[ix] {
+            let root_id = if self.root[ix] != usize::MAX {
+                self.root[ix]
+            } else {
+                let id = self.states.len();
+                self.root[ix] = id;
+                self.states.push(State::Tok(ix, Rc::new("")));
+                id
+            };
+
+            let base_children: Vec<usize> = info.base.iter().map(|n| self.node(ix, n)).collect();
+            let tail_children: Vec<usize> = info.tail.iter().map(|n| self.node(ix, n)).collect();
+
+            self.states[root_id] = State::LeftRec(ix, base_children, tail_children);
+            self.register(root_id);
+            return root_id;
+        }
 
         if self.is_recursive[ix] {
             let root_id = self.root[ix];
@@ -324,8 +155,8 @@ impl<'a> Builder<'a> {
         match node {
             Terminal(m) => self.mk_tok(cur_ref_ix, m),
             Reference(ix) => self.rule(*ix),
-            Sequence(nodes) => self.fold(nodes, cur_ref_ix, true),
-            Alternative(nodes) => self.fold(nodes, cur_ref_ix, false),
+            Sequence(nodes) => self.mk_seq_nary(cur_ref_ix, nodes),
+            Alternative(nodes) => self.mk_alt_nary(cur_ref_ix, nodes),
         }
     }
 
@@ -340,41 +171,38 @@ impl<'a> Builder<'a> {
         id
     }
 
-    fn mk_seq(&mut self, ref_ix: RefIx, l: usize, r: usize) -> usize {
-        let key = (ref_ix, l, r);
+    /// Create an n-ary sequence state directly from a list of nodes
+    fn mk_seq_nary(&mut self, ref_ix: RefIx, nodes: &[NormalizedGrammarNode]) -> usize {
+        let children: Vec<usize> = nodes.iter().map(|n| self.node(ref_ix, n)).collect();
+        self.mk_seq(ref_ix, children)
+    }
+
+    /// Create an n-ary alternative state directly from a list of nodes
+    fn mk_alt_nary(&mut self, ref_ix: RefIx, nodes: &[NormalizedGrammarNode]) -> usize {
+        let children: Vec<usize> = nodes.iter().map(|n| self.node(ref_ix, n)).collect();
+        self.mk_alt(ref_ix, children)
+    }
+
+    fn mk_seq(&mut self, ref_ix: RefIx, children: Vec<usize>) -> usize {
+        let key = (ref_ix, children.clone());
         if let Some(id) = self.seq.get(&key) {
             return *id;
         }
         let id = self.states.len();
-        self.states.push(State::Seq(ref_ix, l, r));
+        self.states.push(State::Seq(ref_ix, children));
         self.seq.insert(key, id);
         id
     }
 
-    fn mk_alt(&mut self, ref_ix: RefIx, l: usize, r: usize) -> usize {
-        let key = (ref_ix, l, r);
+    fn mk_alt(&mut self, ref_ix: RefIx, children: Vec<usize>) -> usize {
+        let key = (ref_ix, children.clone());
         if let Some(id) = self.alt.get(&key) {
             return *id;
         }
         let id = self.states.len();
-        self.states.push(State::Alt(ref_ix, l, r));
+        self.states.push(State::Alt(ref_ix, children));
         self.alt.insert(key, id);
         id
-    }
-
-    // Right-associative fold. If `is_seq` then combine via Seq else Alt.
-    fn fold(&mut self, nodes: &[NormalizedGrammarNode], ref_ix: RefIx, is_seq: bool) -> usize {
-        let mut it = nodes.iter().rev();
-        let mut result = self.node(ref_ix, it.next().expect("Empty fold"));
-        for n in it {
-            let left = self.node(ref_ix, n);
-            result = if is_seq {
-                self.mk_seq(ref_ix, left, result)
-            } else {
-                self.mk_alt(ref_ix, left, result)
-            };
-        }
-        result
     }
 
     fn register(&mut self, id: usize) {
@@ -382,12 +210,13 @@ impl<'a> Builder<'a> {
             State::Tok(ix, m) => {
                 self.tok.insert((*ix, m.display()), id);
             }
-            State::Seq(ix, l, r) => {
-                self.seq.insert((*ix, *l, *r), id);
+            State::Seq(ix, children) => {
+                self.seq.insert((*ix, children.clone()), id);
             }
-            State::Alt(ix, l, r) => {
-                self.alt.insert((*ix, *l, *r), id);
+            State::Alt(ix, children) => {
+                self.alt.insert((*ix, children.clone()), id);
             }
+            State::LeftRec(_, _, _) => {}
         }
     }
 
@@ -403,43 +232,17 @@ impl<'a> Builder<'a> {
                 self.states[root_id] = self.states[target].clone();
                 self.register(root_id);
             }
-            Sequence(nodes) => self.emit_fold(root_id, ref_ix, nodes, true),
-            Alternative(nodes) => self.emit_fold(root_id, ref_ix, nodes, false),
-        }
-    }
-
-    fn emit_fold(
-        &mut self,
-        root_id: usize,
-        ref_ix: RefIx,
-        nodes: &[NormalizedGrammarNode],
-        is_seq: bool,
-    ) {
-        let mut it = nodes.iter().rev().peekable();
-        let mut result = self.node(ref_ix, it.next().expect("Empty fold"));
-
-        while let Some(n) = it.next() {
-            let left = self.node(ref_ix, n);
-            if it.peek().is_none() {
-                self.states[root_id] = if is_seq {
-                    State::Seq(ref_ix, left, result)
-                } else {
-                    State::Alt(ref_ix, left, result)
-                };
+            Sequence(nodes) => {
+                let children: Vec<usize> = nodes.iter().map(|n| self.node(ref_ix, n)).collect();
+                self.states[root_id] = State::Seq(ref_ix, children);
                 self.register(root_id);
-                return;
             }
-
-            result = if is_seq {
-                self.mk_seq(ref_ix, left, result)
-            } else {
-                self.mk_alt(ref_ix, left, result)
-            };
+            Alternative(nodes) => {
+                let children: Vec<usize> = nodes.iter().map(|n| self.node(ref_ix, n)).collect();
+                self.states[root_id] = State::Alt(ref_ix, children);
+                self.register(root_id);
+            }
         }
-
-        // Single element: root is an alias.
-        self.states[root_id] = self.states[result].clone();
-        self.register(root_id);
     }
 }
 

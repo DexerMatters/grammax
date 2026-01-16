@@ -4,6 +4,9 @@ pub mod parsec;
 
 pub mod utils;
 
+// Re-exports for convenience
+pub use grammar::Grammar;
+
 #[cfg(test)]
 mod tests {
 

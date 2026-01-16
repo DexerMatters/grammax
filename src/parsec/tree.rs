@@ -16,12 +16,16 @@ type GreenId = usize;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Tag {
     Rule { rule_ix: usize },
+    Token { rule_ix: usize, text: String },
     Error(Vec<ParsecError>),
 }
 
 impl Tag {
     pub fn new_rule(rule_ix: usize) -> Self {
         Tag::Rule { rule_ix }
+    }
+    pub fn new_token(rule_ix: usize, text: String) -> Self {
+        Tag::Token { rule_ix, text }
     }
     pub fn new_error(err: ParsecError) -> Self {
         Tag::Error(vec![err])
@@ -108,10 +112,12 @@ impl TreeAlloc {
         self.alloc(Tag::Error(vec![ParsecError::Placeholder]), vec![], width)
     }
 
+    #[allow(dead_code)]
     pub fn display(&self, id: GreenId) -> String {
         self.display_with_indent(id, 0)
     }
 
+    #[allow(dead_code)]
     fn display_with_indent(&self, id: GreenId, indent: usize) -> String {
         let node = &self.nodes[id];
         let mut result = String::new();
@@ -124,6 +130,15 @@ impl TreeAlloc {
                     "{}Rule({}) [width: {}]",
                     indent_str, rule_ix, node.width
                 ));
+            }
+            Tag::Token { rule_ix, text } => {
+                result.push_str(&format!(
+                    "{}Token({}) [width: {}]",
+                    indent_str, rule_ix, node.width
+                ));
+                if node.children.is_empty() {
+                    result.push_str(&format!(" {}", text));
+                }
             }
             Tag::Error(errors) => {
                 result.push_str(&format!(

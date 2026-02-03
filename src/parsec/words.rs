@@ -63,8 +63,12 @@ pub trait Matcher: Debug {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize>;
     fn display(&self) -> String;
     fn is_nullable(&self) -> bool;
-
     fn is_consuming(&self) -> bool;
+    /// Returns the literal string this matcher matches, if it's a literal.
+    /// Variable matchers (char predicates, ranges) return None.
+    fn preview(&self) -> Option<String> {
+        None
+    }
 
     fn then<U>(self, other: U) -> Sequence<Self, U>
     where
@@ -156,6 +160,10 @@ impl Matcher for &str {
     fn is_consuming(&self) -> bool {
         self.len() > 0
     }
+
+    fn preview(&self) -> Option<String> {
+        Some(self.to_string())
+    }
 }
 
 impl Matcher for char {
@@ -180,6 +188,10 @@ impl Matcher for char {
 
     fn is_consuming(&self) -> bool {
         true
+    }
+
+    fn preview(&self) -> Option<String> {
+        Some(self.to_string())
     }
 }
 
@@ -272,6 +284,9 @@ where
     fn is_consuming(&self) -> bool {
         self.0.is_consuming() || self.1.is_consuming()
     }
+    fn preview(&self) -> Option<String> {
+        self.0.preview().or(self.1.preview())
+    }
 }
 
 impl<R, T> Matcher for Repeat<T, R>
@@ -314,8 +329,8 @@ where
         }
 
         if max == usize::MAX && stopped_at_eof && self.0.is_consuming() {
-            *pos = original_position;
-            return None;
+            // *pos = original_position;
+            // return None;
         }
 
         if count >= min && count <= max {
@@ -367,5 +382,9 @@ impl<M: Matcher> Matcher for NamedMatcher<M> {
 
     fn is_consuming(&self) -> bool {
         self.matcher.is_consuming()
+    }
+
+    fn preview(&self) -> Option<String> {
+        self.matcher.preview()
     }
 }

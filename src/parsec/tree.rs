@@ -8,6 +8,7 @@ use dashmap::DashMap;
 pub enum ParsecError {
     Incomplete,
     UnexpectedToken,
+    MissingToken, // Inserted
     Placeholder,
 }
 

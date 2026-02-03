@@ -1,10 +1,11 @@
+use std::collections::HashSet;
 use std::rc::Rc;
 
 use dashmap::{DashMap, DashSet};
 
 use crate::{
     grammar::{
-        ir::{NormalizedGrammarNode, RefIx, State},
+        ir::{BridgeGrammar, NormalizedGrammarNode, RefIx, Scope, State},
         norm::RuleTable,
     },
     parsec::words::Matcher,
@@ -37,6 +38,7 @@ pub struct GrammarStateAnalysis {
     pub states: Vec<State>,
     pub start_state: usize,
     pub is_recursive: Vec<bool>,
+    pub bridge: BridgeGrammar,
 }
 
 impl GrammarStateAnalysis {
@@ -46,15 +48,71 @@ impl GrammarStateAnalysis {
 
         let mut builder = Builder::new(table, is_recursive);
         let start_state = builder.rule(start);
-        Self {
+
+        let mut analysis = Self {
             states: builder.states,
             start_state,
             is_recursive: builder.is_recursive,
-        }
+            bridge: BridgeGrammar {
+                scopes: Vec::new(),
+                reefs: Vec::new(),
+            },
+        };
+        analysis.bridge = analysis.derive_bridge_grammar();
+        analysis
     }
 
     pub fn rule_set(&self) -> DashSet<usize> {
         self.states.iter().map(|s| s.ref_ix()).collect()
+    }
+
+    pub fn derive_bridge_grammar(&self) -> BridgeGrammar {
+        let mut scopes = Vec::new();
+        let mut reef_set = HashSet::new();
+
+        for state in &self.states {
+            // Collect reefs (all literals)
+            if let State::Tok(_, matcher) = state {
+                if let Some(s) = matcher.preview() {
+                    if !s.is_empty() {
+                        reef_set.insert(s.to_string());
+                    }
+                }
+            }
+
+            let rule_ix = state.ref_ix();
+            if rule_ix >= self.is_recursive.len() || !self.is_recursive[rule_ix] {
+                continue;
+            }
+
+            // Check for Scopes
+            if let State::Seq(_, children) = state {
+                if children.len() < 2 {
+                    continue;
+                }
+
+                let first = &self.states[children[0]];
+                let last = &self.states[children[children.len() - 1]];
+
+                if let (State::Tok(_, m1), State::Tok(_, m2)) = (first, last) {
+                    if let (Some(s1), Some(s2)) = (m1.preview(), m2.preview()) {
+                        if !s1.is_empty() && !s2.is_empty() && s1 != s2 {
+                            let scope = Scope {
+                                open: s1.to_string(),
+                                close: s2.to_string(),
+                                rule_ix,
+                            };
+                            if !scopes.contains(&scope) {
+                                scopes.push(scope);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let reefs = reef_set.into_iter().collect();
+        BridgeGrammar { scopes, reefs }
     }
 }
 

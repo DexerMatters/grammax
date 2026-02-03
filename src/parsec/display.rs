@@ -4,8 +4,8 @@ const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
 const GREEN: &str = "\x1b[32m";
 const YELLOW: &str = "\x1b[33m";
+const RED: &str = "\x1b[31m";
 
-#[allow(dead_code)]
 impl Parser<'_> {
     /// Pretty-print the AST with tree frames and rule ids.
     pub fn display(&self, id: usize) -> String {
@@ -227,7 +227,17 @@ impl Parser<'_> {
                 }
             }
             Tag::Field { name, .. } => (format!("{}{}:{}", YELLOW, name, RESET), String::new()),
-            Tag::Error(errors) => (format!("error:{:?}", errors), String::new()),
+            Tag::Error(errors) => {
+                let err_desc = errors
+                    .iter()
+                    .map(|e| format!("{:?}", e))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                (
+                    format!("{}error:[{}]{}", RED, err_desc, RESET),
+                    String::new(),
+                )
+            }
         }
     }
 }

@@ -63,3 +63,16 @@ pub enum State {
     Field(RefIx, &'static str, usize),
     LeftRec(RefIx, Vec<usize>, Vec<usize>, Vec<Option<&'static str>>),
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Scope {
+    pub open: String,
+    pub close: String,
+    pub rule_ix: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct BridgeGrammar {
+    pub scopes: Vec<Scope>,
+    pub reefs: Vec<String>,
+}

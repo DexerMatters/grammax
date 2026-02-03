@@ -3,7 +3,7 @@ pub mod display;
 pub mod dsl;
 pub(crate) mod ir;
 mod norm;
-mod specs;
+pub mod recovery;
 
 #[cfg(test)]
 mod tests;

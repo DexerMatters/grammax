@@ -17,6 +17,12 @@ pub enum GrammarNode {
         min: usize,
         max: Option<usize>,
     },
+    SeparatedRepetition {
+        node: Box<GrammarNode>,
+        separator: Box<GrammarNode>,
+        min: usize,
+        max: Option<usize>,
+    },
 }
 
 pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
@@ -54,6 +60,24 @@ pub fn many(node: GrammarNode) -> GrammarNode {
 pub fn some(node: GrammarNode) -> GrammarNode {
     GrammarNode::Repetition {
         node: Box::new(node),
+        min: 1,
+        max: None,
+    }
+}
+
+pub fn sep(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
+    GrammarNode::SeparatedRepetition {
+        node: Box::new(node),
+        separator: Box::new(separator),
+        min: 0,
+        max: None,
+    }
+}
+
+pub fn sep1(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
+    GrammarNode::SeparatedRepetition {
+        node: Box::new(node),
+        separator: Box::new(separator),
         min: 1,
         max: None,
     }

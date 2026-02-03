@@ -3,6 +3,7 @@ pub mod display;
 pub mod dsl;
 pub(crate) mod ir;
 mod norm;
+mod specs;
 
 #[cfg(test)]
 mod tests;
@@ -22,6 +23,7 @@ macro_rules! r {
 macro_rules! new_grammar {
     ($start: ident where $($name: ident -> $node: expr)*) => {
         {
+            #[allow(unused_imports)]
             use crate::{grammar::dsl::*, r};
             $(fn $name() -> GrammarNode { $node })*
             crate::grammar::Grammar::new($start(), stringify!($start))
@@ -51,7 +53,6 @@ impl Grammar {
         table.compute_from(node, start_rule);
 
         let analysis = analysis::GrammarStateAnalysis::from_table(&table, 0);
-
         Self {
             table,
             analysis,

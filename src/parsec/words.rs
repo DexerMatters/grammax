@@ -5,50 +5,62 @@ use std::{
 
 use crate::utils::Span;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct EndOfInput;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct StartOfInput;
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Alternative<T, U>(T, U);
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Sequence<T, U>(T, U);
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct Repeat<T, R: ops::RangeBounds<usize>>(T, R);
 
-pub trait Lexical<T>
-where
-    Self: IntoIterator<Item = T>
-        + Index<usize, Output = T>
-        + Index<ops::Range<usize>, Output = [T]>
-        + IndexMut<usize, Output = T>
-        + IndexMut<ops::Range<usize>, Output = [T]>,
-    for<'a> &'a Self: IntoIterator<Item = &'a T>,
-    T: Clone + PartialEq + Eq,
-{
-    fn len(&self) -> usize;
-    fn span(&self) -> Span {
-        Span {
-            start: 0,
-            end: self.len(),
-        }
-    }
-    fn slice(&self, span: Span) -> &[T] {
-        &self[span.start..span.end]
-    }
-    fn slice_mut(&mut self, span: Span) -> &mut [T] {
-        &mut self[span.start..span.end]
+#[derive(Debug, Clone, Copy)]
+pub struct NamedMatcher<M: Matcher> {
+    pub name: &'static str,
+    pub matcher: M,
+}
+
+impl NamedMatcher<EndOfInput> {
+    pub const fn new<M: Matcher>(name: &'static str, matcher: M) -> NamedMatcher<M> {
+        NamedMatcher { name, matcher }
     }
 }
 
-impl<T: Clone + PartialEq + Eq> Lexical<T> for Vec<T> {
-    fn len(&self) -> usize {
-        self.len()
-    }
+pub const NUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
+    NamedMatcher::new("number", Repeat(|c: char| c.is_ascii_digit(), 1..));
+
+pub const ALPHAS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
+    NamedMatcher::new("identifier", Repeat(|c: char| c.is_ascii_alphabetic(), 1..));
+
+pub const ALPHANUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
+    NamedMatcher::new(
+        "alphanum",
+        Repeat(|c: char| c.is_ascii_alphanumeric() || c == '_', 1..),
+    );
+
+const fn string_char(c: char) -> bool {
+    c != '"' && c != '\n' && c != '\r'
+}
+
+pub const STRING: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
+    NamedMatcher::new("json_string", Repeat(string_char, 0..));
+
+pub const WHITESPACES: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
+    NamedMatcher::new("whitespaces", Repeat(|c: char| c.is_whitespace(), 1..));
+
+pub const fn token<M: Matcher>(
+    matcher: M,
+) -> Sequence<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>, M> {
+    Sequence(
+        Repeat(|c: char| c.is_whitespace() || c == '\n' || c == '\r', 0..),
+        matcher,
+    )
 }
 
 pub trait Matcher: Debug {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool;
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize>;
     fn display(&self) -> String;
     fn is_nullable(&self) -> bool;
 
@@ -80,8 +92,8 @@ pub trait Matcher: Debug {
 }
 
 impl Matcher for () {
-    fn matches(&self, _input: &str, _pos: &mut usize) -> bool {
-        true
+    fn matches<'a>(&self, _input: &'a str, _pos: &mut usize) -> Option<usize> {
+        Some(0)
     }
 
     fn display(&self) -> String {
@@ -97,14 +109,39 @@ impl Matcher for () {
     }
 }
 
+impl Matcher for fn(char) -> bool {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        if let Some(next_char) = input[*pos..].chars().next() {
+            if self(next_char) {
+                *pos += next_char.len_utf8();
+                return Some(*pos - start);
+            }
+        }
+        None
+    }
+
+    fn display(&self) -> String {
+        String::from("char_predicate")
+    }
+
+    fn is_nullable(&self) -> bool {
+        false
+    }
+
+    fn is_consuming(&self) -> bool {
+        true
+    }
+}
+
 impl Matcher for &str {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool {
-        let end_pos = *pos + self.len();
-        if end_pos <= input.len() && &input[*pos..end_pos] == *self {
-            *pos = end_pos;
-            true
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        if input[*pos..].starts_with(*self) {
+            *pos += self.len();
+            Some(*pos - start)
         } else {
-            false
+            None
         }
     }
 
@@ -122,14 +159,15 @@ impl Matcher for &str {
 }
 
 impl Matcher for char {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
         if let Some(next_char) = input[*pos..].chars().next() {
             if next_char == *self {
                 *pos += next_char.len_utf8();
-                return true;
+                return Some(*pos - start);
             }
         }
-        false
+        None
     }
 
     fn display(&self) -> String {
@@ -146,8 +184,8 @@ impl Matcher for char {
 }
 
 impl Matcher for EndOfInput {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool {
-        *pos >= input.len()
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        if *pos >= input.len() { Some(0) } else { None }
     }
 
     fn display(&self) -> String {
@@ -164,8 +202,8 @@ impl Matcher for EndOfInput {
 }
 
 impl Matcher for StartOfInput {
-    fn matches(&self, _input: &str, pos: &mut usize) -> bool {
-        *pos == 0
+    fn matches<'a>(&self, _input: &'a str, pos: &mut usize) -> Option<usize> {
+        if *pos == 0 { Some(0) } else { None }
     }
 
     fn display(&self) -> String {
@@ -186,10 +224,10 @@ where
     T: Matcher,
     U: Matcher,
 {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let original_position = *pos;
-        if self.0.matches(input, pos) {
-            true
+        if let Some(matched) = self.0.matches(input, pos) {
+            Some(matched)
         } else {
             *pos = original_position;
             self.1.matches(input, pos)
@@ -211,8 +249,19 @@ where
     T: Matcher,
     U: Matcher,
 {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool {
-        self.0.matches(input, pos) && self.1.matches(input, pos)
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let original_position = *pos;
+        if let Some(matched1) = self.0.matches(input, pos) {
+            if let Some(matched2) = self.1.matches(input, pos) {
+                Some(matched1 + matched2)
+            } else {
+                *pos = original_position;
+                None
+            }
+        } else {
+            *pos = original_position;
+            None
+        }
     }
     fn display(&self) -> String {
         format!("({} {})", self.0.display(), self.1.display())
@@ -230,7 +279,7 @@ where
     T: Matcher,
     R: ops::RangeBounds<usize> + Debug,
 {
-    fn matches(&self, input: &str, pos: &mut usize) -> bool {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         use std::ops::Bound;
 
         let min = match self.1.start_bound() {
@@ -247,16 +296,33 @@ where
 
         let original_position = *pos;
         let mut count = 0;
+        let mut stopped_at_eof = false;
 
-        while count < max && self.0.matches(input, pos) {
-            count += 1;
+        while count < max {
+            let before = *pos;
+            if self.0.matches(input, pos).is_some() {
+                if *pos == before {
+                    break;
+                }
+                count += 1;
+            } else {
+                if *pos >= input.len() {
+                    stopped_at_eof = true;
+                }
+                break;
+            }
+        }
+
+        if max == usize::MAX && stopped_at_eof && self.0.is_consuming() {
+            *pos = original_position;
+            return None;
         }
 
         if count >= min && count <= max {
-            true
+            Some(*pos - original_position)
         } else {
             *pos = original_position;
-            false
+            None
         }
     }
     fn display(&self) -> String {
@@ -283,5 +349,23 @@ where
         };
 
         min > 0 && self.0.is_consuming()
+    }
+}
+
+impl<M: Matcher> Matcher for NamedMatcher<M> {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        self.matcher.matches(input, pos)
+    }
+
+    fn display(&self) -> String {
+        self.name.to_string()
+    }
+
+    fn is_nullable(&self) -> bool {
+        self.matcher.is_nullable()
+    }
+
+    fn is_consuming(&self) -> bool {
+        self.matcher.is_consuming()
     }
 }

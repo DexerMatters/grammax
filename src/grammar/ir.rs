@@ -1,4 +1,4 @@
-use std::{fmt, ops, rc::Rc};
+use std::{ops, rc::Rc};
 
 use crate::parsec::words::Matcher;
 
@@ -8,6 +8,7 @@ pub enum NormalizedGrammarNode {
     Alternative(Vec<NormalizedGrammarNode>),
     Sequence(Vec<NormalizedGrammarNode>),
     Reference(usize),
+    Field(&'static str, Box<NormalizedGrammarNode>),
 }
 
 use NormalizedGrammarNode::*;
@@ -52,33 +53,13 @@ impl ops::BitOr for NormalizedGrammarNode {
     }
 }
 
-impl fmt::Display for NormalizedGrammarNode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Terminal(matcher) => {
-                write!(f, "{}", matcher.display())
-            }
-            Reference(index) => {
-                write!(f, "@{}", index)
-            }
-            Sequence(nodes) => {
-                let parts: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
-                write!(f, "({})", parts.join(" "))
-            }
-            Alternative(nodes) => {
-                let parts: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
-                write!(f, "({})", parts.join(" | "))
-            }
-        }
-    }
-}
-
 pub type RefIx = usize;
 
 #[derive(Clone, Debug)]
 pub enum State {
     Tok(RefIx, Rc<dyn Matcher>),
     Seq(RefIx, Vec<usize>),
-    Alt(RefIx, Vec<usize>),
-    LeftRec(RefIx, Vec<usize>, Vec<usize>),
+    Alt(RefIx, Vec<usize>, bool), // (rule_ix, children, has_epsilon)
+    Field(RefIx, &'static str, usize),
+    LeftRec(RefIx, Vec<usize>, Vec<usize>, Vec<Option<&'static str>>),
 }

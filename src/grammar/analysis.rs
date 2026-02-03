@@ -15,8 +15,9 @@ impl State {
         match self {
             State::Tok(ix, _)
             | State::Seq(ix, _)
-            | State::Alt(ix, _)
-            | State::LeftRec(ix, _, _) => *ix,
+            | State::Alt(ix, _, _)
+            | State::Field(ix, _, _)
+            | State::LeftRec(ix, _, _, _) => *ix,
         }
     }
 
@@ -24,8 +25,9 @@ impl State {
     pub fn children(&self) -> &[usize] {
         match self {
             State::Tok(_, _) => &[],
-            State::Seq(_, children) | State::Alt(_, children) => children,
-            State::LeftRec(_, _, _) => &[],
+            State::Seq(_, children) | State::Alt(_, children, _) => children,
+            State::Field(_, _, child) => std::slice::from_ref(child),
+            State::LeftRec(_, _, _, _) => &[],
         }
     }
 }
@@ -34,6 +36,7 @@ impl State {
 pub struct GrammarStateAnalysis {
     pub states: Vec<State>,
     pub start_state: usize,
+    pub is_recursive: Vec<bool>,
 }
 
 impl GrammarStateAnalysis {
@@ -46,6 +49,7 @@ impl GrammarStateAnalysis {
         Self {
             states: builder.states,
             start_state,
+            is_recursive: builder.is_recursive,
         }
     }
 
@@ -60,6 +64,7 @@ fn rule_reference_edges(table: &RuleTable) -> Vec<Vec<usize>> {
         match node {
             Terminal(_) => {}
             Reference(ix) => out.push(*ix),
+            Field(_, inner) => walk(inner, out),
             Sequence(nodes) | Alternative(nodes) => nodes.iter().for_each(|n| walk(n, out)),
         }
     }
@@ -85,6 +90,7 @@ struct Builder<'a> {
     tok: DashMap<(RefIx, String), usize>,
     seq: DashMap<(RefIx, Vec<usize>), usize>,
     alt: DashMap<(RefIx, Vec<usize>), usize>,
+    field: DashMap<(RefIx, &'static str, usize), usize>,
 
     root: Vec<usize>,
     built: Vec<bool>,
@@ -100,6 +106,7 @@ impl<'a> Builder<'a> {
             tok: DashMap::new(),
             seq: DashMap::new(),
             alt: DashMap::new(),
+            field: DashMap::new(),
             root: vec![usize::MAX; n],
             built: vec![false; n],
         };
@@ -134,7 +141,8 @@ impl<'a> Builder<'a> {
             let base_children: Vec<usize> = info.base.iter().map(|n| self.node(ix, n)).collect();
             let tail_children: Vec<usize> = info.tail.iter().map(|n| self.node(ix, n)).collect();
 
-            self.states[root_id] = State::LeftRec(ix, base_children, tail_children);
+            self.states[root_id] =
+                State::LeftRec(ix, base_children, tail_children, info.tail_fields.clone());
             self.register(root_id);
             return root_id;
         }
@@ -144,6 +152,14 @@ impl<'a> Builder<'a> {
             self.emit_into(root_id, ix, &self.table.rules[ix]);
             root_id
         } else {
+            if let NormalizedGrammarNode::Reference(target_ix) = &self.table.rules[ix] {
+                if !self.table.rule_names[ix].starts_with('@') {
+                    let child = self.rule(*target_ix);
+                    let root_id = self.mk_seq(ix, vec![child]);
+                    self.root[ix] = root_id;
+                    return root_id;
+                }
+            }
             let root_id = self.node(ix, &self.table.rules[ix]);
             self.root[ix] = root_id;
             root_id
@@ -157,6 +173,7 @@ impl<'a> Builder<'a> {
             Reference(ix) => self.rule(*ix),
             Sequence(nodes) => self.mk_seq_nary(cur_ref_ix, nodes),
             Alternative(nodes) => self.mk_alt_nary(cur_ref_ix, nodes),
+            Field(name, inner) => self.mk_field(cur_ref_ix, name, inner),
         }
     }
 
@@ -183,6 +200,23 @@ impl<'a> Builder<'a> {
         self.mk_alt(ref_ix, children)
     }
 
+    fn mk_field(
+        &mut self,
+        ref_ix: RefIx,
+        name: &'static str,
+        inner: &NormalizedGrammarNode,
+    ) -> usize {
+        let child = self.node(ref_ix, inner);
+        let key = (ref_ix, name, child);
+        if let Some(id) = self.field.get(&key) {
+            return *id;
+        }
+        let id = self.states.len();
+        self.states.push(State::Field(ref_ix, name, child));
+        self.field.insert(key, id);
+        id
+    }
+
     fn mk_seq(&mut self, ref_ix: RefIx, children: Vec<usize>) -> usize {
         let key = (ref_ix, children.clone());
         if let Some(id) = self.seq.get(&key) {
@@ -199,10 +233,24 @@ impl<'a> Builder<'a> {
         if let Some(id) = self.alt.get(&key) {
             return *id;
         }
+        // Detect if any child is an epsilon (empty sequence or nullable)
+        let has_epsilon = children.iter().any(|&child_id| self.is_nullable(child_id));
         let id = self.states.len();
-        self.states.push(State::Alt(ref_ix, children));
+        self.states.push(State::Alt(ref_ix, children, has_epsilon));
         self.alt.insert(key, id);
         id
+    }
+
+    fn is_nullable(&self, state_id: usize) -> bool {
+        match self.states.get(state_id) {
+            Some(State::Seq(_, children)) => {
+                children.is_empty() || children.iter().all(|&c| self.is_nullable(c))
+            }
+            Some(State::Alt(_, children, _)) => children.iter().any(|&c| self.is_nullable(c)),
+            Some(State::Tok(_, m)) => m.is_nullable(),
+            Some(State::Field(_, _, child)) => self.is_nullable(*child),
+            _ => false,
+        }
     }
 
     fn register(&mut self, id: usize) {
@@ -213,10 +261,13 @@ impl<'a> Builder<'a> {
             State::Seq(ix, children) => {
                 self.seq.insert((*ix, children.clone()), id);
             }
-            State::Alt(ix, children) => {
+            State::Alt(ix, children, _) => {
                 self.alt.insert((*ix, children.clone()), id);
             }
-            State::LeftRec(_, _, _) => {}
+            State::Field(ix, name, child) => {
+                self.field.insert((*ix, *name, *child), id);
+            }
+            State::LeftRec(_, _, _, _) => {}
         }
     }
 
@@ -239,7 +290,13 @@ impl<'a> Builder<'a> {
             }
             Alternative(nodes) => {
                 let children: Vec<usize> = nodes.iter().map(|n| self.node(ref_ix, n)).collect();
-                self.states[root_id] = State::Alt(ref_ix, children);
+                let has_epsilon = children.iter().any(|&child_id| self.is_nullable(child_id));
+                self.states[root_id] = State::Alt(ref_ix, children, has_epsilon);
+                self.register(root_id);
+            }
+            Field(name, inner) => {
+                let child = self.node(ref_ix, inner);
+                self.states[root_id] = State::Field(ref_ix, *name, child);
                 self.register(root_id);
             }
         }

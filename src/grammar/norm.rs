@@ -17,125 +17,7 @@ pub struct RuleTable {
 pub struct LeftRecInfo {
     pub base: Vec<NormalizedGrammarNode>,
     pub tail: Vec<NormalizedGrammarNode>,
-}
-
-impl fmt::Display for RuleTable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        const RESET: &str = "\x1b[0m";
-        const BOLD: &str = "\x1b[1m";
-
-        // Find which rules are actually referenced
-        let mut used = vec![false; self.rules.len()];
-        for (i, _) in self.rule_names.iter().enumerate() {
-            if !self.rule_names[i].is_empty() {
-                used[i] = true;
-                self.mark_used(&self.rules[i], &mut used);
-            }
-        }
-
-        // Calculate max name width for alignment (only for rules that will be shown)
-        let max_width = self
-            .rule_names
-            .iter()
-            .enumerate()
-            .filter(|(i, n)| !n.is_empty() || used[*i])
-            .map(|(i, n)| {
-                if n.is_empty() {
-                    format!("@{}", i).len()
-                } else {
-                    n.len()
-                }
-            })
-            .max()
-            .unwrap_or(10);
-
-        for (i, rule) in self.rules.iter().enumerate() {
-            // Skip unused anonymous rules
-            if i < self.rule_names.len() && self.rule_names[i].is_empty() && !used[i] {
-                continue;
-            }
-
-            let name = if i < self.rule_names.len() && !self.rule_names[i].is_empty() {
-                self.rule_names[i].to_string()
-            } else {
-                format!("@{}", i)
-            };
-
-            let formatted_rule = self.format_node(rule);
-            let padded_name = format!("{:<width$}", name, width = max_width);
-            writeln!(
-                f,
-                "  {}{}{} {} {}",
-                BOLD, padded_name, RESET, "→", formatted_rule
-            )?;
-        }
-        Ok(())
-    }
-}
-
-impl RuleTable {
-    fn mark_used(&self, node: &NormalizedGrammarNode, used: &mut Vec<bool>) {
-        match node {
-            Terminal(_) => {}
-            Reference(idx) => {
-                if *idx < used.len() && !used[*idx] {
-                    used[*idx] = true;
-                    self.mark_used(&self.rules[*idx], used);
-                }
-            }
-            Sequence(nodes) | Alternative(nodes) => {
-                for n in nodes {
-                    self.mark_used(n, used);
-                }
-            }
-        }
-    }
-
-    fn get_rule_name(&self, idx: usize) -> String {
-        self.rule_names
-            .get(idx)
-            .filter(|n| !n.is_empty())
-            .map(|n| n.to_string())
-            .unwrap_or_else(|| format!("@{}", idx))
-    }
-    fn format_node(&self, node: &NormalizedGrammarNode) -> String {
-        self.format_node_inner(node, false)
-    }
-
-    fn format_node_inner(&self, node: &NormalizedGrammarNode, parent_is_seq: bool) -> String {
-        const RESET: &str = "\x1b[0m";
-        const BOLD: &str = "\x1b[1m";
-        const GREY: &str = "\x1b[90m";
-
-        match node {
-            Terminal(matcher) => {
-                format!("{}{}{}", GREY, matcher.display(), RESET)
-            }
-            Reference(index) => {
-                format!("{}{}{}", BOLD, self.get_rule_name(*index), RESET)
-            }
-            Sequence(nodes) => {
-                let parts: Vec<String> = nodes
-                    .iter()
-                    .map(|n| self.format_node_inner(n, true))
-                    .collect();
-                let content = parts.join(" ");
-                // Only wrap in parens if inside an Alternative
-                if parent_is_seq {
-                    content
-                } else {
-                    format!("({})", content)
-                }
-            }
-            Alternative(nodes) => {
-                let parts: Vec<String> = nodes
-                    .iter()
-                    .map(|n| self.format_node_inner(n, false))
-                    .collect();
-                parts.join(" | ")
-            }
-        }
-    }
+    pub tail_fields: Vec<Option<&'static str>>,
 }
 
 impl RuleTable {
@@ -157,6 +39,107 @@ impl RuleTable {
         self.eliminate_left_recursion();
         self.factor_common_prefixes();
         self.simplify_epsilon();
+        self.sort_alternatives();
+    }
+
+    pub fn sort_alternatives(&mut self) {
+        // We need a clone of rules to lookup complexities while sorting,
+        // OR we compute complexities first.
+        let complexities: Vec<usize> = self
+            .rules
+            .iter()
+            .enumerate()
+            .map(|(i, _)| self.calculate_complexity(i, &mut Vec::new()))
+            .collect();
+
+        for rule in &mut self.rules {
+            Self::sort_node_alternatives(rule, &complexities);
+        }
+    }
+
+    fn calculate_complexity(&self, rule_ix: usize, visited: &mut Vec<usize>) -> usize {
+        if visited.contains(&rule_ix) {
+            return usize::MAX; // Recursive = Complex
+        }
+        visited.push(rule_ix);
+        let res = self.estimate_node_complexity(&self.rules[rule_ix], visited);
+        visited.pop();
+        res
+    }
+
+    fn sort_node_alternatives(node: &mut NormalizedGrammarNode, complexities: &[usize]) {
+        match node {
+            NormalizedGrammarNode::Alternative(alts) => {
+                for alt in alts.iter_mut() {
+                    Self::sort_node_alternatives(alt, complexities);
+                }
+                alts.sort_by(|a, b| {
+                    Self::static_estimate_complexity(a, complexities)
+                        .cmp(&Self::static_estimate_complexity(b, complexities))
+                });
+            }
+            NormalizedGrammarNode::Sequence(seq) => {
+                for n in seq.iter_mut() {
+                    Self::sort_node_alternatives(n, complexities);
+                }
+            }
+            NormalizedGrammarNode::Field(_, n) => Self::sort_node_alternatives(n, complexities),
+            _ => {}
+        }
+    }
+
+    fn estimate_node_complexity(
+        &self,
+        node: &NormalizedGrammarNode,
+        visited: &mut Vec<usize>,
+    ) -> usize {
+        match node {
+            NormalizedGrammarNode::Terminal(m) => {
+                if m.display() == "ε" {
+                    usize::MAX
+                } else {
+                    1
+                }
+            }
+            NormalizedGrammarNode::Reference(ix) => self.calculate_complexity(*ix, visited),
+            NormalizedGrammarNode::Sequence(seq) => seq
+                .iter()
+                .map(|n| self.estimate_node_complexity(n, visited))
+                .fold(0, |acc, x| acc.saturating_add(x)),
+            NormalizedGrammarNode::Alternative(alts) => alts
+                .iter()
+                .map(|n| self.estimate_node_complexity(n, visited))
+                .min()
+                .unwrap_or(0),
+            NormalizedGrammarNode::Field(_, n) => self.estimate_node_complexity(n, visited),
+        }
+    }
+
+    fn static_estimate_complexity(node: &NormalizedGrammarNode, complexities: &[usize]) -> usize {
+        match node {
+            NormalizedGrammarNode::Terminal(m) => {
+                if m.display() == "ε" {
+                    usize::MAX
+                } else {
+                    1
+                }
+            }
+            NormalizedGrammarNode::Reference(ix) => complexities[*ix],
+            NormalizedGrammarNode::Sequence(seq) => {
+                if seq.is_empty() {
+                    return usize::MAX;
+                }
+                seq.iter()
+                    .map(|n| Self::static_estimate_complexity(n, complexities))
+                    .fold(0, |acc, x| acc.saturating_add(x))
+            }
+            NormalizedGrammarNode::Alternative(alts) => alts
+                .iter()
+                .map(|n| Self::static_estimate_complexity(n, complexities))
+                .min()
+                .unwrap_or(0),
+            NormalizedGrammarNode::Field(_, n) => Self::static_estimate_complexity(n, complexities),
+        }
     }
 
     fn discover_and_desugar(&mut self, start: GrammarNode, start_name: &'static str) {
@@ -176,23 +159,28 @@ impl RuleTable {
 
         self.rule_names = rule_names.clone();
 
-        let mut rules: Vec<NormalizedGrammarNode> = Vec::new();
+        let named_rule_names = self.rule_names.clone();
+        let named_count = named_rule_names.len();
+
+        let mut rules: Vec<NormalizedGrammarNode> = Vec::with_capacity(named_count);
+        let mut anon_rules_all: Vec<NormalizedGrammarNode> = Vec::new();
+        let mut anon_names_all: Vec<&'static str> = Vec::new();
 
         let mut visited: DashSet<&'static str> = DashSet::new();
 
-        for rule_name in rule_names.iter() {
+        for rule_name in named_rule_names.iter() {
             if let Some(grammar_node) = rule_map.get(rule_name) {
-                let (normalized, anon_rules, anon_names) =
-                    self.normalize_node(&grammar_node, &mut visited);
+                let anon_base = named_count + anon_rules_all.len();
+                let (normalized, mut anon_rules, mut anon_names) =
+                    self.normalize_node(&grammar_node, &mut visited, anon_base, &named_rule_names);
                 rules.push(normalized);
-
-                for (name, node) in anon_names.into_iter().zip(anon_rules.into_iter()) {
-                    self.rule_names.push(name);
-                    rules.push(node);
-                }
+                anon_rules_all.append(&mut anon_rules);
+                anon_names_all.append(&mut anon_names);
             }
         }
 
+        self.rule_names.extend(anon_names_all);
+        rules.extend(anon_rules_all);
         self.rules = rules;
     }
 
@@ -210,6 +198,7 @@ impl RuleTable {
 
     fn expand_node(node: NormalizedGrammarNode) -> NormalizedGrammarNode {
         match node {
+            Field(name, inner) => Field(name, Box::new(Self::expand_node(*inner))),
             Sequence(mut nodes) => {
                 if let Some(Alternative(alts)) = nodes.first().cloned() {
                     let rest = nodes.split_off(1);
@@ -224,6 +213,22 @@ impl RuleTable {
                         .map(Self::expand_node)
                         .collect();
                     return Alternative(expanded);
+                }
+                if let Some(Field(name, inner)) = nodes.first().cloned() {
+                    if let Alternative(alts) = *inner {
+                        let rest = nodes.split_off(1);
+                        let expanded = alts
+                            .into_iter()
+                            .map(|alt| {
+                                let mut seq = Vec::with_capacity(1 + rest.len());
+                                seq.push(Field(name, Box::new(alt)));
+                                seq.extend(rest.clone());
+                                Sequence(seq)
+                            })
+                            .map(Self::expand_node)
+                            .collect();
+                        return Alternative(expanded);
+                    }
                 }
                 let out = nodes.into_iter().map(Self::expand_node).collect();
                 Sequence(out)
@@ -241,6 +246,14 @@ impl RuleTable {
 
     fn simplify_node(node: NormalizedGrammarNode) -> NormalizedGrammarNode {
         match node {
+            Field(name, inner) => {
+                let simplified = Self::simplify_node(*inner);
+                if Self::is_epsilon(&simplified) {
+                    simplified
+                } else {
+                    Field(name, Box::new(simplified))
+                }
+            }
             Sequence(nodes) => {
                 let mut out: Vec<NormalizedGrammarNode> = Vec::new();
                 for n in nodes.into_iter().map(Self::simplify_node) {
@@ -303,6 +316,7 @@ impl RuleTable {
     fn factor_node(node: NormalizedGrammarNode) -> NormalizedGrammarNode {
         match node {
             Terminal(_) | Reference(_) => node,
+            Field(name, inner) => Field(name, Box::new(Self::factor_node(*inner))),
             Sequence(nodes) => {
                 let mut out = Vec::with_capacity(nodes.len());
                 for n in nodes {
@@ -505,6 +519,7 @@ impl RuleTable {
         match node {
             Terminal(_) => node.clone(),
             Reference(ix) => Reference(map[*ix]),
+            Field(name, inner) => Field(*name, Box::new(Self::remap_references_static(inner, map))),
             Sequence(nodes) => Sequence(
                 nodes
                     .iter()
@@ -536,6 +551,10 @@ impl RuleTable {
                     Reference(*idx)
                 }
             }
+            Field(name, inner) => Field(
+                *name,
+                Box::new(self.remap_self_references(inner, from_idx, to_idx)),
+            ),
             Sequence(nodes) => Sequence(
                 nodes
                     .iter()
@@ -578,8 +597,19 @@ impl RuleTable {
                 }
             }
 
+            GrammarNode::Field(_, node) => {
+                self.discover_and_collect_references(node, discovered, rule_map);
+            }
+
             GrammarNode::Repetition { node, .. } => {
                 self.discover_and_collect_references(node, discovered, rule_map);
+            }
+
+            GrammarNode::SeparatedRepetition {
+                node, separator, ..
+            } => {
+                self.discover_and_collect_references(node, discovered, rule_map);
+                self.discover_and_collect_references(separator, discovered, rule_map);
             }
         }
     }
@@ -590,6 +620,8 @@ impl RuleTable {
         &self,
         node: &GrammarNode,
         visited: &mut DashSet<&'static str>,
+        anon_base: usize,
+        named_rule_names: &[&'static str],
     ) -> (
         NormalizedGrammarNode,
         Vec<NormalizedGrammarNode>,
@@ -598,25 +630,33 @@ impl RuleTable {
         let mut anon_rules = Vec::new();
         let mut anon_names = Vec::new();
 
+        let mut normalize_child =
+            |node: &GrammarNode,
+             anon_rules: &mut Vec<NormalizedGrammarNode>,
+             anon_names: &mut Vec<&'static str>| {
+                let (norm_node, mut anon, mut names) =
+                    self.normalize_node(node, visited, anon_base, named_rule_names);
+                anon_rules.append(&mut anon);
+                anon_names.append(&mut names);
+                norm_node
+            };
+
         let normalized = match node {
             GrammarNode::Terminal(matcher) => Terminal(Rc::clone(matcher)),
 
             GrammarNode::Reference(_, name) => {
-                let idx = self
-                    .rule_names
+                let idx = named_rule_names
                     .iter()
                     .position(|&n| n == *name)
-                    .unwrap_or_else(|| self.rule_names.len());
+                    .unwrap_or_else(|| named_rule_names.len());
                 Reference(idx)
             }
 
             GrammarNode::Sequence(nodes) => {
                 let mut normalized_nodes = Vec::new();
                 for n in nodes {
-                    let (norm_node, mut anon, mut names) = self.normalize_node(n, visited);
+                    let norm_node = normalize_child(n, &mut anon_rules, &mut anon_names);
                     normalized_nodes.push(norm_node);
-                    anon_rules.append(&mut anon);
-                    anon_names.append(&mut names);
                 }
                 Sequence(normalized_nodes)
             }
@@ -624,25 +664,26 @@ impl RuleTable {
             GrammarNode::Alternative(nodes) => {
                 let mut normalized_nodes = Vec::new();
                 for n in nodes {
-                    let (norm_node, mut anon, mut names) = self.normalize_node(n, visited);
+                    let norm_node = normalize_child(n, &mut anon_rules, &mut anon_names);
                     normalized_nodes.push(norm_node);
-                    anon_rules.append(&mut anon);
-                    anon_names.append(&mut names);
                 }
                 Alternative(normalized_nodes)
             }
 
-            GrammarNode::Repetition { node, min, max } => {
-                let (norm_inner, mut anon, mut names) = self.normalize_node(node, visited);
-                anon_rules.append(&mut anon);
-                anon_names.append(&mut names);
+            GrammarNode::Field(name, node) => {
+                let norm_inner = normalize_child(node, &mut anon_rules, &mut anon_names);
+                Field(*name, Box::new(norm_inner))
+            }
 
-                let anon_idx = self.rule_names.len() + anon_rules.len();
+            GrammarNode::Repetition { node, min, max } => {
+                let norm_inner = normalize_child(node, &mut anon_rules, &mut anon_names);
+
+                let anon_idx = anon_base + anon_rules.len();
 
                 let rep_rule = match (min, max) {
                     (0, None) => {
                         let self_ref = Reference(anon_idx);
-                        Alternative(vec![Terminal(Rc::new(())), norm_inner + self_ref])
+                        Alternative(vec![norm_inner + self_ref, Terminal(Rc::new(()))])
                     }
                     (1, None) => {
                         let self_ref = Reference(anon_idx);
@@ -650,7 +691,8 @@ impl RuleTable {
                     }
                     (min_count, Some(max_count)) => {
                         let mut alternatives = Vec::new();
-                        for count in *min_count..=*max_count {
+                        let start = if *min_count == 0 { 1 } else { *min_count };
+                        for count in start..=*max_count {
                             let mut seq_nodes = vec![norm_inner.clone(); count];
                             let alternative = if seq_nodes.is_empty() {
                                 Terminal(Rc::new(()))
@@ -662,6 +704,9 @@ impl RuleTable {
                                 result
                             };
                             alternatives.push(alternative);
+                        }
+                        if *min_count == 0 {
+                            alternatives.push(Terminal(Rc::new(())));
                         }
                         if alternatives.len() == 1 {
                             alternatives.pop().unwrap()
@@ -680,9 +725,77 @@ impl RuleTable {
                 };
 
                 anon_rules.push(rep_rule);
-                anon_names.push("");
+                anon_names.push("@rep");
 
                 Reference(anon_idx)
+            }
+
+            GrammarNode::SeparatedRepetition {
+                node,
+                separator,
+                min,
+                max,
+            } => {
+                let norm_inner = normalize_child(node, &mut anon_rules, &mut anon_names);
+                let norm_sep = normalize_child(separator, &mut anon_rules, &mut anon_names);
+
+                let list_idx = anon_base + anon_rules.len();
+                let tail_idx = list_idx + 1;
+                let tail_ref = Reference(tail_idx);
+
+                let make_sequence = |count: usize| -> NormalizedGrammarNode {
+                    if count == 0 {
+                        Self::epsilon_node()
+                    } else {
+                        let mut parts = Vec::with_capacity(count * 2 - 1);
+                        for i in 0..count {
+                            parts.push(norm_inner.clone());
+                            if i + 1 < count {
+                                parts.push(norm_sep.clone());
+                            }
+                        }
+                        Self::seq_or_single(parts)
+                    }
+                };
+
+                let list_rule = match (min, max) {
+                    (0, None) => Alternative(vec![
+                        norm_inner.clone() + tail_ref.clone(),
+                        Self::epsilon_node(),
+                    ]),
+                    (1, None) => norm_inner.clone() + tail_ref.clone(),
+                    (min_count, Some(max_count)) => {
+                        let mut alternatives = Vec::new();
+                        let start = if *min_count == 0 { 1 } else { *min_count };
+                        for count in start..=*max_count {
+                            alternatives.push(make_sequence(count));
+                        }
+                        if *min_count == 0 {
+                            alternatives.push(Self::epsilon_node());
+                        }
+                        if alternatives.len() == 1 {
+                            alternatives.pop().unwrap()
+                        } else {
+                            Alternative(alternatives)
+                        }
+                    }
+                    (min_count, None) => {
+                        let prefix = make_sequence(*min_count);
+                        prefix + tail_ref.clone()
+                    }
+                };
+
+                let tail_rule = Alternative(vec![
+                    norm_sep.clone() + norm_inner.clone() + tail_ref.clone(),
+                    Self::epsilon_node(),
+                ]);
+
+                anon_rules.push(list_rule);
+                anon_names.push("@sep");
+                anon_rules.push(tail_rule);
+                anon_names.push("@sep_tail");
+
+                Reference(list_idx)
             }
         };
 
@@ -704,10 +817,12 @@ impl RuleTable {
 
             let mut betas = Vec::new();
             let mut alphas = Vec::new();
+            let mut alpha_fields = Vec::new();
 
             for alt in alts {
-                if let Some(alpha) = Self::strip_left_rec(i, &alt) {
+                if let Some((alpha, field_name)) = Self::strip_left_rec(i, &alt) {
                     alphas.push(alpha);
+                    alpha_fields.push(field_name);
                 } else {
                     betas.push(alt);
                 }
@@ -740,6 +855,7 @@ impl RuleTable {
             left_rec[i] = Some(LeftRecInfo {
                 base: betas,
                 tail: alphas,
+                tail_fields: alpha_fields,
             });
         }
 
@@ -752,27 +868,38 @@ impl RuleTable {
     fn strip_left_rec(
         rule_ix: usize,
         node: &NormalizedGrammarNode,
-    ) -> Option<NormalizedGrammarNode> {
+    ) -> Option<(NormalizedGrammarNode, Option<&'static str>)> {
         match node {
-            Reference(ix) if *ix == rule_ix => Some(Terminal(Rc::new(()))),
+            Reference(ix) if *ix == rule_ix => Some((Terminal(Rc::new(())), None)),
+            Field(name, inner) => match inner.as_ref() {
+                Reference(ix) if *ix == rule_ix => Some((Terminal(Rc::new(())), Some(*name))),
+                _ => Self::strip_left_rec(rule_ix, inner),
+            },
             Sequence(nodes) => {
                 if nodes.is_empty() {
                     None
-                } else if let Reference(ix) = &nodes[0] {
-                    if *ix == rule_ix {
-                        let rest = &nodes[1..];
-                        if rest.is_empty() {
-                            Some(Terminal(Rc::new(())))
-                        } else if rest.len() == 1 {
-                            Some(rest[0].clone())
+                } else {
+                    let first = &nodes[0];
+                    let (first_inner, field_name) = match first {
+                        Field(name, inner) => (inner.as_ref(), Some(*name)),
+                        other => (other, None),
+                    };
+                    if let Reference(ix) = first_inner {
+                        if *ix == rule_ix {
+                            let rest = &nodes[1..];
+                            if rest.is_empty() {
+                                Some((Terminal(Rc::new(())), field_name))
+                            } else if rest.len() == 1 {
+                                Some((rest[0].clone(), field_name))
+                            } else {
+                                Some((Sequence(rest.to_vec()), field_name))
+                            }
                         } else {
-                            Some(Sequence(rest.to_vec()))
+                            None
                         }
                     } else {
                         None
                     }
-                } else {
-                    None
                 }
             }
             _ => None,

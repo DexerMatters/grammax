@@ -4,8 +4,133 @@ use dashmap::DashSet;
 
 use crate::{
     Grammar,
-    grammar::{GrammarError, GrammarInfo, ir::NormalizedGrammarNode},
+    grammar::{GrammarError, GrammarInfo, ir::NormalizedGrammarNode, norm::RuleTable},
 };
+
+impl RuleTable {
+    fn get_rule_name(&self, idx: usize) -> String {
+        self.rule_names
+            .get(idx)
+            .filter(|n| !n.is_empty())
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| format!("@{}", idx))
+    }
+    fn mark_used(&self, node: &NormalizedGrammarNode, used: &mut Vec<bool>) {
+        match node {
+            NormalizedGrammarNode::Terminal(_) => {}
+            NormalizedGrammarNode::Reference(idx) => {
+                if *idx < used.len() && !used[*idx] {
+                    used[*idx] = true;
+                    self.mark_used(&self.rules[*idx], used);
+                }
+            }
+            NormalizedGrammarNode::Field(_, inner) => {
+                self.mark_used(inner, used);
+            }
+            NormalizedGrammarNode::Sequence(nodes) | NormalizedGrammarNode::Alternative(nodes) => {
+                for n in nodes {
+                    self.mark_used(n, used);
+                }
+            }
+        }
+    }
+
+    fn format_node(&self, node: &NormalizedGrammarNode) -> String {
+        self.format_node_inner(node, false)
+    }
+
+    fn format_node_inner(&self, node: &NormalizedGrammarNode, parent_is_seq: bool) -> String {
+        const RESET: &str = "\x1b[0m";
+        const BOLD: &str = "\x1b[1m";
+        const GREY: &str = "\x1b[90m";
+
+        match node {
+            NormalizedGrammarNode::Terminal(matcher) => {
+                format!("{}{}{}", GREY, matcher.display(), RESET)
+            }
+            NormalizedGrammarNode::Reference(index) => {
+                format!("{}{}{}", BOLD, self.get_rule_name(*index), RESET)
+            }
+            NormalizedGrammarNode::Field(name, inner) => {
+                format!("{}:{}", name, self.format_node_inner(inner, false))
+            }
+            NormalizedGrammarNode::Sequence(nodes) => {
+                let parts: Vec<String> = nodes
+                    .iter()
+                    .map(|n| self.format_node_inner(n, true))
+                    .collect();
+                let content = parts.join(" ");
+                // Only wrap in parens if inside an Alternative
+                if parent_is_seq {
+                    content
+                } else {
+                    format!("({})", content)
+                }
+            }
+            NormalizedGrammarNode::Alternative(nodes) => {
+                let parts: Vec<String> = nodes
+                    .iter()
+                    .map(|n| self.format_node_inner(n, false))
+                    .collect();
+                parts.join(" | ")
+            }
+        }
+    }
+}
+
+impl fmt::Display for RuleTable {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const RESET: &str = "\x1b[0m";
+        const BOLD: &str = "\x1b[1m";
+
+        // Find which rules are actually referenced
+        let mut used = vec![false; self.rules.len()];
+        for (i, _) in self.rule_names.iter().enumerate() {
+            if !self.rule_names[i].is_empty() {
+                used[i] = true;
+                self.mark_used(&self.rules[i], &mut used);
+            }
+        }
+
+        // Calculate max name width for alignment (only for rules that will be shown)
+        let max_width = self
+            .rule_names
+            .iter()
+            .enumerate()
+            .filter(|(i, n)| !n.is_empty() || used[*i])
+            .map(|(i, n)| {
+                if n.is_empty() {
+                    format!("@{}", i).len()
+                } else {
+                    n.len()
+                }
+            })
+            .max()
+            .unwrap_or(10);
+
+        for (i, rule) in self.rules.iter().enumerate() {
+            // Skip unused anonymous rules
+            if i < self.rule_names.len() && self.rule_names[i].is_empty() && !used[i] {
+                continue;
+            }
+
+            let name = if i < self.rule_names.len() && !self.rule_names[i].is_empty() {
+                self.rule_names[i].to_string()
+            } else {
+                format!("@{}", i)
+            };
+
+            let formatted_rule = self.format_node(rule);
+            let padded_name = format!("{:<width$}", name, width = max_width);
+            writeln!(
+                f,
+                "  {}{}{} {} {}",
+                BOLD, padded_name, RESET, "→", formatted_rule
+            )?;
+        }
+        Ok(())
+    }
+}
 
 impl fmt::Display for Grammar {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -125,6 +250,9 @@ impl fmt::Display for NormalizedGrammarNode {
             NormalizedGrammarNode::Reference(index) => {
                 write!(f, "@{}", index)
             }
+            NormalizedGrammarNode::Field(name, node) => {
+                write!(f, "{}:{}", name, node)
+            }
             NormalizedGrammarNode::Sequence(nodes) => {
                 let parts: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
                 write!(f, "({})", parts.join(" "))
@@ -132,9 +260,6 @@ impl fmt::Display for NormalizedGrammarNode {
             NormalizedGrammarNode::Alternative(nodes) => {
                 let parts: Vec<String> = nodes.iter().map(|n| n.to_string()).collect();
                 write!(f, "({})", parts.join(" | "))
-            }
-            NormalizedGrammarNode::Field(name, inner) => {
-                write!(f, "{}[{}]", name, inner)
             }
         }
     }

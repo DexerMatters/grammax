@@ -1,4 +1,4 @@
-use std::{fmt, sync::Arc};
+use std::sync::Arc;
 
 use crate::grammar::{dsl::GrammarNode, ir::NormalizedGrammarNode};
 
@@ -9,7 +9,7 @@ use crate::grammar::norm::NormalizedGrammarNode::*;
 #[derive(Clone, Debug)]
 pub struct RuleTable {
     pub rule_names: Vec<&'static str>,
-    pub rule_descriptions: DashMap<usize, &'static str>,
+    pub rule_descriptions: Vec<&'static str>,
     pub rules: Vec<NormalizedGrammarNode>,
     pub left_rec: Vec<Option<LeftRecInfo>>,
 }
@@ -26,7 +26,7 @@ impl RuleTable {
         let len = initial_rules.len();
         Self {
             rule_names: vec![""; len],
-            rule_descriptions: DashMap::new(),
+            rule_descriptions: vec![""; len],
             rules: initial_rules,
             left_rec: vec![None; len],
         }
@@ -184,6 +184,7 @@ impl RuleTable {
         self.rule_names.extend(anon_names_all);
         rules.extend(anon_rules_all);
         self.rules = rules;
+        self.rule_descriptions = vec![""; self.rules.len()];
     }
 
     fn factor_common_prefixes(&mut self) {

@@ -1,9 +1,8 @@
 use crate::{
     new_grammar,
     parsec::{
+        Parser,
         fmt::Display,
-        parser::{Parser, ParserConfig},
-        tree::TreeAlloc,
         words::{EndOfInput, NUMS, STRING, token},
     },
 };
@@ -18,7 +17,7 @@ fn test_parser() {
     );
 
     println!("Grammar:\n{}", grammar);
-    let mut parser = Parser::new_with_config(grammar, ParserConfig::recovering());
+    let mut parser = Parser::new(grammar);
     let result = parser.parse_text("x+x-x+x");
     println!("{}", result.root.display(&parser));
     println!("Messages:");
@@ -40,7 +39,7 @@ fn test_parser_many_grammar() {
         absurd where
         absurd -> many(t("a")) + t(EndOfInput)
     );
-    let mut parser2 = Parser::new_with_config(grammar2, ParserConfig::recovering());
+    let mut parser2 = Parser::new(grammar2);
     let root2 = parser2.parse_text("aaaaaa").root;
     println!("{}", root2.display(&parser2));
 }
@@ -53,7 +52,7 @@ fn test_error_recovery() {
     );
 
     println!("Grammar:\n{}", grammar);
-    let mut parser = Parser::new_with_config(grammar, ParserConfig::recovering());
+    let mut parser = Parser::new(grammar);
     let result = parser.parse_text("(12,3x3,44)");
     let output = result.root.display(&parser);
     println!("{}", output);
@@ -71,19 +70,18 @@ fn test_statement_parser() {
         if_stmt -> t(token("if")) + r!(cond) + r!(block)
         cond -> t(token("(")) + t(token("true")) + t(token(")"))
         block -> t(token("{")) + many(r!(stmt) + t(token(";"))) + t(token("}"))
+    )
+    .in_which("block", "a code block that can contain statements")
+    .in_which(
+        "cond",
+        "A condition that must be true for the if statement to execute",
     );
 
-    let mut parser = Parser::new_with_config(grammar, ParserConfig::recovering_with_memo(1000));
+    let mut parser = Parser::new(grammar);
     let code = r#"
         x = 10;
         x = 20;
-        if (true) {
-            x = 30;
-            x = 40;
-            if (true) {
-                x = 50;
-            };
-        };
+        if (true)
         "#;
     let result = parser.parse_text(code);
     println!("{}", result.root.display(&parser));
@@ -105,7 +103,7 @@ fn test_json_error_recovery() {
         null    -> tt("null")
     );
 
-    let mut parser = Parser::new_with_config(grammar, ParserConfig::recovering_with_memo(1000));
+    let mut parser = Parser::new(grammar);
     let code = r#"{"name": "ok", "age":nulll}"#;
     let result = parser.parse_text(code);
     println!("{}", result.root.display(&parser));
@@ -132,7 +130,7 @@ fn test_selection_schema_current() {
         
     }"#;
 
-    let mut parser = Parser::new_with_config(grammar, ParserConfig::recovering());
+    let mut parser = Parser::new(grammar);
     println!("Selection Schema - Current Structure Test");
     println!("Code: {}", code);
     let result = parser.parse_text(code);

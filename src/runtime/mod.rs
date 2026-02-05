@@ -1,23 +1,20 @@
 use std::{
     ops,
-    sync::{Arc, mpsc},
+    sync::mpsc,
     thread::{self, JoinHandle},
 };
 
-use concurrent_queue::ConcurrentQueue;
-
 use crate::{
     grammar::Grammar,
-    parsec::{
-        msg::ParserMessages,
-        parser::{self, Parser},
-        tree::{RedNode, TreeAlloc},
-    },
+    impl_listener,
+    parsec::{self, Parser, ParserConfig, ParserListener, msg::ParserMessages, tree::RedNode},
     runtime::reparser::Reparser,
     utils::Span,
 };
 
 mod reparser;
+
+pub use reparser::ReparserConfig;
 
 #[cfg(test)]
 mod tests;
@@ -35,7 +32,8 @@ pub enum Action {
     Exit,
 }
 
-pub struct Listener {
+#[derive(Default)]
+pub struct RuntimeListener {
     on_updated: Option<Box<dyn Fn(UpdateResult) + Send>>,
     on_paused: Option<Box<dyn Fn() + Send>>,
     on_resumed: Option<Box<dyn Fn() + Send>>,
@@ -68,81 +66,84 @@ impl<'a> UpdateResult<'a> {
     }
 }
 
-impl Listener {
-    pub fn new() -> Self {
-        Self {
-            on_updated: None,
-            on_paused: None,
-            on_resumed: None,
-            on_interrupted: None,
+pub struct Interactive {
+    grammar: Grammar,
+    config: Option<ParserConfig>,
+    reparser_config: Option<ReparserConfig>,
+    runtime_listener: Option<RuntimeListener>,
+    parser_listener: Option<ParserListener>,
+}
+
+impl Interactive {
+    pub fn new(grammar: Grammar) -> Interactive {
+        Interactive {
+            grammar,
+            config: None,
+            reparser_config: None,
+            runtime_listener: None,
+            parser_listener: None,
         }
     }
-    pub fn with_on_updated<F>(mut self, f: F) -> Self
-    where
-        F: Fn(UpdateResult) + Send + 'static,
-    {
-        self.on_updated = Some(Box::new(f));
+
+    pub fn with_config(mut self, reparser_config: ReparserConfig) -> Self {
+        self.reparser_config = Some(reparser_config);
         self
     }
-    pub fn with_on_paused<F>(mut self, f: F) -> Self
-    where
-        F: Fn() + Send + 'static,
-    {
-        self.on_paused = Some(Box::new(f));
+
+    pub fn with_listener(mut self, listener: RuntimeListener) -> Self {
+        self.runtime_listener = Some(listener);
         self
     }
-    pub fn with_on_resumed<F>(mut self, f: F) -> Self
-    where
-        F: Fn() + Send + 'static,
-    {
-        self.on_resumed = Some(Box::new(f));
+
+    pub fn with_parser_config(mut self, config: ParserConfig) -> Self {
+        self.config = Some(config);
         self
     }
-    pub fn with_on_interrupted<F>(mut self, f: F) -> Self
-    where
-        F: Fn() + Send + 'static,
-    {
-        self.on_interrupted = Some(Box::new(f));
+
+    pub fn with_parser_listener(mut self, listener: ParserListener) -> Self {
+        self.parser_listener = Some(listener);
         self
+    }
+
+    pub fn finish(self) -> InteractiveInstance {
+        InteractiveInstance::init(
+            self.grammar,
+            self.config.unwrap_or_else(ParserConfig::default),
+            self.reparser_config.unwrap_or_else(ReparserConfig::default),
+            self.runtime_listener.unwrap_or_default(),
+            self.parser_listener.unwrap_or_default(),
+        )
     }
 }
 
-pub struct Interactive {
+pub struct InteractiveInstance {
     sender: mpsc::Sender<Action>,
     thread_handle: JoinHandle<()>,
 }
 
-impl Interactive {
-    pub fn new(grammar: Grammar, config: parser::ParserConfig) -> Self {
-        Self::init(grammar, config, Listener::new())
-    }
-    pub fn new_with_listener(
+impl InteractiveInstance {
+    pub(crate) fn init(
         grammar: Grammar,
-        config: parser::ParserConfig,
-        listener: Listener,
+        config: ParserConfig,
+        reparser_config: ReparserConfig,
+        runtime_listener: RuntimeListener,
+        parser_listener: ParserListener,
     ) -> Self {
-        Self::init(grammar, config, listener)
-    }
-    fn init(grammar: Grammar, config: parser::ParserConfig, listener: Listener) -> Self {
         let (sender, inthread_receiver) = mpsc::channel();
-        let sender_clone = sender.clone();
         let thread_handle = thread::spawn(move || {
-            let mut parser = Parser::new_with_config(grammar, config);
+            let mut parser = Parser::new(grammar)
+                .with_config(config)
+                .with_listener(parser_listener);
             let alloc = parser.alloc.clone();
-            let parser::Result {
-                root: cursor,
-                messages,
-            } = parser.parse_text("");
+            let parsec::Result { root: cursor, .. } = parser.parse_text("");
 
             Runtime {
                 text: "".to_string(),
                 parser,
-                messages,
-                cursor: Reparser::new(cursor, alloc),
-                self_sender: sender_clone,
+                cursor: Reparser::new(cursor, alloc).with_config(reparser_config),
                 receiver: inthread_receiver,
                 mode: Mode::Ready,
-                listener,
+                runtime_listener,
             }
             .run_ready_mode();
         });
@@ -197,10 +198,8 @@ enum Mode {
 pub struct Runtime {
     text: String,
     parser: Parser,
-    messages: ParserMessages,
-    listener: Listener,
+    runtime_listener: RuntimeListener,
     cursor: Reparser,
-    self_sender: mpsc::Sender<Action>,
     receiver: mpsc::Receiver<Action>,
 
     mode: Mode,
@@ -216,18 +215,24 @@ impl Runtime {
                 }
                 Action::Exit => {
                     self.mode = Mode::Interrupted;
-                    self.listener.on_interrupted.as_ref().map(|listener| {
-                        (listener)();
-                    });
+                    self.runtime_listener
+                        .on_interrupted
+                        .as_ref()
+                        .map(|listener| {
+                            (listener)();
+                        });
                     break;
                 }
                 _ => { /* Ignored */ }
             }
         }
         if self.mode == Mode::Interrupted {
-            self.listener.on_interrupted.as_ref().map(|listener| {
-                (listener)();
-            });
+            self.runtime_listener
+                .on_interrupted
+                .as_ref()
+                .map(|listener| {
+                    (listener)();
+                });
             return;
         }
         self.run_running_mode();
@@ -238,7 +243,7 @@ impl Runtime {
             match action {
                 Action::Pause => {
                     self.mode = Mode::Paused;
-                    self.listener.on_paused.as_ref().map(|listener| {
+                    self.runtime_listener.on_paused.as_ref().map(|listener| {
                         (listener)();
                     });
                     break;
@@ -250,7 +255,7 @@ impl Runtime {
                     self.parser
                         .apply_edit(&self.text, span.start, old_len, new_len);
                     let result = self.cursor.handle_edit(&mut self.parser, span, text.len());
-                    self.listener.on_updated.as_ref().map(|listener| {
+                    self.runtime_listener.on_updated.as_ref().map(|listener| {
                         (listener)(UpdateResult::new(
                             result.messages,
                             &self.cursor.current,
@@ -266,7 +271,7 @@ impl Runtime {
                     self.parser.apply_edit(&self.text, offset, 0, new_len);
                     let span = Span::new(offset, offset);
                     let result = self.cursor.handle_edit(&mut self.parser, span, text.len());
-                    self.listener.on_updated.as_ref().map(|listener| {
+                    self.runtime_listener.on_updated.as_ref().map(|listener| {
                         (listener)(UpdateResult::new(
                             result.messages,
                             &self.cursor.current,
@@ -281,7 +286,7 @@ impl Runtime {
                     self.text.replace_range(ops::Range::from(span), "");
                     self.parser.apply_edit(&self.text, span.start, old_len, 0);
                     let result = self.cursor.handle_edit(&mut self.parser, span, 0);
-                    self.listener.on_updated.as_ref().map(|listener| {
+                    self.runtime_listener.on_updated.as_ref().map(|listener| {
                         (listener)(UpdateResult::new(
                             result.messages,
                             &self.cursor.current,
@@ -293,9 +298,12 @@ impl Runtime {
                 }
                 Action::Exit => {
                     self.mode = Mode::Interrupted;
-                    self.listener.on_interrupted.as_ref().map(|listener| {
-                        (listener)();
-                    });
+                    self.runtime_listener
+                        .on_interrupted
+                        .as_ref()
+                        .map(|listener| {
+                            (listener)();
+                        });
                     break;
                 }
                 Action::Run => { /* Already running */ }
@@ -313,16 +321,19 @@ impl Runtime {
             match action {
                 Action::Resume => {
                     self.mode = Mode::Running;
-                    self.listener.on_resumed.as_ref().map(|listener| {
+                    self.runtime_listener.on_resumed.as_ref().map(|listener| {
                         (listener)();
                     });
                     break;
                 }
                 Action::Exit => {
                     self.mode = Mode::Interrupted;
-                    self.listener.on_interrupted.as_ref().map(|listener| {
-                        (listener)();
-                    });
+                    self.runtime_listener
+                        .on_interrupted
+                        .as_ref()
+                        .map(|listener| {
+                            (listener)();
+                        });
                     return;
                 }
                 _ => { /* Ignored */ }
@@ -334,3 +345,11 @@ impl Runtime {
         self.run_running_mode();
     }
 }
+
+impl_listener!(
+    RuntimeListener,
+    on_updated(UpdateResult),
+    on_paused(),
+    on_resumed(),
+    on_interrupted()
+);

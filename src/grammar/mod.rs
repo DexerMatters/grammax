@@ -67,4 +67,28 @@ impl Grammar {
             self.table.rule_names[rule_idx]
         }
     }
+
+    pub fn in_which(mut self, rule_name: &'static str, meta: impl RuleMeta) -> Self {
+        if let Some(idx) = self.table.rule_names.iter().position(|&n| n == rule_name) {
+            meta.apply(&mut self, idx);
+        } else {
+            panic!("Rule '{}' not found in grammar", rule_name);
+        }
+        self
+    }
 }
+
+#[allow(private_bounds)]
+pub trait RuleMeta: SealedRuleMeta {}
+
+trait SealedRuleMeta {
+    fn apply(&self, grammar: &mut Grammar, rule_idx: usize);
+}
+
+impl SealedRuleMeta for &'static str {
+    fn apply(&self, grammar: &mut Grammar, rule_idx: usize) {
+        grammar.table.rule_descriptions[rule_idx] = *self;
+    }
+}
+
+impl RuleMeta for &'static str {}

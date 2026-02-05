@@ -3,6 +3,23 @@ use std::collections::VecDeque;
 use std::ops;
 use std::sync::Arc;
 
+#[macro_export]
+macro_rules! impl_listener {
+    ($name: ty, $($field: ident ($($typ : ty),*)),+) => {
+        impl $name {
+            pub fn new() -> Self {
+                Self::default()
+            }
+            $(
+                pub fn $field(mut self, callback: impl Fn($($typ),*) + Send + 'static) -> Self {
+                    self.$field = Some(Box::new(callback));
+                    self
+                }
+            )+
+        }
+    };
+}
+
 #[derive(Clone, Debug)]
 pub struct LruCache<K: Clone + Eq + std::hash::Hash, V: Clone> {
     capacity: usize,

@@ -1,16 +1,12 @@
-use std::rc::Rc;
 use std::{collections::HashSet, sync::Arc};
 
-use dashmap::{DashMap, DashSet};
+use dashmap::DashMap;
 
-use crate::parsec::words::MatcherRef;
-use crate::{
-    grammar::{
-        ir::{BridgeGrammar, NormalizedGrammarNode, RefIx, Scope, State},
-        norm::RuleTable,
-    },
-    parsec::words::Matcher,
+use crate::grammar::{
+    ir::{BridgeGrammar, NormalizedGrammarNode, RefIx, Scope, State},
+    norm::RuleTable,
 };
+use crate::parsec::words::MatcherRef;
 
 impl State {
     pub fn ref_ix(&self) -> RefIx {
@@ -22,22 +18,13 @@ impl State {
             | State::LeftRec(ix, _, _, _) => *ix,
         }
     }
-
-    /// Get child state indices for this state
-    pub fn children(&self) -> &[usize] {
-        match self {
-            State::Tok(_, _) => &[],
-            State::Seq(_, children) | State::Alt(_, children, _) => children,
-            State::Field(_, _, child) => std::slice::from_ref(child),
-            State::LeftRec(_, _, _, _) => &[],
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
 pub struct GrammarStateAnalysis {
     pub states: Vec<State>,
     pub start_state: usize,
+    pub rule_roots: Vec<usize>,
     pub is_recursive: Vec<bool>,
     pub bridge: BridgeGrammar,
 }
@@ -53,6 +40,7 @@ impl GrammarStateAnalysis {
         let mut analysis = Self {
             states: builder.states,
             start_state,
+            rule_roots: builder.root,
             is_recursive: builder.is_recursive,
             bridge: BridgeGrammar {
                 scopes: Vec::new(),
@@ -63,16 +51,12 @@ impl GrammarStateAnalysis {
         analysis
     }
 
-    pub fn rule_set(&self) -> DashSet<usize> {
-        self.states.iter().map(|s| s.ref_ix()).collect()
-    }
-
     pub fn state_id_for_rule(&self, rule_ix: usize) -> Option<usize> {
-        self.states
-            .iter()
-            .position(|state| state.ref_ix() == rule_ix)
+        self.rule_roots
+            .get(rule_ix)
+            .copied()
+            .filter(|&id| id != usize::MAX)
     }
-
     pub fn derive_bridge_grammar(&self) -> BridgeGrammar {
         let mut scopes = Vec::new();
         let mut reef_set = HashSet::new();

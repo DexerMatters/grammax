@@ -68,7 +68,6 @@ pub trait Matcher: Debug {
     fn preview(&self) -> Option<String> {
         None
     }
-
     fn then<U>(self, other: U) -> Sequence<Self, U>
     where
         Self: Sized,
@@ -316,6 +315,11 @@ where
 
         while count < max {
             let before = *pos;
+            // Hacky debug for specific failing case
+            if input.len() > 10 && *pos > 0 && input[*pos..].starts_with("lolname") {
+                // eprintln!("Repeat matching at pos {}: input={:?}", *pos, &input[*pos..(*pos+10).min(input.len())]);
+            }
+
             if self.0.matches(input, pos).is_some() {
                 if *pos == before {
                     break;

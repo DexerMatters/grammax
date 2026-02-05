@@ -1,7 +1,6 @@
 use std::cell::{self, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::ops;
 use std::rc::Rc;
 
 use dashmap::DashMap;

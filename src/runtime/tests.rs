@@ -1,15 +1,15 @@
 use std::{
     sync::{
         Arc,
-        atomic::{self, AtomicIsize, AtomicUsize},
+        atomic::{self, AtomicUsize},
     },
     thread,
 };
 
 use crate::{
     new_grammar,
-    parsec::{fmt::Display, parser::ParserConfig, words::*},
-    runtime::{Interactive, Listener},
+    parsec::{ParserListener, fmt::Display, words::*},
+    runtime::{Interactive, RuntimeListener},
     utils::Span,
 };
 
@@ -21,7 +21,7 @@ fn test_arithmetic_example() {
         expr   -> r!(expr) + t("+") + r!(num) | r!(expr) + t("-") + r!(num) | r!(num)
         num    -> t("x")
     );
-    let listener = Listener::new().with_on_updated(|result| {
+    let listener = RuntimeListener::new().on_updated(|result| {
         eprintln!("Updated source text:\n{}", result.source_text);
         eprintln!(
             "Updated parse tree:\n{}",
@@ -35,8 +35,7 @@ fn test_arithmetic_example() {
         eprintln!("Messages:");
         eprintln!("{}", result.messages.display(&result.current_parser));
     });
-    let runtime =
-        Interactive::new_with_listener(grammar, ParserConfig::recovering_with_memo(1000), listener);
+    let runtime = Interactive::new(grammar).with_listener(listener).finish();
     runtime.run().unwrap();
     runtime.insert(0, "(x+x)".to_string()).unwrap();
     runtime.insert(4, "-x+x".to_string()).unwrap();
@@ -56,7 +55,7 @@ fn test_example() {
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
-    let listener = Listener::new().with_on_updated(|result| {
+    let listener = RuntimeListener::new().on_updated(|result| {
         eprintln!("Updated source text:\n{}", result.source_text);
         eprintln!(
             "Updated parse tree:\n{}",
@@ -85,17 +84,17 @@ fn test_example() {
     let memo_clone = memo_counter.clone();
     let memo_clone2 = memo_counter.clone();
 
-    let config = ParserConfig::recovering_with_memo(1000)
-        .with_on_computation_hook(move |_parser| {
+    let parser_listener = ParserListener::new()
+        .on_computation(move |_parser| {
             comp_counter.fetch_add(1, atomic::Ordering::SeqCst);
         })
-        .with_on_node_reuse_hook(move |_parser| {
+        .on_node_reuse(move |_parser| {
             reuse_counter.fetch_add(1, atomic::Ordering::SeqCst);
         })
-        .with_on_memo_hit_hook(move |_parser| {
+        .on_memo_hit(move |_parser| {
             memo_counter.fetch_add(1, atomic::Ordering::SeqCst);
         })
-        .with_on_start_parse_hook(move |_parser| {
+        .on_start_parse(move |_parser| {
             comp_clone.store(0, atomic::Ordering::SeqCst);
             reuse_clone.store(0, atomic::Ordering::SeqCst);
             memo_clone.store(0, atomic::Ordering::SeqCst);
@@ -107,7 +106,7 @@ fn test_example() {
                 atomic::Ordering::SeqCst,
             );
         })
-        .with_on_finish_parse_hook(move |_parser| {
+        .on_finish_parse(move |_parser| {
             let comp_count = comp_clone2.load(atomic::Ordering::SeqCst);
             let reuse_count = reuse_clone2.load(atomic::Ordering::SeqCst);
             let memo_count = memo_clone2.load(atomic::Ordering::SeqCst);
@@ -129,14 +128,20 @@ fn test_example() {
             let start_time = time.load(atomic::Ordering::SeqCst);
             eprintln!("Time taken: {} ms", end_time - start_time);
         });
-
-    let runtime = Interactive::new_with_listener(grammar, config, listener);
+    let runtime = Interactive::new(grammar)
+        .with_listener(listener)
+        .with_parser_listener(parser_listener)
+        .finish();
     runtime.run().unwrap();
     runtime.insert(0, r#"{"name": ok}"#.to_string()).unwrap();
 
     runtime
         .update(Span::new(8, 11), r#""ok""#.to_string())
         .unwrap();
+
+    runtime.insert(12, r#", "age": 21"#.to_string()).unwrap();
+
+    runtime.insert(21, "2".to_string()).unwrap();
 
     thread::sleep(std::time::Duration::from_millis(100));
 }

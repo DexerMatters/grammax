@@ -1,6 +1,5 @@
 use std::{
     ops::{self, RangeBounds},
-    rc::Rc,
     sync::Arc,
 };
 
@@ -54,6 +53,24 @@ pub fn opt(node: GrammarNode) -> GrammarNode {
     }
 }
 
+pub fn repeat<R: RangeBounds<usize>>(node: GrammarNode, range: R) -> GrammarNode {
+    let min = match range.start_bound() {
+        std::ops::Bound::Included(&n) => n,
+        std::ops::Bound::Excluded(&n) => n + 1,
+        std::ops::Bound::Unbounded => 0,
+    };
+    let max = match range.end_bound() {
+        std::ops::Bound::Included(&n) => Some(n),
+        std::ops::Bound::Excluded(&n) => Some(n.saturating_sub(1)),
+        std::ops::Bound::Unbounded => None,
+    };
+    GrammarNode::Repetition {
+        node: Box::new(node),
+        min,
+        max,
+    }
+}
+
 pub fn many(node: GrammarNode) -> GrammarNode {
     GrammarNode::Repetition {
         node: Box::new(node),
@@ -90,24 +107,6 @@ pub fn sep1(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
 
 pub fn field(name: &'static str, node: GrammarNode) -> GrammarNode {
     GrammarNode::Field(name, Box::new(node))
-}
-
-pub fn repeat<R: RangeBounds<usize>>(node: GrammarNode, range: R) -> GrammarNode {
-    let min = match range.start_bound() {
-        std::ops::Bound::Included(&n) => n,
-        std::ops::Bound::Excluded(&n) => n + 1,
-        std::ops::Bound::Unbounded => 0,
-    };
-    let max = match range.end_bound() {
-        std::ops::Bound::Included(&n) => Some(n),
-        std::ops::Bound::Excluded(&n) => Some(n.saturating_sub(1)),
-        std::ops::Bound::Unbounded => None,
-    };
-    GrammarNode::Repetition {
-        node: Box::new(node),
-        min,
-        max,
-    }
 }
 
 impl ops::Add for GrammarNode {

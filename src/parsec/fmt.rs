@@ -1,8 +1,8 @@
 use crate::{
     grammar::ir::State,
     parsec::{
+        Parser,
         msg::ParserMessages,
-        parser::Parser,
         tree::{RedNode, Tag, TreeAllocRefExt},
     },
 };
@@ -123,11 +123,17 @@ fn display_state_index(parser: &Parser, ix: usize, seen: &mut HashSet<usize>) ->
 
 fn display_state_inner(state: &State, parser: &Parser, seen: &mut HashSet<usize>) -> String {
     let rule_names = &parser.grammar.table.rule_names;
+    let rule_descs = &parser.grammar.table.rule_descriptions;
 
     let rule_ix = state.ref_ix();
     if let Some(name) = rule_names.get(rule_ix) {
         if !name.starts_with('@') && !name.is_empty() {
-            return name.to_string();
+            let desc = rule_descs[rule_ix];
+            return if desc.is_empty() {
+                name.to_string()
+            } else {
+                desc.to_string()
+            };
         }
     }
 

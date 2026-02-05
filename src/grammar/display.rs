@@ -4,11 +4,7 @@ use dashmap::DashSet;
 
 use crate::{
     Grammar,
-    grammar::{
-        GrammarError, GrammarInfo,
-        ir::{NormalizedGrammarNode, State},
-        norm::RuleTable,
-    },
+    grammar::{GrammarError, GrammarInfo, ir::NormalizedGrammarNode, norm::RuleTable},
 };
 
 impl RuleTable {

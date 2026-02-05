@@ -1,6 +1,6 @@
-use std::{ops, rc::Rc, sync::Arc};
+use std::ops;
 
-use crate::parsec::words::{Matcher, MatcherRef};
+use crate::parsec::words::MatcherRef;
 
 #[derive(Clone, Debug)]
 pub enum NormalizedGrammarNode {

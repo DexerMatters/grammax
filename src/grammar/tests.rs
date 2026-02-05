@@ -1,5 +1,4 @@
-use crate::{grammar::Grammar, new_grammar};
-use std::f32::INFINITY;
+use crate::new_grammar;
 
 #[test]
 fn test_grammar_norm() {

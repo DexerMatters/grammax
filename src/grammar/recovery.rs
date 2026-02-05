@@ -1,8 +1,6 @@
 use crate::grammar::{Grammar, ir::State};
-use crate::parsec::words::{Matcher, MatcherRef};
+use crate::parsec::words::MatcherRef;
 use std::collections::HashSet;
-use std::rc::Rc;
-use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct Region {

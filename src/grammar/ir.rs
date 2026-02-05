@@ -1,10 +1,10 @@
-use std::{ops, rc::Rc};
+use std::{ops, rc::Rc, sync::Arc};
 
-use crate::parsec::words::Matcher;
+use crate::parsec::words::{Matcher, MatcherRef};
 
 #[derive(Clone, Debug)]
 pub enum NormalizedGrammarNode {
-    Terminal(Rc<dyn Matcher>),
+    Terminal(MatcherRef),
     Alternative(Vec<NormalizedGrammarNode>),
     Sequence(Vec<NormalizedGrammarNode>),
     Reference(usize),
@@ -57,7 +57,7 @@ pub type RefIx = usize;
 
 #[derive(Clone, Debug)]
 pub enum State {
-    Tok(RefIx, Rc<dyn Matcher>),
+    Tok(RefIx, MatcherRef),
     Seq(RefIx, Vec<usize>),
     Alt(RefIx, Vec<usize>, bool), // (rule_ix, children, has_epsilon)
     Field(RefIx, &'static str, usize),

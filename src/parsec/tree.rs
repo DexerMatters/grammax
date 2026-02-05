@@ -1,6 +1,8 @@
+use std::cell::{self, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops;
+use std::rc::Rc;
 
 use dashmap::DashMap;
 
@@ -8,7 +10,7 @@ use dashmap::DashMap;
 pub enum ParsecError {
     Incomplete,
     UnexpectedToken,
-    MissingToken, // Inserted
+    MissingToken,
     Placeholder,
 }
 
@@ -40,14 +42,15 @@ impl Tag {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RedNode {
-    pub parent: Option<Box<RedNode>>,
+    pub parent: Option<Rc<RedNode>>,
     pub offset: usize,
     pub green: GreenId,
 }
 
 impl RedNode {
-    pub(crate) fn new_root(alloc: &TreeAlloc, text: &str) -> Self {
+    pub(crate) fn new_root(alloc: TreeAllocRef, text: &str) -> Self {
         Self {
             parent: None,
             offset: 0,
@@ -63,9 +66,20 @@ pub struct GreenNode {
     pub children: Vec<GreenId>,
 }
 
+#[derive(Debug)]
 pub(crate) struct TreeAlloc {
     nodes: boxcar::Vec<GreenNode>,
     dedup: DashMap<u64, Vec<usize>>,
+}
+
+pub(crate) type TreeAllocRef = Rc<RefCell<TreeAlloc>>;
+
+pub(crate) trait TreeAllocRefExt {
+    fn get_node(&self, id: GreenId) -> cell::Ref<'_, GreenNode>;
+    fn get_node_mut(&self, id: GreenId) -> cell::RefMut<'_, GreenNode>;
+    fn alloc_token(&self, tag: Tag, width: usize) -> GreenId;
+    fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId;
+    fn new_placeholder(&self, width: usize) -> GreenId;
 }
 
 impl TreeAlloc {
@@ -75,20 +89,22 @@ impl TreeAlloc {
             dedup: DashMap::new(),
         }
     }
+}
 
-    pub fn get_node(&self, id: GreenId) -> &GreenNode {
-        &self.nodes[id]
+impl TreeAllocRefExt for TreeAllocRef {
+    fn get_node(&self, id: GreenId) -> std::cell::Ref<'_, GreenNode> {
+        cell::Ref::map(self.borrow(), |alloc| alloc.nodes.get(id).unwrap())
     }
 
-    pub fn get_node_mut(&mut self, id: GreenId) -> &mut GreenNode {
-        self.nodes.get_mut(id).unwrap()
+    fn get_node_mut(&self, id: GreenId) -> cell::RefMut<'_, GreenNode> {
+        cell::RefMut::map(self.borrow_mut(), |alloc| alloc.nodes.get_mut(id).unwrap())
     }
 
-    pub fn alloc_token(&self, tag: Tag, width: usize) -> GreenId {
+    fn alloc_token(&self, tag: Tag, width: usize) -> GreenId {
         self.alloc(tag, vec![], width)
     }
 
-    pub fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId {
+    fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId {
         let node = GreenNode {
             tag,
             children,
@@ -96,46 +112,32 @@ impl TreeAlloc {
         };
 
         let should_dedup = matches!(node.tag, Tag::Token { .. } | Tag::Error(_));
-
+        let borrowed = self.borrow();
         if should_dedup {
             let mut hasher = DefaultHasher::new();
             node.hash(&mut hasher);
             let hash = hasher.finish();
 
-            if let Some(indices) = self.dedup.get(&hash) {
+            if let Some(indices) = borrowed.dedup.get(&hash) {
                 for &idx in indices.iter() {
-                    if self.nodes[idx] == node {
+                    if borrowed.nodes[idx] == node {
                         return idx;
                     }
                 }
             }
 
-            let idx = self.nodes.count();
-            self.nodes.push(node);
-            self.dedup.entry(hash).or_default().push(idx);
+            let idx = borrowed.nodes.count();
+            borrowed.nodes.push(node);
+            borrowed.dedup.entry(hash).or_default().push(idx);
             idx
         } else {
-            let idx = self.nodes.count();
-            self.nodes.push(node);
+            let idx = borrowed.nodes.count();
+            borrowed.nodes.push(node);
             idx
         }
     }
 
-    pub fn new_placeholder(&self, width: usize) -> GreenId {
+    fn new_placeholder(&self, width: usize) -> GreenId {
         self.alloc(Tag::Error(vec![ParsecError::Placeholder]), vec![], width)
-    }
-}
-
-impl ops::Index<GreenId> for TreeAlloc {
-    type Output = GreenNode;
-
-    fn index(&self, index: GreenId) -> &Self::Output {
-        &self.nodes[index]
-    }
-}
-
-impl ops::IndexMut<GreenId> for TreeAlloc {
-    fn index_mut(&mut self, index: GreenId) -> &mut Self::Output {
-        self.nodes.get_mut(index).unwrap()
     }
 }

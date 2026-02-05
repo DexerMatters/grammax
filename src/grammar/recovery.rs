@@ -1,7 +1,8 @@
 use crate::grammar::{Grammar, ir::State};
-use crate::parsec::words::Matcher;
+use crate::parsec::words::{Matcher, MatcherRef};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 #[derive(Clone, Debug)]
 pub struct Region {
@@ -20,7 +21,7 @@ pub struct RecoverySpecs {
 
 #[derive(Clone, Debug)]
 pub struct ErrorRecoveryStrategy {
-    pub sync_tokens: Vec<Rc<dyn Matcher>>,
+    pub sync_tokens: Vec<MatcherRef>,
     pub recovery_states: HashSet<usize>,
 }
 

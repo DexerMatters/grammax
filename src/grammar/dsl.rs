@@ -1,13 +1,14 @@
 use std::{
     ops::{self, RangeBounds},
     rc::Rc,
+    sync::Arc,
 };
 
-use crate::parsec::words::Matcher;
+use crate::parsec::words::{Matcher, MatcherRef, token};
 
 #[derive(Clone)]
 pub enum GrammarNode {
-    Terminal(Rc<dyn Matcher>),
+    Terminal(MatcherRef),
     Alternative(Vec<GrammarNode>),
     Sequence(Vec<GrammarNode>),
     Reference(fn() -> GrammarNode, &'static str),
@@ -29,8 +30,12 @@ pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
     GrammarNode::Reference(f, name)
 }
 
-pub fn t<M: Matcher + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Rc::new(matcher))
+pub fn t<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
+    GrammarNode::Terminal(Arc::new(matcher))
+}
+
+pub fn tt<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
+    GrammarNode::Terminal(Arc::new(token(matcher)))
 }
 
 pub fn seq(nodes: Vec<GrammarNode>) -> GrammarNode {

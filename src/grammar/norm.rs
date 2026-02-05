@@ -1,4 +1,4 @@
-use std::{fmt, rc::Rc};
+use std::{fmt, sync::Arc};
 
 use crate::grammar::{dsl::GrammarNode, ir::NormalizedGrammarNode};
 
@@ -294,7 +294,7 @@ impl RuleTable {
     }
 
     fn epsilon_node() -> NormalizedGrammarNode {
-        Terminal(Rc::new(()))
+        Terminal(Arc::new(()))
     }
 
     fn seq_or_single(mut seq: Vec<NormalizedGrammarNode>) -> NormalizedGrammarNode {
@@ -434,7 +434,7 @@ impl RuleTable {
                     for seq in group {
                         let rest = &seq[prefix_len..];
                         let suffix = if rest.is_empty() {
-                            Terminal(Rc::new(()))
+                            Terminal(Arc::new(()))
                         } else if rest.len() == 1 {
                             rest[0].clone()
                         } else {
@@ -642,7 +642,7 @@ impl RuleTable {
             };
 
         let normalized = match node {
-            GrammarNode::Terminal(matcher) => Terminal(Rc::clone(matcher)),
+            GrammarNode::Terminal(matcher) => Terminal(Arc::clone(matcher)),
 
             GrammarNode::Reference(_, name) => {
                 let idx = named_rule_names
@@ -683,7 +683,7 @@ impl RuleTable {
                 let rep_rule = match (min, max) {
                     (0, None) => {
                         let self_ref = Reference(anon_idx);
-                        Alternative(vec![norm_inner + self_ref, Terminal(Rc::new(()))])
+                        Alternative(vec![norm_inner + self_ref, Terminal(Arc::new(()))])
                     }
                     (1, None) => {
                         let self_ref = Reference(anon_idx);
@@ -695,7 +695,7 @@ impl RuleTable {
                         for count in start..=*max_count {
                             let mut seq_nodes = vec![norm_inner.clone(); count];
                             let alternative = if seq_nodes.is_empty() {
-                                Terminal(Rc::new(()))
+                                Terminal(Arc::new(()))
                             } else {
                                 let mut result = seq_nodes.remove(0);
                                 for node in seq_nodes {
@@ -706,7 +706,7 @@ impl RuleTable {
                             alternatives.push(alternative);
                         }
                         if *min_count == 0 {
-                            alternatives.push(Terminal(Rc::new(())));
+                            alternatives.push(Terminal(Arc::new(())));
                         }
                         if alternatives.len() == 1 {
                             alternatives.pop().unwrap()
@@ -845,7 +845,7 @@ impl RuleTable {
             for alpha in &alphas {
                 tail_alts.push(Self::append_rec(alpha, &tail_ref));
             }
-            tail_alts.push(Terminal(Rc::new(())));
+            tail_alts.push(Terminal(Arc::new(())));
 
             let new_rule = Self::alt_or_single(base_alts);
             let tail_rule = Self::alt_or_single(tail_alts);
@@ -870,9 +870,9 @@ impl RuleTable {
         node: &NormalizedGrammarNode,
     ) -> Option<(NormalizedGrammarNode, Option<&'static str>)> {
         match node {
-            Reference(ix) if *ix == rule_ix => Some((Terminal(Rc::new(())), None)),
+            Reference(ix) if *ix == rule_ix => Some((Terminal(Arc::new(())), None)),
             Field(name, inner) => match inner.as_ref() {
-                Reference(ix) if *ix == rule_ix => Some((Terminal(Rc::new(())), Some(*name))),
+                Reference(ix) if *ix == rule_ix => Some((Terminal(Arc::new(())), Some(*name))),
                 _ => Self::strip_left_rec(rule_ix, inner),
             },
             Sequence(nodes) => {
@@ -888,7 +888,7 @@ impl RuleTable {
                         if *ix == rule_ix {
                             let rest = &nodes[1..];
                             if rest.is_empty() {
-                                Some((Terminal(Rc::new(())), field_name))
+                                Some((Terminal(Arc::new(())), field_name))
                             } else if rest.len() == 1 {
                                 Some((rest[0].clone(), field_name))
                             } else {

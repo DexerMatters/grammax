@@ -1,9 +1,8 @@
 use std::{
     fmt::Debug,
-    ops::{self, Index, IndexMut},
+    ops::{self},
+    sync::Arc,
 };
-
-use crate::utils::Span;
 
 #[derive(Debug, Clone, Copy)]
 pub struct EndOfInput;
@@ -94,6 +93,8 @@ pub trait Matcher: Debug {
         Repeat(self, range)
     }
 }
+
+pub type MatcherRef = Arc<dyn Matcher + Send + Sync + 'static>;
 
 impl Matcher for () {
     fn matches<'a>(&self, _input: &'a str, _pos: &mut usize) -> Option<usize> {

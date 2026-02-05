@@ -1,8 +1,9 @@
-use std::collections::HashSet;
 use std::rc::Rc;
+use std::{collections::HashSet, sync::Arc};
 
 use dashmap::{DashMap, DashSet};
 
+use crate::parsec::words::MatcherRef;
 use crate::{
     grammar::{
         ir::{BridgeGrammar, NormalizedGrammarNode, RefIx, Scope, State},
@@ -80,13 +81,20 @@ impl GrammarStateAnalysis {
                 }
             }
 
-            let rule_ix = state.ref_ix();
-            if rule_ix >= self.is_recursive.len() || !self.is_recursive[rule_ix] {
-                continue;
-            }
-
             // Check for Scopes
             if let State::Seq(_, children) = state {
+                let rule_ix = state.ref_ix();
+                let is_rule_recursive =
+                    rule_ix < self.is_recursive.len() && self.is_recursive[rule_ix];
+                let has_recursive_child = children.iter().any(|&child| {
+                    let child_rule_ix = self.states[child].ref_ix();
+                    child_rule_ix < self.is_recursive.len() && self.is_recursive[child_rule_ix]
+                });
+
+                if !is_rule_recursive && !has_recursive_child {
+                    continue;
+                }
+
                 if children.len() < 2 {
                     continue;
                 }
@@ -173,7 +181,7 @@ impl<'a> Builder<'a> {
         for ix in 0..n {
             if this.is_recursive[ix] {
                 this.root[ix] = this.states.len();
-                this.states.push(State::Tok(ix, Rc::new("")));
+                this.states.push(State::Tok(ix, Arc::new("")));
             }
         }
 
@@ -192,7 +200,7 @@ impl<'a> Builder<'a> {
             } else {
                 let id = self.states.len();
                 self.root[ix] = id;
-                self.states.push(State::Tok(ix, Rc::new("")));
+                self.states.push(State::Tok(ix, Arc::new("")));
                 id
             };
 
@@ -235,13 +243,13 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn mk_tok(&mut self, ref_ix: RefIx, matcher: &Rc<dyn Matcher>) -> usize {
+    fn mk_tok(&mut self, ref_ix: RefIx, matcher: &MatcherRef) -> usize {
         let key = (ref_ix, matcher.display());
         if let Some(id) = self.tok.get(&key) {
             return *id;
         }
         let id = self.states.len();
-        self.states.push(State::Tok(ref_ix, matcher.clone()));
+        self.states.push(State::Tok(ref_ix, Arc::clone(matcher)));
         self.tok.insert(key, id);
         id
     }

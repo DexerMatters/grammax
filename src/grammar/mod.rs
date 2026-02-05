@@ -8,7 +8,7 @@ pub mod recovery;
 #[cfg(test)]
 mod tests;
 
-use std::fmt;
+use std::{fmt, sync::Arc};
 
 use dashmap::DashSet;
 
@@ -31,18 +31,21 @@ macro_rules! new_grammar {
     };
 }
 
+#[derive(Debug)]
 pub enum GrammarError {
     InfiniteConsumption(usize),
 }
 
+#[derive(Debug)]
 pub enum GrammarInfo {
     RecursionDetected(usize),
     DirectReference(usize),
 }
 
+#[derive(Debug)]
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
-    pub(crate) analysis: analysis::GrammarStateAnalysis,
+    pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,
     errors: Vec<GrammarError>,
     infos: Vec<GrammarInfo>,
 }
@@ -52,7 +55,7 @@ impl Grammar {
         let mut table = norm::RuleTable::new(vec![]);
         table.compute_from(node, start_rule);
 
-        let analysis = analysis::GrammarStateAnalysis::from_table(&table, 0);
+        let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(&table, 0));
         Self {
             table,
             analysis,

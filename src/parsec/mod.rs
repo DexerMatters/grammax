@@ -1,4 +1,5 @@
-pub mod display;
+pub mod fmt;
+pub mod msg;
 pub mod parser;
 pub mod tree;
 pub mod words;

@@ -67,6 +67,12 @@ impl GrammarStateAnalysis {
         self.states.iter().map(|s| s.ref_ix()).collect()
     }
 
+    pub fn state_id_for_rule(&self, rule_ix: usize) -> Option<usize> {
+        self.states
+            .iter()
+            .position(|state| state.ref_ix() == rule_ix)
+    }
+
     pub fn derive_bridge_grammar(&self) -> BridgeGrammar {
         let mut scopes = Vec::new();
         let mut reef_set = HashSet::new();

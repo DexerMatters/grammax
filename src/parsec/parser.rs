@@ -454,6 +454,18 @@ impl Parser {
             .map(|strategy| RecoverySpecs::from_text_with_strategy(&self.text, strategy));
     }
 
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn recovery_specs(&self) -> Option<&RecoverySpecs> {
+        self.specs.as_ref()
+    }
+
+    pub fn recovery_strategy(&self) -> Option<&ErrorRecoveryStrategy> {
+        self.recovery_strategy.as_ref()
+    }
+
     fn parse(
         &mut self,
         node_id: usize,

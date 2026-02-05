@@ -1,16 +1,13 @@
-pub mod analysis;
+pub(crate) mod analysis;
 pub mod display;
 pub mod dsl;
 pub(crate) mod ir;
-mod norm;
-pub mod recovery;
-
+pub(crate) mod norm;
+pub(crate) mod recovery;
 #[cfg(test)]
 mod tests;
 
-use std::{fmt, sync::Arc};
-
-use dashmap::DashSet;
+use std::sync::Arc;
 
 #[macro_export]
 macro_rules! r {

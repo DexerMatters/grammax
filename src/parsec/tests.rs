@@ -97,7 +97,7 @@ fn test_json_error_recovery() {
         json where
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> r!(string) + tt(":") + r!(json)
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
         string  -> tt("\"") + t(STRING) + tt("\"")
         number  -> tt(NUMS)
@@ -106,7 +106,7 @@ fn test_json_error_recovery() {
     );
 
     let mut parser = Parser::new_with_config(grammar, ParserConfig::recovering_with_memo(1000));
-    let code = r#"{"name": "ok", "bad": true, "age": 21}"#;
+    let code = r#"{"name": "ok", "age":nulll}"#;
     let result = parser.parse_text(code);
     println!("{}", result.root.display(&parser));
     println!("Messages:");

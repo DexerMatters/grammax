@@ -14,12 +14,42 @@ use crate::{
 };
 
 #[test]
+fn test_arithmetic_example() {
+    let grammar = new_grammar!(
+        start where
+        start  -> t("(") + r!(expr) + t(")") + t(EndOfInput)
+        expr   -> r!(expr) + t("+") + r!(num) | r!(expr) + t("-") + r!(num) | r!(num)
+        num    -> t("x")
+    );
+    let listener = Listener::new().with_on_updated(|result| {
+        eprintln!("Updated source text:\n{}", result.source_text);
+        eprintln!(
+            "Updated parse tree:\n{}",
+            result.current_tree.display(&result.current_parser)
+        );
+        eprintln!(
+            "Reparsed tree:\n{}",
+            result.reparsed_tree.display(&result.current_parser)
+        );
+        eprintln!("Offset: {}", result.current_tree.offset);
+        eprintln!("Messages:");
+        eprintln!("{}", result.messages.display(&result.current_parser));
+    });
+    let runtime =
+        Interactive::new_with_listener(grammar, ParserConfig::recovering_with_memo(1000), listener);
+    runtime.run().unwrap();
+    runtime.insert(0, "(x+x)".to_string()).unwrap();
+    runtime.insert(4, "-x+x".to_string()).unwrap();
+    thread::sleep(std::time::Duration::from_millis(100));
+}
+
+#[test]
 fn test_example() {
     let grammar = new_grammar!(
         json where
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> r!(string) + tt(":") + r!(json)
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
         string  -> tt("\"") + t(STRING) + tt("\"")
         number  -> tt(NUMS)
@@ -55,7 +85,7 @@ fn test_example() {
     let memo_clone = memo_counter.clone();
     let memo_clone2 = memo_counter.clone();
 
-    let config = ParserConfig::recovering()
+    let config = ParserConfig::recovering_with_memo(1000)
         .with_on_computation_hook(move |_parser| {
             comp_counter.fetch_add(1, atomic::Ordering::SeqCst);
         })
@@ -98,17 +128,14 @@ fn test_example() {
                 .as_millis() as isize;
             let start_time = time.load(atomic::Ordering::SeqCst);
             eprintln!("Time taken: {} ms", end_time - start_time);
-        })
-        .with_memo(1000);
+        });
 
     let runtime = Interactive::new_with_listener(grammar, config, listener);
     runtime.run().unwrap();
-    runtime.insert(0, r#"{"name": "ok"}"#.to_string()).unwrap();
-
-    runtime.insert(13, r#", "age": 21"#.to_string()).unwrap();
+    runtime.insert(0, r#"{"name": ok}"#.to_string()).unwrap();
 
     runtime
-        .update(Span::new(21, 24), "null".to_string())
+        .update(Span::new(8, 11), r#""ok""#.to_string())
         .unwrap();
 
     thread::sleep(std::time::Duration::from_millis(100));

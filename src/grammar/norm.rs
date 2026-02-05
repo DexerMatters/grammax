@@ -9,6 +9,7 @@ use crate::grammar::norm::NormalizedGrammarNode::*;
 #[derive(Clone, Debug)]
 pub struct RuleTable {
     pub rule_names: Vec<&'static str>,
+    pub rule_descriptions: DashMap<usize, &'static str>,
     pub rules: Vec<NormalizedGrammarNode>,
     pub left_rec: Vec<Option<LeftRecInfo>>,
 }
@@ -25,6 +26,7 @@ impl RuleTable {
         let len = initial_rules.len();
         Self {
             rule_names: vec![""; len],
+            rule_descriptions: DashMap::new(),
             rules: initial_rules,
             left_rec: vec![None; len],
         }

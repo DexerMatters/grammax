@@ -71,8 +71,17 @@ pub struct Scope {
     pub rule_ix: usize,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeparableScope {
+    pub rule_ix: usize,
+    pub item_rule_ix: usize,
+    pub separator: String,
+    pub wrapper_rule_ix: Option<usize>,
+}
+
 #[derive(Clone, Debug)]
 pub struct BridgeGrammar {
     pub scopes: Vec<Scope>,
     pub reefs: Vec<String>,
+    pub separable_scopes: Vec<SeparableScope>,
 }

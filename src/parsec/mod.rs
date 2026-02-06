@@ -6,8 +6,6 @@ pub mod words;
 #[cfg(test)]
 mod tests;
 
-use dashmap::DashSet;
-
 use crate::{
     grammar::{
         Grammar,
@@ -22,9 +20,9 @@ use crate::{
     },
     utils::{LruCache, Span},
 };
+use rustc_hash::FxHashSet;
 use std::{
     cell::RefCell,
-    collections::HashMap,
     fmt as fmt2,
     hash::{Hash, Hasher},
     rc::Rc,
@@ -33,12 +31,38 @@ use std::{
 
 pub struct ParserConfig {
     pub recover: bool,
-    pub memo_capacity: usize, // 0 = disabled, >0 = LRU cache size
+    pub memo_capacity: usize, // 0 = disabled, >0 = LRU cache size for probe memo
+    pub node_cache_capacity: usize, // 0 = disabled, >0 = LRU cache size for incremental reuse
+    pub simple_ast: bool,     // true = skip @ rules; false = create nodes for all rules
 }
 
 impl ParserConfig {
     pub fn default() -> Self {
-        Self::new()
+        Self {
+            recover: true,
+            memo_capacity: 1000,
+            node_cache_capacity: 1000,
+            simple_ast: true,
+        }
+    }
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_simple_ast(mut self, simple: bool) -> Self {
+        self.simple_ast = simple;
+        self
+    }
+
+    pub fn with_memo_capacity(mut self, capacity: usize) -> Self {
+        self.memo_capacity = capacity;
+        self
+    }
+
+    pub fn with_node_cache_capacity(mut self, capacity: usize) -> Self {
+        self.node_cache_capacity = capacity;
+        self
     }
 }
 
@@ -47,6 +71,8 @@ impl fmt2::Debug for ParserConfig {
         f.debug_struct("ParserConfig")
             .field("recover", &self.recover)
             .field("memo_capacity", &self.memo_capacity)
+            .field("node_cache_capacity", &self.node_cache_capacity)
+            .field("simple_ast", &self.simple_ast)
             .finish()
     }
 }
@@ -62,11 +88,6 @@ pub struct ParserListener {
     pub on_start_parse: Option<Box<dyn Fn(&Parser) + Send>>,
     pub on_finish_parse: Option<Box<dyn Fn(&Parser) + Send>>,
     pub on_computation: Option<Box<dyn Fn(&Parser) + Send>>,
-    pub on_memo_hit: Option<Box<dyn Fn(&Parser) + Send>>,
-    pub on_node_reuse: Option<Box<dyn Fn(&Parser) + Send>>,
-    pub on_recovery_attempt: Option<Box<dyn Fn(&Parser) + Send>>,
-    pub on_recovery_success: Option<Box<dyn Fn(&Parser) + Send>>,
-    pub on_recovery_failure: Option<Box<dyn Fn(&Parser) + Send>>,
     pub on_error: Option<Box<dyn Fn(&Parser) + Send>>,
 }
 
@@ -78,15 +99,6 @@ impl fmt2::Debug for ParserListener {
     }
 }
 
-impl ParserConfig {
-    pub fn new() -> Self {
-        Self {
-            recover: true,
-            memo_capacity: 1000,
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct Parser {
     pub(crate) text: Arc<str>,
@@ -94,13 +106,17 @@ pub struct Parser {
     pub(crate) alloc: TreeAllocRef,
     pub(crate) messages: ParserMessages,
     pub(crate) listener: ParserListener,
-    in_flight: DashSet<ParseKey>,
-    probe_in_flight: DashSet<ProbeKey>,
+    in_flight: FxHashSet<ParseKey>,
+    probe_in_flight: FxHashSet<ProbeKey>,
     probe_memo: Option<LruCache<ProbeKey, ParseResult>>,
-    node_cache: HashMap<NodeCacheKey, CachedNode>,
+    node_cache: LruCache<NodeCacheKey, CachedNode>,
     config: ParserConfig,
     specs: Option<RecoverySpecs>,
     recovery_strategy: Option<ErrorRecoveryStrategy>,
+    pub(crate) incremental_insert_pos: Option<usize>,
+    pub(crate) old_tree: Option<Rc<RedNode>>,
+    pub(crate) newly_computed_nodes: Vec<Span>,
+    pub(crate) newly_computed_tokens: Vec<Span>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -118,10 +134,8 @@ struct ProbeKey {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NodeCacheKey {
-    rule_ix: usize,
+    state_id: usize,
     pos: usize,
-    width: usize,
-    content_hash: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -129,6 +143,7 @@ struct CachedNode {
     node_id: usize,
     pos: usize,
     width: usize,
+    content_hash: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -177,12 +192,29 @@ impl Parser {
 
     pub fn with_config(mut self, config: ParserConfig) -> Self {
         self.config = config;
+        self.probe_memo = if self.config.memo_capacity > 0 {
+            Some(LruCache::new(self.config.memo_capacity))
+        } else {
+            None
+        };
+        self.node_cache = LruCache::new(self.config.node_cache_capacity);
         self
     }
 
     pub fn with_listener(mut self, listener: ParserListener) -> Self {
         self.listener = listener;
         self
+    }
+
+    /// Set the insertion position for incremental parsing.
+    /// When set, the parser will try to reuse old content before this position
+    /// and only parse new content at and after this position.
+    pub fn set_incremental_insert_pos(&mut self, pos: Option<usize>) {
+        self.incremental_insert_pos = pos;
+    }
+
+    pub fn set_old_tree(&mut self, tree: Option<Rc<RedNode>>) {
+        self.old_tree = tree;
     }
 
     fn init(grammar: Grammar, config: ParserConfig, alloc: TreeAllocRef) -> Parser {
@@ -196,19 +228,24 @@ impl Parser {
         } else {
             None
         };
+        let node_cache_capacity = config.node_cache_capacity;
         Self {
             text: Arc::from(""),
             grammar,
             alloc,
             listener: ParserListener::default(),
             messages: Vec::new(),
-            in_flight: DashSet::new(),
-            probe_in_flight: DashSet::new(),
+            in_flight: FxHashSet::default(),
+            probe_in_flight: FxHashSet::default(),
             probe_memo,
-            node_cache: HashMap::new(),
+            node_cache: LruCache::new(node_cache_capacity),
             config,
             specs: None,
             recovery_strategy,
+            incremental_insert_pos: None,
+            old_tree: None,
+            newly_computed_nodes: Vec::new(),
+            newly_computed_tokens: Vec::new(),
         }
     }
 
@@ -257,14 +294,15 @@ impl Parser {
     }
 
     pub fn parse_rule(&mut self, rule_ix: usize, pos: usize) -> Option<usize> {
-        self.messages.clear();
         let state_id = self.grammar.analysis.state_id_for_rule(rule_ix)?;
+        self.parse_state(state_id, pos)
+    }
 
-        // Check node cache first
-        if let Some(cached) = self.try_reuse_node(rule_ix, pos) {
-            if let Some(hook) = &self.listener.on_node_reuse {
-                hook(self);
-            }
+    pub fn parse_state(&mut self, state_id: usize, pos: usize) -> Option<usize> {
+        self.messages.clear();
+        let rule_ix = self.grammar.analysis.states[state_id].ref_ix();
+
+        if let Some(cached) = self.try_reuse_node(state_id, pos) {
             return Some(cached.node_id);
         }
 
@@ -278,8 +316,9 @@ impl Parser {
             .map(|hook| hook(self));
 
         if res.ok {
-            self.recompute_width(node_id);
-            let (mut final_node_id, mut width) = (node_id, self.alloc.get_node(node_id).width);
+            let width = res.pos - pos;
+            self.alloc.get_node_mut(node_id).width = width;
+            let (mut final_node_id, mut final_width) = (node_id, width);
 
             {
                 let green = self.alloc.get_node(node_id);
@@ -289,16 +328,18 @@ impl Parser {
                     if let Tag::Rule { rule_ix: child_ix } = &child_node.tag {
                         if *child_ix == rule_ix {
                             final_node_id = child;
-                            width = child_node.width;
+                            final_width = child_node.width;
                         }
                     }
                 }
             }
 
             // Cache the successfully parsed node (use final unwrapped node)
-            if width > 0 {
-                self.cache_node(rule_ix, pos, width, final_node_id);
+            if final_width > 0 && self.messages.is_empty() {
+                self.cache_node(state_id, pos, final_width, final_node_id);
             }
+            self.newly_computed_nodes
+                .push(Span::new(pos, pos + final_width));
 
             Some(final_node_id)
         } else {
@@ -306,14 +347,58 @@ impl Parser {
         }
     }
 
+    pub fn newly_computed_nodes(&self) -> Vec<Span> {
+        self.newly_computed_nodes.clone()
+    }
+
+    pub fn newly_computed_tokens(&self) -> Vec<Span> {
+        self.newly_computed_tokens.clone()
+    }
+
     pub fn apply_edit(&mut self, text: &str, start: usize, old_len: usize, new_len: usize) {
         self.text = Arc::from(text);
         self.messages.clear();
         self.in_flight.clear();
         self.probe_in_flight.clear();
+        self.newly_computed_nodes.clear();
+        self.newly_computed_tokens.clear();
 
+        let shift = new_len as isize - old_len as isize;
+        let text_len = self.text.len();
+
+        // Optimized path for same-length replacements (e.g. typing a character over another)
+        if shift == 0 {
+            if let Some(memo) = &mut self.probe_memo {
+                memo.rebuild(|key, res| {
+                    if key.pos < start && res.pos <= start {
+                        Some((key, res))
+                    } else if key.pos >= start + old_len {
+                        Some((key, res))
+                    } else {
+                        None
+                    }
+                });
+            }
+
+            self.node_cache.rebuild(|key, cached| {
+                let node_end = cached.pos + cached.width;
+                if node_end <= start || cached.pos >= start + old_len {
+                    Some((key, cached))
+                } else {
+                    None
+                }
+            });
+
+            self.specs = self
+                .recovery_strategy
+                .clone()
+                .map(|strategy| RecoverySpecs::from_text_with_strategy(&self.text, strategy));
+            return;
+        }
+
+        // --- FULL REBUILD/SHIFT PATH ---
         // Update probe memo using temporal memoization strategy (shift and retain)
-        if let Some(memo) = &self.probe_memo {
+        if let Some(memo) = &mut self.probe_memo {
             memo.rebuild(|mut key, mut res| {
                 let k_pos = key.pos;
                 let v_pos = res.pos;
@@ -341,37 +426,30 @@ impl Parser {
 
         // Update node cache: invalidate affected, shift unaffected
         let shift = new_len as isize - old_len as isize;
-        let mut new_cache = HashMap::new();
-
-        for (key, cached) in self.node_cache.drain() {
+        self.node_cache.rebuild(|mut key, mut cached| {
             let node_end = cached.pos + cached.width;
 
             if node_end <= start {
                 // Before edit: keep as-is
-                new_cache.insert(key, cached);
-            } else if cached.pos > start + old_len {
-                // After edit (strict inequality): shift position and recompute hash
+                Some((key, cached))
+            } else if cached.pos >= start + old_len {
+                // After edit: shift position.
+                // We don't need to recompute hash because the text within the node is unchanged!
                 let new_pos = (cached.pos as isize + shift) as usize;
-                if new_pos < self.text.len() && new_pos + cached.width <= self.text.len() {
-                    let new_hash = Self::hash_text_range(&self.text, new_pos, cached.width);
+                if new_pos + cached.width <= text_len {
+                    cached.pos = new_pos;
                     let new_key = NodeCacheKey {
-                        rule_ix: key.rule_ix,
+                        state_id: key.state_id,
                         pos: new_pos,
-                        width: cached.width,
-                        content_hash: new_hash,
                     };
-                    let new_cached = CachedNode {
-                        node_id: cached.node_id,
-                        pos: new_pos,
-                        width: cached.width,
-                    };
-                    new_cache.insert(new_key, new_cached);
+                    Some((new_key, cached))
+                } else {
+                    None
                 }
+            } else {
+                None // Invalidated: inside edited range
             }
-            // Overlapping nodes are discarded (not inserted into new_cache)
-        }
-
-        self.node_cache = new_cache;
+        });
 
         self.specs = self
             .recovery_strategy
@@ -384,7 +462,7 @@ impl Parser {
         self.messages.clear();
         self.in_flight.clear();
         self.probe_in_flight.clear();
-        if let Some(memo) = &self.probe_memo {
+        if let Some(memo) = &mut self.probe_memo {
             memo.clear();
         }
         self.node_cache.clear();
@@ -421,6 +499,16 @@ impl Parser {
             return ParseResult::failed(pos);
         }
 
+        // --- INCREMENTAL REUSE ---
+        // Try to reuse a previously parsed node from the cache
+        if let Some(cached) = self.try_reuse_node(state_id, pos) {
+            self.alloc
+                .get_node_mut(node_id)
+                .children
+                .push(cached.node_id);
+            return ParseResult::ok(pos + cached.width);
+        }
+
         self.in_flight.insert(key);
         let res = self.parse_inner(node_id, state_id, pos, last_rule_ix, parent_is_sequence);
         self.in_flight.remove(&key);
@@ -436,11 +524,7 @@ impl Parser {
         };
 
         // Check memo first - if hit, we skip computation
-        if let Some(cached) = self.probe_memo.as_ref().and_then(|m| m.get(&key)) {
-            // Memo hit - call hook
-            if let Some(hook) = &self.listener.on_memo_hit {
-                hook(self);
-            }
+        if let Some(cached) = self.probe_memo.as_mut().and_then(|m| m.get(&key)) {
             return cached;
         }
 
@@ -451,7 +535,7 @@ impl Parser {
         let res = self.probe_inner(state_id, pos, parent_is_sequence);
         self.probe_in_flight.remove(&key);
 
-        if let Some(memo) = &self.probe_memo {
+        if let Some(memo) = &mut self.probe_memo {
             memo.insert(key, res);
         }
         res
@@ -482,7 +566,8 @@ impl Parser {
     ) -> usize {
         if should_create_node {
             let tag = Tag::new_rule(rule_ix);
-            self.alloc.alloc(tag, vec![], 0)
+            let id = self.alloc.alloc(tag, vec![], 0);
+            id
         } else {
             node_id
         }
@@ -503,20 +588,17 @@ impl Parser {
         let current_rule_ix = state.ref_ix();
 
         // Only create a new AST node when the rule changes and the rule is named
-        let is_trivial_rule = self.grammar.name(current_rule_ix).starts_with('@');
+        let is_trivial_rule = self.config.simple_ast && analysis.is_trivial[current_rule_ix];
         let should_create_node = !is_trivial_rule;
 
         let result = match state {
             State::Tok(rule_ix, matcher) => {
-                // Only create a wrapper node if:
-                // 1. should_create_node is true (not a trivial rule)
-                // 2. The token's rule is different from parent (indicates rule boundary)
                 let needs_wrapper = should_create_node && Some(*rule_ix) != last_rule_ix;
                 if needs_wrapper {
                     let work_node = self.make_work_node(node_id, *rule_ix, true);
                     let res = self.parse_token(work_node, *rule_ix, matcher.as_ref(), pos);
                     if res.ok {
-                        self.finalize_node(work_node, node_id);
+                        self.finalize_node(work_node, node_id, state_id, pos, res.pos - pos);
                     }
                     res
                 } else {
@@ -526,6 +608,7 @@ impl Parser {
 
             State::Seq(rule_ix, children) => self.parse_sequence(
                 node_id,
+                state_id,
                 *rule_ix,
                 children,
                 pos,
@@ -545,11 +628,12 @@ impl Parser {
             ),
 
             State::Field(rule_ix, name, child) => {
-                self.parse_field(node_id, *rule_ix, name, *child, pos)
+                self.parse_field(node_id, state_id, *rule_ix, name, *child, pos)
             }
 
             State::LeftRec(rule_ix, base, tail, tail_fields) => self.parse_left_rec(
                 node_id,
+                state_id,
                 *rule_ix,
                 base,
                 tail,
@@ -585,6 +669,26 @@ impl Parser {
         matcher: &dyn Matcher,
         pos: usize,
     ) -> ParseResult {
+        // Literal Fast-Path: directly check starts_with to avoid dynamic dispatch overhead for simple strings
+        if let Some(lit) = matcher.preview() {
+            if self.text[pos..].starts_with(lit) {
+                let width = lit.len();
+                if width == 0 {
+                    return ParseResult::ok(pos);
+                }
+
+                if let Some(hook) = &self.listener.on_computation {
+                    hook(self);
+                }
+                let token_id = self.alloc.alloc_token(Tag::new_token(rule_ix), width);
+                self.newly_computed_tokens.push(Span::new(pos, pos + width));
+                self.alloc.get_node_mut(node_id).children.push(token_id);
+                return ParseResult::ok(pos + width);
+            }
+            // If it doesn't match directly, fall back to full matches() below.
+            // This is necessary because some matchers (like `token`) have optional leading whitespace.
+        }
+
         let mut current_pos = pos;
         match matcher.matches(&self.text, &mut current_pos) {
             Some(0) => ParseResult::ok(current_pos),
@@ -593,6 +697,7 @@ impl Parser {
                     hook(self);
                 }
                 let token_id = self.alloc.alloc_token(Tag::new_token(rule_ix), width);
+                self.newly_computed_tokens.push(Span::new(pos, pos + width));
                 self.alloc.get_node_mut(node_id).children.push(token_id);
                 ParseResult::ok(current_pos)
             }
@@ -604,6 +709,7 @@ impl Parser {
     fn parse_sequence(
         &mut self,
         node_id: usize,
+        state_id: usize,
         rule_ix: usize,
         children: &Vec<usize>,
         pos: usize,
@@ -694,52 +800,20 @@ impl Parser {
 
             // Recover if structural (safe at start) or committed (safe to finish)
             if allow_recovery || committed {
-                // Call recovery attempt hook
-                if let Some(hook) = &self.listener.on_recovery_attempt {
-                    hook(self);
-                }
                 recovered = self.attempt_recovery(work_node, current_pos, vec![expected_ix]);
-                // Call recovery success or failure hook
-                if recovered.is_some() {
-                    if let Some(hook) = &self.listener.on_recovery_success {
-                        hook(self);
-                    }
-                } else {
-                    if let Some(hook) = &self.listener.on_recovery_failure {
-                        hook(self);
-                    }
-                }
             }
             if recovered.is_none()
                 && self.config.recover
                 && is_sep_tail
                 && !self.at_list_end(current_pos)
             {
-                // Call recovery attempt hook
-                if let Some(hook) = &self.listener.on_recovery_attempt {
-                    hook(self);
-                }
                 recovered = self
                     .recover_sep_tail(work_node, current_pos, expected_ix)
                     .or_else(|| self.attempt_recovery(work_node, current_pos, vec![expected_ix]));
-                // Call recovery success or failure hook
-                if recovered.is_some() {
-                    if let Some(hook) = &self.listener.on_recovery_success {
-                        hook(self);
-                    }
-                } else {
-                    if let Some(hook) = &self.listener.on_recovery_failure {
-                        hook(self);
-                    }
-                }
             }
 
             // Fallback: Panic mode (skip one character) if committed or structural
             if recovered.is_none() && (committed || allow_recovery) {
-                // Call recovery attempt hook for panic mode
-                if let Some(hook) = &self.listener.on_recovery_attempt {
-                    hook(self);
-                }
                 if let Some(c) = self.text[current_pos..].chars().next() {
                     let w = c.len_utf8();
                     self.push_error(
@@ -750,15 +824,6 @@ impl Parser {
                         vec![expected_ix],
                     );
                     recovered = Some(current_pos + w);
-                    // Panic mode is a recovery success
-                    if let Some(hook) = &self.listener.on_recovery_success {
-                        hook(self);
-                    }
-                } else {
-                    // Panic mode failed
-                    if let Some(hook) = &self.listener.on_recovery_failure {
-                        hook(self);
-                    }
                 }
             }
 
@@ -792,7 +857,7 @@ impl Parser {
         }
 
         if should_create_node {
-            self.finalize_node(work_node, node_id);
+            self.finalize_node(work_node, node_id, state_id, pos, current_pos - pos);
         }
 
         if !has_error {
@@ -1004,7 +1069,7 @@ impl Parser {
                 }
 
                 if should_create_node {
-                    self.finalize_node(work_node, node_id);
+                    self.finalize_node(work_node, node_id, state_id, pos, res.pos - pos);
                 }
                 return res;
             }
@@ -1015,7 +1080,7 @@ impl Parser {
         // Try epsilon if available
         if has_epsilon {
             if should_create_node {
-                self.finalize_node(work_node, node_id);
+                self.finalize_node(work_node, node_id, state_id, pos, 0);
             }
             return ParseResult::ok(pos);
         }
@@ -1023,7 +1088,7 @@ impl Parser {
         // All alternatives failed
         if self.config.recover && parent_is_sequence && should_create_node {
             if let Some(recovered_pos) = self.attempt_recovery(work_node, pos, vec![state_id]) {
-                self.finalize_node(work_node, node_id);
+                self.finalize_node(work_node, node_id, state_id, pos, recovered_pos - pos);
                 return ParseResult::recovered(recovered_pos);
             }
         }
@@ -1034,6 +1099,7 @@ impl Parser {
     fn parse_left_rec(
         &mut self,
         node_id: usize,
+        state_id: usize,
         rule_ix: usize,
         base_states: &Vec<usize>,
         tail_states: &Vec<usize>,
@@ -1072,7 +1138,7 @@ impl Parser {
         }
 
         if should_create_node {
-            self.recompute_width(work_node);
+            self.alloc.get_node_mut(work_node).width = current_pos - pos;
         }
 
         let mut current_node = work_node;
@@ -1086,7 +1152,10 @@ impl Parser {
                         let field_node =
                             self.alloc
                                 .alloc(Tag::new_field(rule_ix, *name), vec![current_node], 0);
-                        self.recompute_width(field_node);
+                        let field_width = self.alloc.get_node(current_node).width;
+                        self.alloc.get_node_mut(field_node).width = field_width;
+                        self.newly_computed_nodes
+                            .push(Span::new(pos, pos + field_width));
                         field_node
                     } else {
                         current_node
@@ -1098,7 +1167,10 @@ impl Parser {
                         if res.has_error {
                             has_error = true;
                         }
-                        self.recompute_width(new_node);
+                        let new_width = res.pos - pos;
+                        self.alloc.get_node_mut(new_node).width = new_width;
+                        self.newly_computed_nodes
+                            .push(Span::new(pos, pos + new_width));
                         current_node = new_node;
                         current_pos = res.pos;
                         progressed = true;
@@ -1129,7 +1201,7 @@ impl Parser {
         }
 
         if should_create_node {
-            self.finalize_node(current_node, node_id);
+            self.finalize_node(current_node, node_id, state_id, pos, current_pos - pos);
         }
 
         let mut res = ParseResult::ok(current_pos);
@@ -1142,6 +1214,7 @@ impl Parser {
     fn parse_field(
         &mut self,
         node_id: usize,
+        state_id: usize,
         rule_ix: usize,
         name: &'static str,
         child_state: usize,
@@ -1154,7 +1227,7 @@ impl Parser {
             return ParseResult::failed(pos);
         }
 
-        self.finalize_node(field_node, node_id);
+        self.finalize_node(field_node, node_id, state_id, pos, res.pos - pos);
         res
     }
 
@@ -1429,11 +1502,25 @@ impl Parser {
             .any(|scope| remaining.starts_with(&scope.close))
     }
 
-    fn finalize_node(&mut self, work_node: usize, parent_node: usize) {
+    fn finalize_node(
+        &mut self,
+        work_node: usize,
+        parent_node: usize,
+        state_id: usize,
+        pos: usize,
+        width: usize,
+    ) {
         if let Some(hook) = &self.listener.on_computation {
             hook(self);
         }
-        self.recompute_width(work_node);
+        self.alloc.get_node_mut(work_node).width = width;
+        self.newly_computed_nodes.push(Span::new(pos, pos + width));
+
+        // Cache the node for incremental reuse
+        if width > 0 && self.messages.is_empty() {
+            self.cache_node(state_id, pos, width, work_node);
+        }
+
         self.alloc
             .get_node_mut(parent_node)
             .children
@@ -1447,8 +1534,10 @@ impl Parser {
         }
     }
 
-    fn create_error_node(&mut self, error: ParsecError, width: usize) -> usize {
-        self.alloc.alloc(Tag::new_error(error), vec![], width)
+    fn create_error_node(&mut self, error: ParsecError, pos: usize, width: usize) -> usize {
+        let id = self.alloc.alloc(Tag::new_error(error), vec![], width);
+        self.newly_computed_nodes.push(Span::new(pos, pos + width));
+        id
     }
 
     fn push_error(
@@ -1459,7 +1548,7 @@ impl Parser {
         width: usize,
         expected: Vec<usize>,
     ) {
-        let error_node = self.create_error_node(error, width);
+        let error_node = self.create_error_node(error, pos, width);
         self.alloc.get_node_mut(node_id).children.push(error_node);
         self.listener.on_error.as_ref().map(|hook| hook(self));
         match error {
@@ -1479,17 +1568,6 @@ impl Parser {
 
     fn truncate_children(&mut self, node_id: usize, len: usize) {
         self.alloc.get_node_mut(node_id).children.truncate(len);
-    }
-
-    fn recompute_width(&mut self, node_id: usize) {
-        let total: usize = self
-            .alloc
-            .get_node(node_id)
-            .children
-            .iter()
-            .map(|&child| self.alloc.get_node(child).width)
-            .sum();
-        self.alloc.get_node_mut(node_id).width = total;
     }
 
     fn contains_valid_token(&self, node_id: usize) -> bool {
@@ -1518,38 +1596,30 @@ impl Parser {
         hasher.finish()
     }
 
-    fn try_reuse_node(&self, rule_ix: usize, pos: usize) -> Option<CachedNode> {
-        // Check all cached nodes at this position with this rule
-        for (key, cached) in self.node_cache.iter() {
-            if key.rule_ix == rule_ix && cached.pos == pos {
-                // Verify the text content still matches
-                if pos + cached.width <= self.text.len() {
-                    let current_hash = Self::hash_text_range(&self.text, pos, cached.width);
-                    if current_hash == key.content_hash {
-                        return Some(*cached);
-                    }
-                }
+    fn try_reuse_node(&mut self, state_id: usize, pos: usize) -> Option<CachedNode> {
+        let key = NodeCacheKey { state_id, pos };
+        if let Some(cached) = self.node_cache.get(&key) {
+            // Verify the width is still within bounds.
+            // We TRUST that apply_edit already shifted/invalidated based on content.
+            if pos + cached.width <= self.text.len() {
+                return Some(cached);
             }
         }
         None
     }
 
-    fn cache_node(&mut self, rule_ix: usize, pos: usize, width: usize, node_id: usize) {
+    fn cache_node(&mut self, state_id: usize, pos: usize, width: usize, node_id: usize) {
         if pos + width > self.text.len() {
             return;
         }
 
         let content_hash = Self::hash_text_range(&self.text, pos, width);
-        let key = NodeCacheKey {
-            rule_ix,
-            pos,
-            width,
-            content_hash,
-        };
+        let key = NodeCacheKey { state_id, pos };
         let cached = CachedNode {
             node_id,
             pos,
             width,
+            content_hash,
         };
         self.node_cache.insert(key, cached);
     }
@@ -1559,11 +1629,6 @@ impl_listener!(
     ParserListener,
     on_start_parse(&Parser),
     on_finish_parse(&Parser),
-    on_memo_hit(&Parser),
-    on_node_reuse(&Parser),
     on_computation(&Parser),
-    on_error(&Parser),
-    on_recovery_attempt(&Parser),
-    on_recovery_success(&Parser),
-    on_recovery_failure(&Parser)
+    on_error(&Parser)
 );

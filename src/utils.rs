@@ -1,7 +1,7 @@
-use dashmap::DashMap;
+use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
+use std::hash::Hash;
 use std::ops;
-use std::sync::Arc;
 
 #[macro_export]
 macro_rules! impl_listener {
@@ -20,48 +20,53 @@ macro_rules! impl_listener {
     };
 }
 
-#[derive(Clone, Debug)]
-pub struct LruCache<K: Clone + Eq + std::hash::Hash, V: Clone> {
+#[derive(Clone, Debug, Default)]
+pub struct LruCache<K: Clone + Eq + Hash, V: Clone> {
     capacity: usize,
-    data: Arc<DashMap<K, V>>,
-    order: Arc<parking_lot::Mutex<VecDeque<K>>>,
+    data: FxHashMap<K, V>,
+    order: VecDeque<K>,
 }
 
 impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
     pub fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            data: Arc::new(DashMap::new()),
-            order: Arc::new(parking_lot::Mutex::new(VecDeque::with_capacity(capacity))),
+            data: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            order: VecDeque::with_capacity(capacity),
         }
     }
 
-    pub fn get(&self, key: &K) -> Option<V> {
-        self.data.get(key).map(|entry| {
-            let mut order = self.order.lock();
+    pub fn get(&mut self, key: &K) -> Option<V> {
+        if let Some(value) = self.data.get(key) {
+            let value = value.clone();
             // Move to end (most recently used)
-            order.retain(|k| k != key);
-            order.push_back(key.clone());
-            entry.clone()
-        })
+            if let Some(pos) = self.order.iter().position(|k| k == key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key.clone());
+            Some(value)
+        } else {
+            None
+        }
     }
 
-    pub fn insert(&self, key: K, value: V) {
+    pub fn insert(&mut self, key: K, value: V) {
         if self.data.contains_key(&key) {
             self.data.insert(key.clone(), value);
-            let mut order = self.order.lock();
-            order.retain(|k| k != &key);
-            order.push_back(key);
+            if let Some(pos) = self.order.iter().position(|k| k == &key) {
+                self.order.remove(pos);
+            }
+            self.order.push_back(key);
         } else {
             if self.data.len() >= self.capacity && self.capacity > 0 {
-                let mut order = self.order.lock();
-                if let Some(lru_key) = order.pop_front() {
+                if let Some(lru_key) = self.order.pop_front() {
                     self.data.remove(&lru_key);
                 }
             }
-            self.data.insert(key.clone(), value);
-            let mut order = self.order.lock();
-            order.push_back(key);
+            if self.capacity > 0 {
+                self.data.insert(key.clone(), value);
+                self.order.push_back(key);
+            }
         }
     }
 
@@ -69,22 +74,18 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
         self.data.contains_key(key)
     }
 
-    pub fn clear(&self) {
+    pub fn clear(&mut self) {
         self.data.clear();
-        self.order.lock().clear();
+        self.order.clear();
     }
 
-    pub fn rebuild<F>(&self, mapper: F)
+    pub fn rebuild<F>(&mut self, mut mapper: F)
     where
-        F: Fn(K, V) -> Option<(K, V)>,
+        F: FnMut(K, V) -> Option<(K, V)>,
     {
-        // Lock order to preserve LRU and consistency
-        let mut order = self.order.lock();
-
-        // Collect entries to keep/update
         let mut new_entries = Vec::new();
 
-        for key in order.iter() {
+        for key in self.order.iter() {
             if let Some(val) = self.data.get(key) {
                 if let Some((new_key, new_val)) = mapper(key.clone(), val.clone()) {
                     new_entries.push((new_key, new_val));
@@ -92,13 +93,12 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
             }
         }
 
-        // Clear and refill
         self.data.clear();
-        order.clear();
+        self.order.clear();
 
         for (k, v) in new_entries {
             self.data.insert(k.clone(), v);
-            order.push_back(k);
+            self.order.push_back(k);
         }
     }
 

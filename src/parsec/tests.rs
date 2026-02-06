@@ -77,6 +77,8 @@ fn test_statement_parser() {
         "A condition that must be true for the if statement to execute",
     );
 
+    println!("Grammar:\n{}", grammar);
+
     let mut parser = Parser::new(grammar);
     let code = r#"
         x = 10;
@@ -102,6 +104,8 @@ fn test_json_error_recovery() {
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
+
+    println!("Grammar:\n{}", grammar);
 
     let mut parser = Parser::new(grammar);
     let code = r#"{"name": "ok", "age":nulll}"#;

@@ -3,7 +3,7 @@ use std::{collections::HashSet, sync::Arc};
 use dashmap::DashMap;
 
 use crate::grammar::{
-    ir::{BridgeGrammar, NormalizedGrammarNode, RefIx, Scope, State},
+    ir::{BridgeGrammar, NormalizedGrammarNode, RefIx, Scope, SeparableScope, State},
     norm::RuleTable,
 };
 use crate::parsec::words::MatcherRef;
@@ -27,6 +27,10 @@ pub struct GrammarStateAnalysis {
     pub rule_roots: Vec<usize>,
     pub is_recursive: Vec<bool>,
     pub bridge: BridgeGrammar,
+    pub list_rules: Vec<usize>,
+    pub list_tail_rules: Vec<usize>,
+    pub rule_terminators: Vec<Vec<String>>,
+    pub is_trivial: Vec<bool>,
 }
 
 impl GrammarStateAnalysis {
@@ -37,6 +41,18 @@ impl GrammarStateAnalysis {
         let mut builder = Builder::new(table, is_recursive);
         let start_state = builder.rule(start);
 
+        let mut list_rules = Vec::new();
+        let mut list_tail_rules = Vec::new();
+        let mut is_trivial = Vec::new();
+        for (ix, name) in table.rule_names.iter().enumerate() {
+            is_trivial.push(name.starts_with('@'));
+            if *name == "@sep" {
+                list_rules.push(ix);
+            } else if *name == "@sep_tail" {
+                list_tail_rules.push(ix);
+            }
+        }
+
         let mut analysis = Self {
             states: builder.states,
             start_state,
@@ -45,10 +61,24 @@ impl GrammarStateAnalysis {
             bridge: BridgeGrammar {
                 scopes: Vec::new(),
                 reefs: Vec::new(),
+                separable_scopes: Vec::new(),
             },
+            list_rules,
+            list_tail_rules,
+            rule_terminators: vec![Vec::new(); table.rules.len()],
+            is_trivial,
         };
         analysis.bridge = analysis.derive_bridge_grammar();
+        analysis.rule_terminators = analysis.compute_terminators();
         analysis
+    }
+
+    pub fn is_list_rule(&self, rule_ix: usize) -> bool {
+        self.list_rules.contains(&rule_ix)
+    }
+
+    pub fn is_list_tail_rule(&self, rule_ix: usize) -> bool {
+        self.list_tail_rules.contains(&rule_ix)
     }
 
     pub fn state_id_for_rule(&self, rule_ix: usize) -> Option<usize> {
@@ -60,9 +90,9 @@ impl GrammarStateAnalysis {
     pub fn derive_bridge_grammar(&self) -> BridgeGrammar {
         let mut scopes = Vec::new();
         let mut reef_set = HashSet::new();
+        let mut separable_scopes = Vec::new();
 
         for state in &self.states {
-            // Collect reefs (all literals)
             if let State::Tok(_, matcher) = state {
                 if let Some(s) = matcher.preview() {
                     if !s.is_empty() {
@@ -71,7 +101,6 @@ impl GrammarStateAnalysis {
                 }
             }
 
-            // Check for Scopes
             if let State::Seq(_, children) = state {
                 let rule_ix = state.ref_ix();
                 let is_rule_recursive =
@@ -106,11 +135,119 @@ impl GrammarStateAnalysis {
                         }
                     }
                 }
+
+                self.detect_separable_scopes(state, children, &mut separable_scopes);
             }
         }
 
         let reefs = reef_set.into_iter().collect();
-        BridgeGrammar { scopes, reefs }
+        BridgeGrammar {
+            scopes,
+            reefs,
+            separable_scopes,
+        }
+    }
+
+    fn detect_separable_scopes(
+        &self,
+        state: &State,
+        children: &[usize],
+        out: &mut Vec<SeparableScope>,
+    ) {
+        if children.len() < 3 {
+            return;
+        }
+
+        let rule_ix = state.ref_ix();
+
+        let first_ix = children[0];
+        let middle_start = 1;
+        let middle_end = children.len().saturating_sub(1);
+
+        if middle_start >= middle_end {
+            return;
+        }
+
+        let middle_len = middle_end - middle_start;
+        if middle_len == 0 {
+            return;
+        }
+
+        let mut separator_token = None;
+        if middle_len > 1 {
+            for i in middle_start..middle_end {
+                if let State::Tok(_, m) = &self.states[children[i]] {
+                    if let Some(s) = m.preview() {
+                        if !s.is_empty()
+                            && s != "{"
+                            && s != "}"
+                            && s != "["
+                            && s != "]"
+                            && s != "("
+                            && s != ")"
+                        {
+                            separator_token = Some(s.to_string());
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(separator) = separator_token {
+            let item_rule_ix = self.states[first_ix].ref_ix();
+            let scope = SeparableScope {
+                rule_ix,
+                item_rule_ix,
+                separator,
+                wrapper_rule_ix: None,
+            };
+            if !out.contains(&scope) {
+                out.push(scope);
+            }
+        }
+    }
+
+    fn compute_terminators(&self) -> Vec<Vec<String>> {
+        let mut terminators = vec![Vec::new(); self.rule_roots.len()];
+
+        for scope in &self.bridge.separable_scopes {
+            let mut sep_copy = scope.separator.clone();
+            sep_copy.push('\0');
+            if !terminators[scope.rule_ix].contains(&sep_copy) {
+                terminators[scope.rule_ix].push(sep_copy);
+            }
+        }
+
+        for scope in &self.bridge.scopes {
+            let mut close_copy = scope.close.clone();
+            close_copy.push('\0');
+            if !terminators[scope.rule_ix].contains(&close_copy) {
+                terminators[scope.rule_ix].push(close_copy);
+            }
+        }
+
+        let reefs = &self.bridge.reefs;
+        for (_rule_ix, terms) in terminators.iter_mut().enumerate() {
+            for reef in reefs {
+                let mut reef_copy = reef.clone();
+                reef_copy.push('\0');
+                if !terms.contains(&reef_copy) {
+                    terms.push(reef_copy);
+                }
+            }
+
+            terms.sort();
+            terms.dedup();
+
+            for term in terms.iter_mut() {
+                if !term.is_empty() && term.ends_with('\0') {
+                    term.pop();
+                }
+            }
+        }
+
+        terminators
     }
 }
 

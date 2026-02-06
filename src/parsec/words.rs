@@ -63,9 +63,7 @@ pub trait Matcher: Debug {
     fn display(&self) -> String;
     fn is_nullable(&self) -> bool;
     fn is_consuming(&self) -> bool;
-    /// Returns the literal string this matcher matches, if it's a literal.
-    /// Variable matchers (char predicates, ranges) return None.
-    fn preview(&self) -> Option<String> {
+    fn preview(&self) -> Option<&str> {
         None
     }
     fn then<U>(self, other: U) -> Sequence<Self, U>
@@ -161,8 +159,8 @@ impl Matcher for &str {
         self.len() > 0
     }
 
-    fn preview(&self) -> Option<String> {
-        Some(self.to_string())
+    fn preview(&self) -> Option<&str> {
+        Some(*self)
     }
 }
 
@@ -188,10 +186,6 @@ impl Matcher for char {
 
     fn is_consuming(&self) -> bool {
         true
-    }
-
-    fn preview(&self) -> Option<String> {
-        Some(self.to_string())
     }
 }
 
@@ -284,7 +278,7 @@ where
     fn is_consuming(&self) -> bool {
         self.0.is_consuming() || self.1.is_consuming()
     }
-    fn preview(&self) -> Option<String> {
+    fn preview(&self) -> Option<&str> {
         self.0.preview().or(self.1.preview())
     }
 }
@@ -389,7 +383,7 @@ impl<M: Matcher> Matcher for NamedMatcher<M> {
         self.matcher.is_consuming()
     }
 
-    fn preview(&self) -> Option<String> {
+    fn preview(&self) -> Option<&str> {
         self.matcher.preview()
     }
 }

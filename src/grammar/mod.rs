@@ -28,18 +28,18 @@ macro_rules! new_grammar {
     };
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum GrammarError {
     InfiniteConsumption(usize),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum GrammarInfo {
     RecursionDetected(usize),
     DirectReference(usize),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,

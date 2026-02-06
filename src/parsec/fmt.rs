@@ -139,7 +139,10 @@ fn display_state_inner(state: &State, parser: &Parser, seen: &mut HashSet<usize>
 
     match state {
         State::Field(_, name, _) => name.to_string(),
-        State::Tok(_, matcher) => matcher.preview().unwrap_or_else(|| matcher.display()),
+        State::Tok(_, matcher) => matcher
+            .preview()
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| matcher.display()),
         State::Seq(_, children) => children
             .iter()
             .map(|&child_ix| display_state_index(parser, child_ix, seen))

@@ -1,11 +1,9 @@
 pub(crate) mod analysis;
 pub mod display;
 pub mod dsl;
-pub(crate) mod expr_detect;
 pub(crate) mod ir;
 pub(crate) mod norm;
 pub(crate) mod recovery;
-
 #[cfg(test)]
 mod tests;
 
@@ -20,14 +18,14 @@ macro_rules! r {
 
 #[macro_export]
 macro_rules! new_grammar {
-	($start: ident where $($name: ident -> $node: expr)*) => {
-		{
-			#[allow(unused_imports)]
-			use $crate::{grammar::dsl::*, r};
-			$(fn $name() -> GrammarNode { $node })*
-			$crate::grammar::Grammar::new($start(), stringify!($start))
-		}
-	};
+    ($start: ident where $($name: ident -> $node: expr)*) => {
+        {
+            #[allow(unused_imports)]
+            use $crate::{grammar::dsl::*, r};
+            $(fn $name() -> GrammarNode { $node })*
+            $crate::grammar::Grammar::new($start(), stringify!($start))
+        }
+    };
 }
 
 #[derive(Debug, Clone)]
@@ -51,12 +49,10 @@ pub struct Grammar {
 
 impl Grammar {
     pub fn new(node: dsl::GrammarNode, start_rule: &'static str) -> Self {
-        let table = norm::RuleTable::normalize(node, start_rule);
-        let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
-            &table,
-            table.start_rule,
-        ));
+        let mut table = norm::RuleTable::new(vec![]);
+        table.compute_from(node, start_rule);
 
+        let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(&table, 0));
         Self {
             table,
             analysis,
@@ -64,18 +60,16 @@ impl Grammar {
             infos: vec![],
         }
     }
-
     pub fn name(&self, rule_idx: usize) -> &'static str {
-        self.table
-            .rules
-            .get(rule_idx)
-            .map(|r| r.name)
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| format!("@{}", rule_idx).leak())
+        if self.table.rule_names[rule_idx].is_empty() {
+            format!("@{}", rule_idx).leak()
+        } else {
+            self.table.rule_names[rule_idx]
+        }
     }
 
     pub fn in_which(mut self, rule_name: &'static str, meta: impl RuleMeta) -> Self {
-        if let Some(idx) = self.table.rules.iter().position(|r| r.name == rule_name) {
+        if let Some(idx) = self.table.rule_names.iter().position(|&n| n == rule_name) {
             meta.apply(&mut self, idx);
         } else {
             panic!("Rule '{}' not found in grammar", rule_name);
@@ -93,9 +87,7 @@ trait SealedRuleMeta {
 
 impl SealedRuleMeta for &'static str {
     fn apply(&self, grammar: &mut Grammar, rule_idx: usize) {
-        if let Some(rule) = grammar.table.rules.get_mut(rule_idx) {
-            rule.description = *self;
-        }
+        grammar.table.rule_descriptions[rule_idx] = *self;
     }
 }
 

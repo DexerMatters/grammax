@@ -1,8 +1,9 @@
-use rustc_hash::FxHashMap;
 use std::cell::{self, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
+
+use dashmap::DashMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParsecError {
@@ -10,18 +11,16 @@ pub enum ParsecError {
     UnexpectedToken,
     MissingToken,
     Placeholder,
-    LRError, // Added for LR parser
 }
 
-pub type GreenId = usize;
+type GreenId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Tag {
     Rule { rule_ix: usize },
-    Token { rule_ix: usize }, // Usually terminal_idx
+    Token { rule_ix: usize },
     Field { rule_ix: usize, name: &'static str },
     Error(Vec<ParsecError>),
-    Root,
 }
 
 impl Tag {
@@ -50,19 +49,11 @@ pub struct RedNode {
 }
 
 impl RedNode {
-    pub fn new_root(alloc: &TreeAllocRef, text: &str) -> Self {
+    pub(crate) fn new_root(alloc: TreeAllocRef, text: &str) -> Self {
         Self {
             parent: None,
             offset: 0,
             green: alloc.new_placeholder(text.len()),
-        }
-    }
-
-    pub fn root(_alloc: &TreeAllocRef, green: GreenId) -> Self {
-        Self {
-            parent: None,
-            offset: 0,
-            green,
         }
     }
 }
@@ -74,31 +65,38 @@ pub struct GreenNode {
     pub children: Vec<GreenId>,
 }
 
-pub struct TreeAlloc {
-    nodes: Vec<GreenNode>,
-    dedup: FxHashMap<u64, Vec<usize>>,
+#[derive(Debug)]
+pub(crate) struct TreeAlloc {
+    nodes: boxcar::Vec<GreenNode>,
+    dedup: DashMap<u64, Vec<usize>>,
 }
 
-pub type TreeAllocRef = Rc<RefCell<TreeAlloc>>;
+pub(crate) type TreeAllocRef = Rc<RefCell<TreeAlloc>>;
 
-pub trait TreeAllocRefExt {
-    fn create() -> Self;
+pub(crate) trait TreeAllocRefExt {
     fn get_node(&self, id: GreenId) -> cell::Ref<'_, GreenNode>;
+    fn get_node_mut(&self, id: GreenId) -> cell::RefMut<'_, GreenNode>;
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId;
     fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId;
     fn new_placeholder(&self, width: usize) -> GreenId;
 }
 
+impl TreeAlloc {
+    pub fn new() -> Self {
+        Self {
+            nodes: boxcar::Vec::new(),
+            dedup: DashMap::new(),
+        }
+    }
+}
+
 impl TreeAllocRefExt for TreeAllocRef {
-    fn create() -> Self {
-        Rc::new(RefCell::new(TreeAlloc {
-            nodes: Vec::new(),
-            dedup: FxHashMap::default(),
-        }))
+    fn get_node(&self, id: GreenId) -> std::cell::Ref<'_, GreenNode> {
+        cell::Ref::map(self.borrow(), |alloc| alloc.nodes.get(id).unwrap())
     }
 
-    fn get_node(&self, id: GreenId) -> cell::Ref<'_, GreenNode> {
-        cell::Ref::map(self.borrow(), |alloc| &alloc.nodes[id])
+    fn get_node_mut(&self, id: GreenId) -> cell::RefMut<'_, GreenNode> {
+        cell::RefMut::map(self.borrow_mut(), |alloc| alloc.nodes.get_mut(id).unwrap())
     }
 
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId {
@@ -112,32 +110,27 @@ impl TreeAllocRefExt for TreeAllocRef {
             width,
         };
 
-        // Deduplicate tokens and errors (leaves)
         let should_dedup = matches!(node.tag, Tag::Token { .. } | Tag::Error(_));
+        let borrowed = self.borrow();
         if should_dedup {
             let mut hasher = DefaultHasher::new();
             node.hash(&mut hasher);
             let hash = hasher.finish();
 
-            {
-                let borrowed = self.borrow();
-                if let Some(indices) = borrowed.dedup.get(&hash) {
-                    for &idx in indices {
-                        if borrowed.nodes[idx] == node {
-                            return idx;
-                        }
+            if let Some(indices) = borrowed.dedup.get(&hash) {
+                for &idx in indices.iter() {
+                    if borrowed.nodes[idx] == node {
+                        return idx;
                     }
                 }
             }
 
-            let mut borrowed = self.borrow_mut();
-            let idx = borrowed.nodes.len();
+            let idx = borrowed.nodes.count();
             borrowed.nodes.push(node);
             borrowed.dedup.entry(hash).or_default().push(idx);
             idx
         } else {
-            let mut borrowed = self.borrow_mut();
-            let idx = borrowed.nodes.len();
+            let idx = borrowed.nodes.count();
             borrowed.nodes.push(node);
             idx
         }

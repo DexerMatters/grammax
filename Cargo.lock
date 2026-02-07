@@ -74,6 +74,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d9c4f5dac5e15c24eb999c26181a6ca40b39fe946cbe4c263c7209467bc83af2"
 
 [[package]]
+name = "grammax"
+version = "0.1.0"
+dependencies = [
+ "boxcar",
+ "concurrent-queue",
+ "dashmap",
+ "indexmap",
+ "internment",
+ "ndarray",
+ "parking_lot",
+ "rustc-hash",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -258,20 +272,6 @@ name = "smallvec"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
-
-[[package]]
-name = "tree-editor"
-version = "0.1.0"
-dependencies = [
- "boxcar",
- "concurrent-queue",
- "dashmap",
- "indexmap",
- "internment",
- "ndarray",
- "parking_lot",
- "rustc-hash",
-]
 
 [[package]]
 name = "windows-link"

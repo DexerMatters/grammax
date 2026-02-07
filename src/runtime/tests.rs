@@ -8,7 +8,7 @@ use std::{
 
 use crate::{
     new_grammar,
-    parsec::{ParserConfig, ParserListener, fmt::Display, words::*},
+    parsec_old::{ParserConfig, ParserListener, fmt::Display, words::*},
     runtime::{Interactive, RuntimeListener},
 };
 
@@ -16,14 +16,15 @@ use crate::{
 fn test_expr_example() {
     let grammar = new_grammar!(
         start where
-        start -> many(r!(stmt) + t(token(";"))) + t(token(EndOfInput))
-        stmt  -> r!(assignment) | r!(if_stmt)
-        assignment -> t(token("x")) + t(token("=")) + t(token(NUMS))
-        if_stmt -> t(token("if")) + r!(cond) + r!(block)
-        cond -> t(token("(")) + r!(boolean) + t(token(")"))
-        boolean -> t(token("true")) | t(token("false"))
-        block -> t(token("{")) + many(r!(stmt) + t(token(";"))) + t(token("}"))
+        start -> r!(expr) + tt(EndOfInput)
+        expr -> r!(add) | r!(mul) | r!(primary)
+        add  -> r!(primary) + tt("+") + r!(expr)
+        mul  -> r!(primary) + tt("*") + r!(expr)
+        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
+    println!("===== Grammar =====");
+    println!("{}", grammar);
+
     let listener = RuntimeListener::new()
         .before_update(|| {
             eprintln!("Update started...");
@@ -48,10 +49,7 @@ fn test_expr_example() {
         .with_parser_config(ParserConfig::new().with_simple_ast(false))
         .finish();
     runtime.run().unwrap();
-    runtime.insert(0, "x = 12;".to_string()).unwrap();
-    runtime
-        .insert(7, "if (true) { x = 34; x = 56; x = 44; };".to_string())
-        .unwrap();
+    runtime.insert(0, "1 + 1".to_string()).unwrap();
     thread::sleep(std::time::Duration::from_millis(100));
 }
 

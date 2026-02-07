@@ -1,6 +1,6 @@
 use crate::{
     grammar::ir::State,
-    parsec::{
+    parsec_old::{
         Parser,
         msg::ParserMessages,
         tree::{RedNode, Tag, TreeAllocRefExt},
@@ -78,14 +78,14 @@ impl Display for ParserMessages {
             }
 
             match &msg.message {
-                crate::parsec::msg::ErrorMessage::MissingToken { expected } => {
+                crate::parsec_old::msg::ErrorMessage::MissingToken { expected } => {
                     let missing = format_missing_expected(parser, expected, &mut seen);
                     out.push_str(&format!(
                         "  {}Missing Token{} {} at [{}, {}]",
                         RED, RESET, missing, msg.span.start, msg.span.end
                     ));
                 }
-                crate::parsec::msg::ErrorMessage::UnexpectedToken { expected } => {
+                crate::parsec_old::msg::ErrorMessage::UnexpectedToken { expected } => {
                     out.push_str(&format!(
                         "  {}Unexpected Token{} at [{}, {}]",
                         RED, RESET, msg.span.start, msg.span.end

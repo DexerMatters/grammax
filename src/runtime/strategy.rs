@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs},
-    parsec::{Parser, msg::ParserMessages, tree::TreeAllocRefExt},
+    grammar_old::recovery::{ErrorRecoveryStrategy, RecoverySpecs},
+    parsec_old::{Parser, msg::ParserMessages, tree::TreeAllocRefExt},
     runtime::reparser::{ReparserConfig, Zipper},
     utils::Span,
 };

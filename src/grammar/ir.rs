@@ -2,21 +2,22 @@ use std::ops;
 
 use crate::parsec::words::MatcherRef;
 
+/// Normalized representation of grammar after desugaring
 #[derive(Clone, Debug)]
-pub enum NormalizedGrammarNode {
+pub enum NormalizedNode {
     Terminal(MatcherRef),
-    Alternative(Vec<NormalizedGrammarNode>),
-    Sequence(Vec<NormalizedGrammarNode>),
-    Reference(usize),
-    Field(&'static str, Box<NormalizedGrammarNode>),
+    Alternative(Vec<NormalizedNode>),
+    Sequence(Vec<NormalizedNode>),
+    Reference(usize),  // Rule index
+    Field(&'static str, Box<NormalizedNode>),
 }
 
-use NormalizedGrammarNode::*;
+use NormalizedNode::*;
 
-impl ops::Add for NormalizedGrammarNode {
-    type Output = NormalizedGrammarNode;
+impl ops::Add for NormalizedNode {
+    type Output = NormalizedNode;
 
-    fn add(self, other: NormalizedGrammarNode) -> NormalizedGrammarNode {
+    fn add(self, other: NormalizedNode) -> NormalizedNode {
         match (self, other) {
             (Sequence(mut seq1), Sequence(seq2)) => {
                 seq1.extend(seq2);
@@ -35,16 +36,20 @@ impl ops::Add for NormalizedGrammarNode {
     }
 }
 
-impl ops::BitOr for NormalizedGrammarNode {
-    type Output = NormalizedGrammarNode;
+impl ops::BitOr for NormalizedNode {
+    type Output = NormalizedNode;
 
-    fn bitor(self, other: NormalizedGrammarNode) -> NormalizedGrammarNode {
+    fn bitor(self, other: NormalizedNode) -> NormalizedNode {
         match (self, other) {
             (Alternative(mut alt1), Alternative(alt2)) => {
                 alt1.extend(alt2);
                 Alternative(alt1)
             }
-            (Alternative(mut alt), node) | (node, Alternative(mut alt)) => {
+            (Alternative(mut alt), node) => {
+                alt.push(node);
+                Alternative(alt)
+            }
+            (node, Alternative(mut alt)) => {
                 alt.insert(0, node);
                 Alternative(alt)
             }
@@ -53,17 +58,53 @@ impl ops::BitOr for NormalizedGrammarNode {
     }
 }
 
-pub type RefIx = usize;
-
+/// Rule reference information
 #[derive(Clone, Debug)]
-pub enum State {
-    Tok(RefIx, MatcherRef),
-    Seq(RefIx, Vec<usize>),
-    Alt(RefIx, Vec<usize>, bool), // (rule_ix, children, has_epsilon)
-    Field(RefIx, &'static str, usize),
-    LeftRec(RefIx, Vec<usize>, Vec<usize>, Vec<Option<&'static str>>),
+pub struct RuleInfo {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub node: NormalizedNode,
+    pub is_expression: bool,  // Marked for Pratt parsing
 }
 
+/// Operator information for Pratt parsing
+#[derive(Clone, Debug)]
+pub struct OperatorInfo {
+    pub precedence: u32,
+    pub associativity: Associativity,
+    pub kind: OperatorKind,
+    pub token: MatcherRef,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Associativity {
+    Left,
+    Right,
+    None,  // Non-associative
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperatorKind {
+    Infix,    // A op B
+    Prefix,   // op A
+    Postfix,  // A op
+}
+
+/// Production rule for LR parsing
+#[derive(Clone, Debug)]
+pub struct Production {
+    pub lhs: usize,  // Rule index
+    pub rhs: Vec<Symbol>,
+    pub field_positions: Vec<(usize, &'static str)>,  // (position, field_name)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Symbol {
+    Terminal(usize),  // Index into terminal table
+    NonTerminal(usize),  // Rule index
+}
+
+/// Bridge grammar for error recovery
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Scope {
     pub open: String,

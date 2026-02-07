@@ -3,9 +3,8 @@ use std::{
     sync::Arc,
 };
 
-use crate::parsec::words::{Matcher, MatcherRef, token};
+use crate::parsec_old::words::{Matcher, MatcherRef, token};
 
-/// Grammar DSL node representing the user-defined grammar structure
 #[derive(Clone)]
 pub enum GrammarNode {
     Terminal(MatcherRef),
@@ -25,8 +24,6 @@ pub enum GrammarNode {
         max: Option<usize>,
     },
 }
-
-// Helper functions for DSL
 
 pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
     GrammarNode::Reference(f, name)
@@ -111,8 +108,6 @@ pub fn sep1(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
 pub fn field(name: &'static str, node: GrammarNode) -> GrammarNode {
     GrammarNode::Field(name, Box::new(node))
 }
-
-// Operator overloading for ergonomic DSL
 
 impl ops::Add for GrammarNode {
     type Output = GrammarNode;

@@ -1,7 +1,7 @@
-use crate::grammar::{Grammar, ir::State};
 use crate::parsec::words::MatcherRef;
 use std::collections::HashSet;
 
+/// Region in the source text for error recovery
 #[derive(Clone, Debug)]
 pub struct Region {
     pub start: usize,
@@ -9,6 +9,7 @@ pub struct Region {
     pub indent: usize,
 }
 
+/// Recovery specifications for error handling during parsing
 #[derive(Clone, Debug)]
 pub struct RecoverySpecs {
     pub regions: Vec<Region>,
@@ -17,6 +18,7 @@ pub struct RecoverySpecs {
     pub strategy: ErrorRecoveryStrategy,
 }
 
+/// Strategy for error recovery in LR parsing
 #[derive(Clone, Debug)]
 pub struct ErrorRecoveryStrategy {
     pub sync_tokens: Vec<MatcherRef>,
@@ -24,32 +26,10 @@ pub struct ErrorRecoveryStrategy {
 }
 
 impl ErrorRecoveryStrategy {
-    pub fn from_grammar(grammar: &Grammar) -> Self {
-        let mut sync_tokens = Vec::new();
-        let mut recovery_states = HashSet::new();
-
-        for (state_id, state) in grammar.analysis.states.iter().enumerate() {
-            match state {
-                State::Tok(_, matcher) => {
-                    // Check if the matcher produces a literal string or one of its components is a literal.
-                    // If it does, we treat it as a synchronization token.
-                    if matcher.preview().is_some() || matcher.display() == "EOF" {
-                        sync_tokens.push(matcher.clone());
-                    }
-                }
-                State::Alt(_, children, _) => {
-                    recovery_states.insert(state_id);
-                    for &child in children {
-                        recovery_states.insert(child);
-                    }
-                }
-                _ => {}
-            }
-        }
-
+    pub fn new() -> Self {
         Self {
-            sync_tokens,
-            recovery_states,
+            sync_tokens: Vec::new(),
+            recovery_states: HashSet::new(),
         }
     }
 
@@ -74,13 +54,7 @@ impl ErrorRecoveryStrategy {
 
 impl RecoverySpecs {
     pub fn from_text(text: &str) -> Self {
-        Self::from_text_with_strategy(
-            text,
-            ErrorRecoveryStrategy {
-                sync_tokens: Vec::new(),
-                recovery_states: HashSet::new(),
-            },
-        )
+        Self::from_text_with_strategy(text, ErrorRecoveryStrategy::new())
     }
 
     pub fn from_text_with_strategy(text: &str, strategy: ErrorRecoveryStrategy) -> Self {
@@ -103,61 +77,7 @@ impl RecoverySpecs {
             }
         }
 
-        let mut regions = Vec::new();
-        let mut stack: Vec<(usize, usize)> = Vec::new();
-        let mut prev_indent = 0usize;
-
-        for (idx, &line_start) in line_starts.iter().enumerate() {
-            let line_end = if idx + 1 < line_starts.len() {
-                line_starts[idx + 1].saturating_sub(1)
-            } else {
-                text.len()
-            };
-
-            let line = &text[line_start..line_end];
-            let mut indent = 0usize;
-            let mut seen_non_ws = false;
-            for ch in line.chars() {
-                match ch {
-                    ' ' => indent += 1,
-                    '\t' => indent += 4,
-                    _ => {
-                        seen_non_ws = true;
-                        break;
-                    }
-                }
-            }
-
-            if !seen_non_ws {
-                continue;
-            }
-
-            if indent > prev_indent {
-                stack.push((indent, line_start));
-            } else if indent < prev_indent {
-                while let Some(&(top_indent, start)) = stack.last() {
-                    if top_indent > indent {
-                        stack.pop();
-                        regions.push(Region {
-                            start,
-                            end: line_start,
-                            indent: top_indent,
-                        });
-                    } else {
-                        break;
-                    }
-                }
-            }
-
-            prev_indent = indent;
-        }
-
-        let end = text.len();
-        while let Some((indent, start)) = stack.pop() {
-            regions.push(Region { start, end, indent });
-        }
-
-        regions.sort_by_key(|r| r.end - r.start);
+        let regions = Self::compute_regions(&line_starts, &line_indents, text.len());
 
         Self {
             regions,
@@ -167,56 +87,52 @@ impl RecoverySpecs {
         }
     }
 
-    pub fn region_end_at(&self, pos: usize) -> Option<usize> {
-        self.regions
-            .iter()
-            .find(|r| r.start <= pos && pos < r.end)
-            .map(|r| r.end)
-    }
-
-    pub fn next_line_start(&self, pos: usize) -> Option<usize> {
-        self.line_starts.iter().copied().find(|&s| s > pos)
-    }
-
-    pub fn indent_at(&self, pos: usize) -> usize {
-        let line_idx = self.line_starts.iter().position(|&s| s > pos).unwrap_or(0);
-        if line_idx > 0 && line_idx <= self.line_indents.len() {
-            self.line_indents[line_idx - 1]
-        } else {
-            0
+    fn compute_regions(line_starts: &[usize], line_indents: &[usize], text_len: usize) -> Vec<Region> {
+        let mut regions = Vec::new();
+        if line_starts.is_empty() {
+            return regions;
         }
-    }
 
-    pub fn forward_skip_to_decrease(&self, pos: usize, current_indent: usize) -> Option<usize> {
-        let mut search_pos = pos;
-        while let Some(next_line) = self.next_line_start(search_pos) {
-            let next_indent = self.indent_at(next_line);
-            if next_indent < current_indent {
-                return Some(next_line);
+        let mut stack: Vec<(usize, usize)> = Vec::new();
+        
+        for (line_idx, &line_start) in line_starts.iter().enumerate() {
+            let indent = line_indents.get(line_idx).copied().unwrap_or(0);
+            
+            while let Some(&(_, prev_indent)) = stack.last() {
+                if indent > prev_indent {
+                    break;
+                }
+                if let Some((region_start, _)) = stack.pop() {
+                    regions.push(Region {
+                        start: region_start,
+                        end: line_start,
+                        indent: prev_indent,
+                    });
+                }
             }
-            search_pos = next_line;
+            
+            stack.push((line_start, indent));
         }
-        None
+
+        while let Some((region_start, indent)) = stack.pop() {
+            regions.push(Region {
+                start: region_start,
+                end: text_len,
+                indent,
+            });
+        }
+
+        regions
     }
 
-    pub fn backward_skip_to_decrease(&self, pos: usize, current_indent: usize) -> Option<usize> {
-        let mut line_idx = self.line_starts.iter().position(|&s| s > pos)?;
-        if line_idx == 0 {
-            return None;
-        }
-        line_idx -= 1;
+    pub fn line_number(&self, pos: usize) -> usize {
+        self.line_starts
+            .binary_search(&pos)
+            .unwrap_or_else(|i| i.saturating_sub(1))
+    }
 
-        while line_idx > 0 {
-            let prev_indent = if line_idx > 0 && line_idx <= self.line_indents.len() {
-                self.line_indents[line_idx - 1]
-            } else {
-                0
-            };
-            if prev_indent < current_indent {
-                return self.line_starts.get(line_idx).copied();
-            }
-            line_idx -= 1;
-        }
-        None
+    pub fn column_number(&self, pos: usize) -> usize {
+        let line = self.line_number(pos);
+        pos - self.line_starts[line]
     }
 }

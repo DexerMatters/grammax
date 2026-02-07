@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::{
-    parsec::{
+    parsec_old::{
         Parser,
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},

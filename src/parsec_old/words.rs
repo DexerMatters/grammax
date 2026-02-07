@@ -1,58 +1,19 @@
 use std::{
-    fmt::{self, Debug},
+    fmt::Debug,
     ops::{self},
     sync::Arc,
 };
 
-pub trait Matcher: Debug {
-    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize>;
-    fn display(&self) -> String;
-    fn is_nullable(&self) -> bool;
-    fn is_consuming(&self) -> bool;
-    fn preview(&self) -> Option<&str> {
-        None
-    }
-    fn then<U>(self, other: U) -> Sequence<Self, U>
-    where
-        Self: Sized,
-        U: Matcher,
-    {
-        Sequence(self, other)
-    }
-
-    fn or<U>(self, other: U) -> Alternative<Self, U>
-    where
-        Self: Sized,
-        U: Matcher,
-    {
-        Alternative(self, other)
-    }
-
-    fn times<R>(self, range: R) -> Repeat<Self, R>
-    where
-        Self: Sized,
-        R: ops::RangeBounds<usize>,
-    {
-        Repeat(self, range)
-    }
-}
-
-pub type MatcherRef = Arc<dyn Matcher + Send + Sync + 'static>;
-
 #[derive(Debug, Clone, Copy)]
 pub struct EndOfInput;
-
 #[derive(Debug, Clone, Copy)]
 pub struct StartOfInput;
-
 #[derive(Debug, Clone, Copy)]
-pub struct Alternative<T, U>(pub T, pub U);
-
+pub struct Alternative<T, U>(T, U);
 #[derive(Debug, Clone, Copy)]
-pub struct Sequence<T, U>(pub T, pub U);
-
+pub struct Sequence<T, U>(T, U);
 #[derive(Debug, Clone, Copy)]
-pub struct Repeat<T, R: ops::RangeBounds<usize>>(pub T, pub R);
+pub struct Repeat<T, R: ops::RangeBounds<usize>>(T, R);
 
 #[derive(Debug, Clone, Copy)]
 pub struct NamedMatcher<M: Matcher> {
@@ -97,7 +58,40 @@ pub const fn token<M: Matcher>(
     )
 }
 
-// Matcher implementations
+pub trait Matcher: Debug {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize>;
+    fn display(&self) -> String;
+    fn is_nullable(&self) -> bool;
+    fn is_consuming(&self) -> bool;
+    fn preview(&self) -> Option<&str> {
+        None
+    }
+    fn then<U>(self, other: U) -> Sequence<Self, U>
+    where
+        Self: Sized,
+        U: Matcher,
+    {
+        Sequence(self, other)
+    }
+
+    fn or<U>(self, other: U) -> Alternative<Self, U>
+    where
+        Self: Sized,
+        U: Matcher,
+    {
+        Alternative(self, other)
+    }
+
+    fn times<R>(self, range: R) -> Repeat<Self, R>
+    where
+        Self: Sized,
+        R: ops::RangeBounds<usize>,
+    {
+        Repeat(self, range)
+    }
+}
+
+pub type MatcherRef = Arc<dyn Matcher + Send + Sync + 'static>;
 
 impl Matcher for () {
     fn matches<'a>(&self, _input: &'a str, _pos: &mut usize) -> Option<usize> {
@@ -205,7 +199,7 @@ impl Matcher for EndOfInput {
     }
 
     fn is_nullable(&self) -> bool {
-        false
+        true
     }
 
     fn is_consuming(&self) -> bool {
@@ -223,7 +217,7 @@ impl Matcher for StartOfInput {
     }
 
     fn is_nullable(&self) -> bool {
-        false
+        true
     }
 
     fn is_consuming(&self) -> bool {
@@ -231,93 +225,144 @@ impl Matcher for StartOfInput {
     }
 }
 
-impl<T: Matcher, U: Matcher> Matcher for Alternative<T, U> {
+impl<T, U> Matcher for Alternative<T, U>
+where
+    T: Matcher,
+    U: Matcher,
+{
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
-        self.0
-            .matches(input, pos)
-            .or_else(|| self.1.matches(input, pos))
+        let original_position = *pos;
+        if let Some(matched) = self.0.matches(input, pos) {
+            Some(matched)
+        } else {
+            *pos = original_position;
+            self.1.matches(input, pos)
+        }
     }
-
     fn display(&self) -> String {
-        format!("({} | {})", self.0.display(), self.1.display())
+        format!("({}/{})", self.0.display(), self.1.display())
     }
-
     fn is_nullable(&self) -> bool {
         self.0.is_nullable() || self.1.is_nullable()
     }
-
-    fn is_consuming(&self) -> bool {
-        self.0.is_consuming() && self.1.is_consuming()
-    }
-}
-
-impl<T: Matcher, U: Matcher> Matcher for Sequence<T, U> {
-    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
-        let start = *pos;
-        self.0.matches(input, pos)?;
-        self.1.matches(input, pos)?;
-        Some(*pos - start)
-    }
-
-    fn display(&self) -> String {
-        format!("{} {}", self.0.display(), self.1.display())
-    }
-
-    fn is_nullable(&self) -> bool {
-        self.0.is_nullable() && self.1.is_nullable()
-    }
-
     fn is_consuming(&self) -> bool {
         self.0.is_consuming() || self.1.is_consuming()
     }
 }
 
-impl<T: Matcher, R: ops::RangeBounds<usize> + fmt::Debug> Matcher for Repeat<T, R> {
+impl<T, U> Matcher for Sequence<T, U>
+where
+    T: Matcher,
+    U: Matcher,
+{
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
-        let start = *pos;
+        let original_position = *pos;
+        if let Some(matched1) = self.0.matches(input, pos) {
+            if let Some(matched2) = self.1.matches(input, pos) {
+                Some(matched1 + matched2)
+            } else {
+                *pos = original_position;
+                None
+            }
+        } else {
+            *pos = original_position;
+            None
+        }
+    }
+    fn display(&self) -> String {
+        format!("({} {})", self.0.display(), self.1.display())
+    }
+    fn is_nullable(&self) -> bool {
+        self.0.is_nullable() && self.1.is_nullable()
+    }
+    fn is_consuming(&self) -> bool {
+        self.0.is_consuming() || self.1.is_consuming()
+    }
+    fn preview(&self) -> Option<&str> {
+        self.0.preview().or(self.1.preview())
+    }
+}
+
+impl<R, T> Matcher for Repeat<T, R>
+where
+    T: Matcher,
+    R: ops::RangeBounds<usize> + Debug,
+{
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        use std::ops::Bound;
+
         let min = match self.1.start_bound() {
-            ops::Bound::Included(&n) => n,
-            ops::Bound::Excluded(&n) => n + 1,
-            ops::Bound::Unbounded => 0,
-        };
-        let max = match self.1.end_bound() {
-            ops::Bound::Included(&n) => Some(n),
-            ops::Bound::Excluded(&n) => Some(n.saturating_sub(1)),
-            ops::Bound::Unbounded => None,
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
         };
 
+        let max = match self.1.end_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n.saturating_sub(1),
+            Bound::Unbounded => usize::MAX,
+        };
+
+        let original_position = *pos;
         let mut count = 0;
-        while max.map_or(true, |m| count < m) {
+        let mut stopped_at_eof = false;
+
+        while count < max {
             let before = *pos;
+            // Hacky debug for specific failing case
+            if input.len() > 10 && *pos > 0 && input[*pos..].starts_with("lolname") {
+                // eprintln!("Repeat matching at pos {}: input={:?}", *pos, &input[*pos..(*pos+10).min(input.len())]);
+            }
+
             if self.0.matches(input, pos).is_some() {
+                if *pos == before {
+                    break;
+                }
                 count += 1;
             } else {
-                *pos = before;
+                if *pos >= input.len() {
+                    stopped_at_eof = true;
+                }
                 break;
             }
         }
 
-        if count >= min {
-            Some(*pos - start)
+        if max == usize::MAX && stopped_at_eof && self.0.is_consuming() {
+            // *pos = original_position;
+            // return None;
+        }
+
+        if count >= min && count <= max {
+            Some(*pos - original_position)
         } else {
-            *pos = start;
+            *pos = original_position;
             None
         }
     }
-
     fn display(&self) -> String {
-        format!("{}*", self.0.display())
+        format!("({:?} x {:?})", self.0.display(), self.1)
     }
-
     fn is_nullable(&self) -> bool {
-        match self.1.start_bound() {
-            ops::Bound::Included(&0) | ops::Bound::Excluded(&0) | ops::Bound::Unbounded => true,
-            _ => false,
-        }
-    }
+        use std::ops::Bound;
 
+        let min = match self.1.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+
+        min == 0 || self.0.is_nullable()
+    }
     fn is_consuming(&self) -> bool {
-        self.0.is_consuming()
+        use std::ops::Bound;
+
+        let min = match self.1.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n + 1,
+            Bound::Unbounded => 0,
+        };
+
+        min > 0 && self.0.is_consuming()
     }
 }
 
@@ -336,5 +381,9 @@ impl<M: Matcher> Matcher for NamedMatcher<M> {
 
     fn is_consuming(&self) -> bool {
         self.matcher.is_consuming()
+    }
+
+    fn preview(&self) -> Option<&str> {
+        self.matcher.preview()
     }
 }

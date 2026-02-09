@@ -1,9 +1,7 @@
 use rustc_hash::FxHashMap;
-use std::collections::HashMap;
 
 use crate::grammar::dsl::GrammarNode;
-use crate::grammar::expr_detect::ExpressionDetector;
-use crate::grammar::ir::{NormalizedNode, OperatorInfo, Production, RuleInfo, Symbol};
+use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::parsec::words::MatcherRef;
 
 /// Normalized grammar optimized for LR parsing
@@ -13,7 +11,6 @@ pub struct RuleTable {
     pub productions: Vec<Production>,
     pub terminals: Vec<MatcherRef>,
     pub terminal_map: FxHashMap<String, usize>, // terminal display -> index
-    pub operator_tables: HashMap<usize, Vec<OperatorInfo>>, // rule_ix -> operators
     pub start_rule: usize,
 }
 
@@ -26,8 +23,14 @@ impl RuleTable {
         let user_start_ix = normalizer.discover_rule(start, start_name);
         normalizer.desugar_all();
 
+        // Phase 1.5: Resolve create-node expansions (from drop)
+        normalizer.resolve_dropped_rules();
+
+        // Phase 1.6: Extract complex nodes from sequences (ensure LR compatibility)
+        normalizer.extract_complex_nodes();
+
         // Phase 2: Detect expression rules
-        let (mut rules, operator_tables) = normalizer.detect_expressions();
+        let mut rules = normalizer.rules;
 
         // Inject augmented start rule to ensure Accept is only on EOF
         // $root -> start
@@ -53,7 +56,6 @@ impl RuleTable {
             productions,
             terminals,
             terminal_map,
-            operator_tables,
             start_rule: start_ix,
         }
     }
@@ -278,6 +280,7 @@ impl RuleTable {
 struct Normalizer {
     rules: Vec<RuleInfo>,
     rule_map: FxHashMap<String, usize>, // name -> index
+    pending_drops: FxHashMap<(usize, usize), usize>, // (target_rule_ix, drop_count) -> helper_rule_ix
 }
 
 impl Normalizer {
@@ -285,6 +288,7 @@ impl Normalizer {
         Self {
             rules: Vec::new(),
             rule_map: FxHashMap::default(),
+            pending_drops: FxHashMap::default(),
         }
     }
 
@@ -353,6 +357,35 @@ impl Normalizer {
                 min,
                 max,
             } => self.desugar_separated_repetition(*node, *separator, min, max),
+
+            GrammarNode::Drop { node, count } => match self.normalize_node(*node) {
+                NormalizedNode::Reference(target_ix) => {
+                    if count == 0 {
+                        return NormalizedNode::Reference(target_ix);
+                    }
+
+                    if let Some(&helper_ix) = self.pending_drops.get(&(target_ix, count)) {
+                        return NormalizedNode::Reference(helper_ix);
+                    }
+
+                    // Create new helper rule
+                    let helper_ix = self.rules.len();
+                    let target_name = self.rules[target_ix].name;
+                    let helper_name = format!("{}@drop_{}", target_name, count);
+                    let helper_name: &'static str = Box::leak(helper_name.into_boxed_str());
+
+                    self.rules.push(RuleInfo {
+                        name: helper_name,
+                        description: "",
+                        node: NormalizedNode::Sequence(vec![]), // Placeholder
+                        is_expression: false,
+                    });
+
+                    self.pending_drops.insert((target_ix, count), helper_ix);
+                    NormalizedNode::Reference(helper_ix)
+                }
+                _ => panic!("Drop can only be applied to References"),
+            },
         }
     }
 
@@ -478,6 +511,123 @@ impl Normalizer {
         ix
     }
 
+    /// Extracts complex nodes from places where only simple nodes (symbols) are allowed (Sequences, Fields)
+    fn extract_complex_nodes(&mut self) {
+        let mut processed = 0;
+        // Iterate by index to handle new rules being added
+        while processed < self.rules.len() {
+            let mut node = self.rules[processed].node.clone();
+            let mut changed = false;
+
+            // We pass 'false' for 'in_sequence' initially because top-level structure can be complex
+            Self::extract_in_node(self, &mut node, &mut changed, false);
+
+            if changed {
+                self.rules[processed].node = node;
+            }
+            processed += 1;
+        }
+    }
+
+    fn extract_in_node(
+        &mut self,
+        node: &mut NormalizedNode,
+        changed: &mut bool,
+        in_restricted_ctx: bool,
+    ) {
+        match node {
+            NormalizedNode::Alternative(alts) => {
+                // If we are in restricted context (inside Sequence/Field), Alternative is NOT allowed directly.
+                // We must extract it.
+                if in_restricted_ctx {
+                    let new_ix = self.create_internal_rule_for_extract(node.clone());
+                    *node = NormalizedNode::Reference(new_ix);
+                    *changed = true;
+                    return;
+                }
+
+                // Otherwise traverse children
+                for alt in alts {
+                    Self::extract_in_node(self, alt, changed, false); // Reset context for children of Alt
+                }
+            }
+            NormalizedNode::Sequence(parts) => {
+                if in_restricted_ctx {
+                    // Nested Sequence must be extracted
+                    let new_ix = self.create_internal_rule_for_extract(node.clone());
+                    *node = NormalizedNode::Reference(new_ix);
+                    *changed = true;
+                    return;
+                }
+
+                for part in parts {
+                    Self::extract_in_node(self, part, changed, true); // Children of Sequence are restricted
+                }
+            }
+            NormalizedNode::Field(_, inner) => {
+                // Field content is restricted
+                Self::extract_in_node(self, inner, changed, true);
+            }
+            _ => {} // Terminal, Reference are fine
+        }
+    }
+
+    fn create_internal_rule_for_extract(&mut self, node: NormalizedNode) -> usize {
+        let new_ix = self.rules.len();
+        let name = Box::leak(format!("@extract_{}", new_ix).into_boxed_str());
+
+        self.rules.push(RuleInfo {
+            name,
+            description: "",
+            node,
+            is_expression: false,
+        });
+
+        // Recursively extract in the new rule (it will be picked up by the main loop)
+        new_ix
+    }
+
+    /// Resolves pending dropped rules by generating their bodies
+    fn resolve_dropped_rules(&mut self) {
+        let pending: Vec<((usize, usize), usize)> =
+            self.pending_drops.iter().map(|(k, v)| (*k, *v)).collect();
+
+        for ((target_ix, count), helper_ix) in pending {
+            let target_node = self.rules[target_ix].node.clone();
+            let dropped_node = match target_node {
+                NormalizedNode::Reference(ref_ix) if ref_ix == target_ix => {
+                    NormalizedNode::Sequence(vec![])
+                }
+                other => Self::drop_alternatives(other, count),
+            };
+            self.rules[helper_ix].node = dropped_node;
+
+            // Mark helper as expression if target is expression
+            if self.rules[target_ix].is_expression {
+                self.rules[helper_ix].is_expression = true;
+            }
+        }
+    }
+
+    fn drop_alternatives(target_node: NormalizedNode, count: usize) -> NormalizedNode {
+        match target_node {
+            NormalizedNode::Alternative(mut alts) => {
+                if count < alts.len() {
+                    NormalizedNode::Alternative(alts.split_off(count))
+                } else {
+                    NormalizedNode::Sequence(vec![])
+                }
+            }
+            other => {
+                if count == 0 {
+                    other
+                } else {
+                    NormalizedNode::Sequence(vec![])
+                }
+            }
+        }
+    }
+
     /// Placeholder for converting normalized back to DSL (for repetition desugaring)
     fn denormalize_node(&self, node: NormalizedNode) -> GrammarNode {
         match node {
@@ -503,11 +653,5 @@ impl Normalizer {
 
     fn desugar_all(&mut self) {
         // All desugaring happens during normalize_node
-    }
-
-    /// Detects expression rules using the expression detector
-    fn detect_expressions(self) -> (Vec<RuleInfo>, HashMap<usize, Vec<OperatorInfo>>) {
-        let detector = ExpressionDetector::new(self.rules);
-        detector.detect_expressions()
     }
 }

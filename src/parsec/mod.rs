@@ -1,6 +1,8 @@
+pub mod builder;
 pub mod display;
 pub mod msg;
 pub mod parser;
+pub mod recovery;
 pub mod tree;
 pub mod words;
 

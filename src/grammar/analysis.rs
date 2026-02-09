@@ -1,9 +1,8 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
-use crate::grammar::ir::{Associativity, Production, Symbol};
+use crate::grammar::ir::{Production, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::parsec::words::MatcherRef;
 
 pub const EOF_TOKEN: usize = usize::MAX;
 
@@ -12,13 +11,10 @@ pub enum Action {
     Shift(usize),
     Reduce(usize), // Production index
     Accept,
-    Error,
 }
 
 #[derive(Debug, Clone)]
 pub struct LRState {
-    pub id: usize,
-    pub items: Vec<Item>,
     pub actions: FxHashMap<usize, Action>, // terminal_idx -> Action
     pub goto: FxHashMap<usize, usize>,     // rule_idx -> state_idx
 }
@@ -27,9 +23,7 @@ pub struct LRState {
 pub struct GrammarStateAnalysis {
     pub states: Vec<LRState>,
     pub start_state: usize,
-    pub rule_terminators: FxHashMap<usize, Vec<MatcherRef>>, // For error recovery
 }
-
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
 pub struct Item {
     pub production_ix: usize,
@@ -46,7 +40,6 @@ pub struct AnalysisContext<'a> {
     table: &'a RuleTable,
     productions: &'a [Production],
     first_sets: FxHashMap<usize, FxHashSet<Option<usize>>>, // rule_idx -> {terminal_idx | None} (None = epsilon)
-    follow_sets: FxHashMap<usize, FxHashSet<usize>>,
 }
 
 impl GrammarStateAnalysis {
@@ -107,12 +100,7 @@ impl GrammarStateAnalysis {
                 }
             }
 
-            final_states.push(LRState {
-                id: i,
-                items: item_set.iter().cloned().collect(),
-                actions,
-                goto,
-            });
+            final_states.push(LRState { actions, goto });
         }
 
         // Post-processing for optimization or clean up
@@ -120,16 +108,7 @@ impl GrammarStateAnalysis {
         Self {
             states: final_states,
             start_state: 0,
-            rule_terminators: FxHashMap::default(), // TODO: compute from Follow sets
         }
-    }
-
-    pub fn state_id_for_rule(&self, rule_ix: usize) -> Option<usize> {
-        // Find state that shifts this rule (simplified for recovery)
-        // This is a heuristic for now
-        self.states
-            .iter()
-            .position(|s| s.goto.contains_key(&rule_ix))
     }
 }
 
@@ -139,7 +118,6 @@ impl<'a> AnalysisContext<'a> {
             table,
             productions: &table.productions,
             first_sets: FxHashMap::default(),
-            follow_sets: FxHashMap::default(),
         }
     }
 
@@ -414,10 +392,15 @@ impl<'a> AnalysisContext<'a> {
 
                             // Update tail_first for next symbol
                             let sym_first = self.first_sets.get(idx).cloned().unwrap_or_default();
-                            if !sym_first.contains(&None) {
-                                tail_first.remove(&None);
+                            let sym_nullable = sym_first.contains(&None);
+
+                            let mut new_tail = sym_first.clone();
+                            new_tail.remove(&None);
+
+                            if sym_nullable {
+                                new_tail.extend(tail_first.iter().cloned());
                             }
-                            tail_first.extend(sym_first);
+                            tail_first = new_tail;
                         }
                     }
                 }
@@ -449,80 +432,29 @@ impl<'a> AnalysisContext<'a> {
         new: Action,
         table: &RuleTable,
     ) {
-        // Shift/Reduce or Reduce/Reduce
-        // Check operator tables
-        let term_str = table.terminals[terminal].display();
-
-        // Find operator info for the terminal in the context of the rules
-        // This is tricky because we don't know which rule we are in easily for Shift.
-        // For Reduce, we know the production -> rule.
-
-        // Strategy:
-        // 1. If Shift/Reduce: look at the Shift terminal (operator?) and the Reduce rule (is it an expression?).
-        // 2. If Reduce/Reduce: look at prec of both rules.
-
-        match (&old, &new) {
-            (Action::Shift(_), Action::Reduce(prod_ix)) => {
-                let prod = &self.productions[*prod_ix];
-                let rule_ix = prod.lhs;
-
-                if let Some(ops) = table.operator_tables.get(&rule_ix) {
-                    // Find operator token in production that matches one in ops
-                    let mut reduce_op = None;
-                    for sym in &prod.rhs {
-                        if let Symbol::Terminal(t_ix) = sym {
-                            let t_disp = table.terminals[*t_ix].display();
-                            if let Some(op) = ops.iter().find(|o| o.token.display() == t_disp) {
-                                reduce_op = Some(op);
-                                // Don't break immediately, usually the last operator defines precedence?
-                                // Standard yacc/bison uses the last terminal.
-                            }
-                        }
-                    }
-
-                    // Find shift operator info (from terminal)
-                    let shift_op = ops.iter().find(|o| o.token.display() == term_str);
-
-                    if let (Some(r_op), Some(s_op)) = (reduce_op, shift_op) {
-                        if r_op.precedence > s_op.precedence {
-                            // Reduce wins (keep new)
-                            actions.insert(terminal, new);
-                            return;
-                        } else if r_op.precedence < s_op.precedence {
-                            // Shift wins (keep old)
-                            return;
-                        } else {
-                            // Equal precedence, check associativity
-                            if r_op.associativity == Associativity::Left {
-                                // Left assoc -> Reduce
-                                actions.insert(terminal, new);
-                                return;
-                            } else {
-                                // Right assoc -> Shift
-                                return;
-                            }
-                        }
-                    } else {
-                        // Ops not found
-                    }
-                } else {
-                    // No ops table for rule
-                }
-
-                // Default: Shift preferred
-            }
-            _ => {}
+        if terminal == EOF_TOKEN || terminal >= table.terminals.len() {
+            return;
         }
 
-        // If unresolved, prefer Shift over Reduce, or First Reduce over Second
+        // Default conflict resolution:
+        // Shift/Reduce: Shift wins
+        // Reduce/Reduce: First wins (keep old)
+
         match new {
             Action::Shift(_) => {
-                /* Keep Shift (rewrite) or Old was Shift? If Old was Reduce, Shift wins */
+                // If old was Reduce, Shift overrides it
                 if let Action::Reduce(_) = old {
                     actions.insert(terminal, new);
                 }
             }
-            Action::Reduce(_) => { /* Old was Shift or Reduce. If Shift, keep old. If Reduce, keep old (first one wins) */
+            Action::Reduce(new_idx) => {
+                // If old was Shift, keep Shift.
+                // If old was Reduce, keep the one with lower production index (earlier in grammar).
+                if let Action::Reduce(old_idx) = old {
+                    if new_idx < old_idx {
+                        actions.insert(terminal, new);
+                    }
+                }
             }
             _ => {}
         }

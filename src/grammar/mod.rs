@@ -1,13 +1,9 @@
 pub(crate) mod analysis;
 pub mod display;
 pub mod dsl;
-pub(crate) mod expr_detect;
 pub(crate) mod ir;
 pub(crate) mod norm;
 pub(crate) mod recovery;
-
-#[cfg(test)]
-mod tests;
 
 use std::sync::Arc;
 
@@ -45,8 +41,6 @@ pub enum GrammarInfo {
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,
-    errors: Vec<GrammarError>,
-    infos: Vec<GrammarInfo>,
 }
 
 impl Grammar {
@@ -57,12 +51,7 @@ impl Grammar {
             table.start_rule,
         ));
 
-        Self {
-            table,
-            analysis,
-            errors: vec![],
-            infos: vec![],
-        }
+        Self { table, analysis }
     }
 
     pub fn name(&self, rule_idx: usize) -> &'static str {

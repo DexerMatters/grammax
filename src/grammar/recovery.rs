@@ -87,17 +87,21 @@ impl RecoverySpecs {
         }
     }
 
-    fn compute_regions(line_starts: &[usize], line_indents: &[usize], text_len: usize) -> Vec<Region> {
+    fn compute_regions(
+        line_starts: &[usize],
+        line_indents: &[usize],
+        text_len: usize,
+    ) -> Vec<Region> {
         let mut regions = Vec::new();
         if line_starts.is_empty() {
             return regions;
         }
 
         let mut stack: Vec<(usize, usize)> = Vec::new();
-        
+
         for (line_idx, &line_start) in line_starts.iter().enumerate() {
             let indent = line_indents.get(line_idx).copied().unwrap_or(0);
-            
+
             while let Some(&(_, prev_indent)) = stack.last() {
                 if indent > prev_indent {
                     break;
@@ -110,7 +114,7 @@ impl RecoverySpecs {
                     });
                 }
             }
-            
+
             stack.push((line_start, indent));
         }
 

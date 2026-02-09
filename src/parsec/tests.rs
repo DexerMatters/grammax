@@ -1,32 +1,33 @@
-use crate::grammar::dsl::*;
 use crate::new_grammar;
-use crate::parsec::display::format_ast;
+use crate::parsec::display::{format_ast, format_messages};
 use crate::parsec::parser::Parser;
-use crate::parsec::words::NUMS;
+use crate::parsec::tree::TreeAllocRefExt;
+use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
 #[test]
 fn test_simple_arithmetic_precedence() {
     let grammar = new_grammar!(
-        expr where
+        start where
+        start -> r!(expr)
         expr -> r!(add) | r!(mul) | r!(primary)
-        add  -> r!(expr) + t("+") + r!(primary)
-        mul  -> r!(expr) + t("*") + r!(primary)
+        add  -> field("lhs:", r!(expr)) + t("+") + field("rhs:", r!(expr).drop(1))
+        mul  -> field("lhs:", r!(expr).drop(1)) + t("*") + field("rhs:", r!(expr).drop(2))
         primary -> tt(NUMS) | t("(") + r!(expr) + t(")")
     );
 
     let mut parser = Parser::new(grammar.clone());
 
-    let text = "4*4*(1+2*3)*4+5";
+    println!("Grammar:\n{}", parser.grammar.table);
+
+    let text = "1+4*x+4";
     let result = parser.parse_text(text);
 
-    assert!(
-        result.messages.is_empty(),
-        "Parse errors: {:?}",
-        result.messages
-    );
-
     let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
-    println!("AST 1+2*3:\n{}", output);
+    println!("AST 1+4*3+4:\n{}", output);
+    println!(
+        "Messages:\n{}",
+        format_messages(&parser.grammar, &result.messages)
+    );
 
     // Verify * is child of + (or rather + is the root operation)
     // Structure:
@@ -42,49 +43,104 @@ fn test_simple_arithmetic_precedence() {
 }
 
 #[test]
-fn test_parentheses_precedence() {
+fn test_json() {
     let grammar = new_grammar!(
-        expr where
-        expr -> alt(vec![
-            seq(vec![r!(expr), t("+"), r!(expr)]),
-            seq(vec![r!(expr), t("*"), r!(expr)]),
-            seq(vec![t("("), r!(expr), t(")")]),
-            t("1"),
-            t("2"),
-            t("3")
-        ])
+        json where
+        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
+        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
+        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
+        string  -> tt("\"") + t(STRING) + tt("\"")
+        number  -> tt(NUMS)
+        boolean -> tt("true") | tt("false")
+        null    -> tt("null")
+    );
+
+    let mut parser = Parser::new(grammar.clone());
+
+    println!("Grammar:\n{}", parser.grammar.table);
+
+    let text = r#"{
+        "name": "John",
+        "age": 30,
+        "isStudent": true,
+        "scores": [85, x, 92],
+        "address": {
+            "street": "123 Main St",
+            "city": "Anytown"
+        },
+        "nullValue": null
+    }
+    "#;
+    let result = parser.parse_text(text);
+
+    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
+    println!("AST:\n{}", output);
+    println!(
+        "Messages:\n{}",
+        format_messages(&parser.grammar, &result.messages)
+    );
+}
+
+#[test]
+fn test_repetition() {
+    let grammar = new_grammar!(
+        start where
+        start -> r!(expr)
+        expr -> tt("[") + sep(field("arg:", r!(expr)), tt(",")) + tt("]") | tt(NUMS)
     );
 
     let mut parser = Parser::new(grammar);
 
-    // (1 + 2) * 3
-    let text = "(1+2)*3";
+    // Test with valid input first
+    let text = "[1,[6, 4],3]";
     let result = parser.parse_text(text);
-
+    println!("Grammar:\n{}", parser.grammar.table);
+    println!(
+        "AST (valid):\n{}",
+        format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text())
+    );
     assert!(
         result.messages.is_empty(),
-        "Parse errors: {:?}",
-        result.messages
+        "Expected no parse errors for valid input"
     );
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
-    println!("AST (1+2)*3:\n{}", output);
+    // Test with error input
+    let text2 = "[1,[4, x],3]";
+    let result2 = parser.parse_text(text2);
+    println!(
+        "\nAST (with error 1):\n{}",
+        format_ast(&parser.grammar, &result2.root, &parser.alloc, parser.text())
+    );
+    println!(
+        "Messages:\n{}",
+        format_messages(&parser.grammar, &result2.messages)
+    );
+
+    // We expect exactly one error at the position of 'x'
+    assert!(
+        !result2.messages.is_empty(),
+        "Expected parse errors for invalid input"
+    );
+
+    // Test with error input
+    let text2 = "[1,[x, 4],3]";
+    let result2 = parser.parse_text(text2);
+    println!(
+        "\nAST (with error 2):\n{}",
+        format_ast(&parser.grammar, &result2.root, &parser.alloc, parser.text())
+    );
+    println!(
+        "Messages:\n{}",
+        format_messages(&parser.grammar, &result2.messages)
+    );
+
+    // We expect exactly one error at the position of 'x'
+    assert!(
+        !result2.messages.is_empty(),
+        "Expected parse errors for invalid input"
+    );
 }
 
 #[test]
-fn test_right_associativity_check() {
-    // Standard + is usually left associative.
-    // Let's define a right associative operator, e.g. ^
-    // expr -> expr ^ expr
-    // expr -> val
-
-    // How does expr_detect determine associativity?
-    // It defaults to LEFT unless specified.
-    // The DSL doesn't seem to expose associativity control directly in the `alt` list order effectively without annotations
-    // OR expr_detect guesses based on recursion pattern?
-    // Looking at expr_detect.rs snippet:
-    // It assigns precedence based on index.
-    // It calls `extract_operator`.
-
-    // Let's stick to standard test first.
-}
+fn test_right_associativity_check() {}

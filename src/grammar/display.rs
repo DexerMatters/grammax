@@ -1,6 +1,6 @@
-use std::fmt;
-use crate::grammar::norm::RuleTable;
 use crate::grammar::ir::{NormalizedNode, Production, Symbol};
+use crate::grammar::norm::RuleTable;
+use std::fmt;
 
 impl RuleTable {
     fn get_rule_name(&self, idx: usize) -> String {
@@ -105,7 +105,7 @@ impl fmt::Display for RuleTable {
                 } else {
                     rule.name.to_string()
                 };
-                
+
                 writeln!(
                     f,
                     "{}{:<width$}{} → {}",

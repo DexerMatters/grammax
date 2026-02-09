@@ -1,5 +1,5 @@
 use std::{
-    fmt::{self, Debug},
+    fmt::Debug,
     ops::{self},
     sync::Arc,
 };
@@ -272,7 +272,7 @@ impl<T: Matcher, U: Matcher> Matcher for Sequence<T, U> {
     }
 }
 
-impl<T: Matcher, R: ops::RangeBounds<usize> + fmt::Debug> Matcher for Repeat<T, R> {
+impl<T: Matcher, R: ops::RangeBounds<usize> + Debug> Matcher for Repeat<T, R> {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
         let min = match self.1.start_bound() {

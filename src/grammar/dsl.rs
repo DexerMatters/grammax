@@ -13,6 +13,10 @@ pub enum GrammarNode {
     Sequence(Vec<GrammarNode>),
     Reference(fn() -> GrammarNode, &'static str),
     Field(&'static str, Box<GrammarNode>),
+    Drop {
+        node: Box<GrammarNode>,
+        count: usize,
+    },
     Repetition {
         node: Box<GrammarNode>,
         min: usize,
@@ -24,6 +28,15 @@ pub enum GrammarNode {
         min: usize,
         max: Option<usize>,
     },
+}
+
+impl GrammarNode {
+    pub fn drop(self, count: usize) -> Self {
+        GrammarNode::Drop {
+            node: Box::new(self),
+            count,
+        }
+    }
 }
 
 // Helper functions for DSL

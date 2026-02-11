@@ -12,5 +12,6 @@ mod tests;
 pub use msg::ParserMessage;
 pub use parser::Parser;
 pub use parser::ParserConfig;
+pub use parser::IncrementalReuseStats;
 pub use parser::ParserListener;
 pub use parser::Result;

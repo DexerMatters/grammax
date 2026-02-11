@@ -1,15 +1,14 @@
-use std::{
-    sync::{
-        Arc,
-        atomic::{self, AtomicUsize},
-    },
-    thread,
-};
+use std::thread;
 
 use crate::{
     new_grammar,
-    parsec_old::{ParserConfig, ParserListener, fmt::Display, words::*},
-    runtime::{Interactive, RuntimeListener},
+    parsec::{
+        ParserConfig,
+        display::{format_ast, format_messages},
+        recovery::RecoveryConfig,
+        words::*,
+    },
+    runtime::{Interactive, RuntimeConfig, RuntimeListener},
 };
 
 #[test]
@@ -23,7 +22,7 @@ fn test_expr_example() {
         primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
     println!("===== Grammar =====");
-    println!("{}", grammar);
+    println!("{}", grammar.table);
 
     let listener = RuntimeListener::new()
         .before_update(|| {
@@ -37,16 +36,30 @@ fn test_expr_example() {
             // );
             eprintln!(
                 "Reparsed tree:\n{}",
-                result.reparsed_tree.display(&result.current_parser)
+                format_ast(
+                    &result.current_parser.grammar,
+                    result.reparsed_tree,
+                    &result.current_parser.alloc,
+                    result.current_parser.text(),
+                )
             );
             eprintln!("Offset: {}", result.reparsed_tree.offset);
             eprintln!("Messages:");
-            eprintln!("{}", result.messages.display(&result.current_parser));
+            eprintln!(
+                "{}",
+                format_messages(&result.current_parser.grammar, &result.messages)
+            );
             eprintln!("Update took: {:?}", duration);
         });
     let runtime = Interactive::new(grammar)
         .with_listener(listener)
-        .with_parser_config(ParserConfig::new().with_simple_ast(false))
+        .with_config(RuntimeConfig {
+            parser: ParserConfig {
+                simple_ast: false,
+                recovery: RecoveryConfig::default(),
+            },
+            ..RuntimeConfig::default()
+        })
         .finish();
     runtime.run().unwrap();
     runtime.insert(0, "1 + 1".to_string()).unwrap();
@@ -77,33 +90,44 @@ fn test_example() {
             //     result.current_tree.display(&result.current_parser)
             // );
             eprintln!(
-                "Reparsed tree:\n{}",
-                result.reparsed_tree.display(&result.current_parser)
+                "Reparsed parse tree:\n{}",
+                format_ast(
+                    &result.current_parser.grammar,
+                    result.current_tree,
+                    &result.current_parser.alloc,
+                    result.current_parser.text(),
+                )
             );
-            eprintln!("Offset: {}", result.reparsed_tree.offset);
-            eprintln!("Messages:");
-            eprintln!("{}", result.messages.display(&result.current_parser));
-            for node in &result.newly_computed_tokens {
+            for spans in result.newly_computed_tokens {
                 eprintln!(
-                    "Newly computed tokens: {:?} - {:?}",
-                    node,
-                    result.current_parser.text[node.start..node.end].to_string()
+                    "Newly computed token {}",
+                    result.source_text[spans.start..spans.end].escape_debug()
                 );
             }
+            eprintln!("Messages:");
+            eprintln!(
+                "{}",
+                format_messages(&result.current_parser.grammar, &result.messages)
+            );
             eprintln!("Update took: {:?}", duration);
         });
 
     let runtime = Interactive::new(grammar)
         .with_listener(listener)
-        .with_parser_config(ParserConfig::new().with_simple_ast(true))
+        .with_parser_config(ParserConfig {
+            simple_ast: true,
+            recovery: RecoveryConfig::default(),
+        })
         .finish();
     runtime.run().unwrap();
     runtime
-        .insert(0, r#"{"name": "Dexer"}"#.to_string())
+        .insert(0, r#"{"name": sDexers}"#.to_string())
         .unwrap();
     runtime.insert(16, r#", "age": 30"#.to_string()).unwrap();
     runtime.delete(16, 27).unwrap();
     runtime.insert(3, "x".to_string()).unwrap();
+    println!("====Inserted 'x' at offset 3");
+    runtime.insert(3, "x".to_string()).unwrap();
 
-    thread::sleep(std::time::Duration::from_millis(100));
+    thread::sleep(std::time::Duration::from_millis(10000));
 }

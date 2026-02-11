@@ -18,16 +18,30 @@ impl<'a> TreeBuilder<'a> {
     }
 
     pub fn build_node(&self, rule_ix: usize, children: Vec<GreenId>) -> GreenId {
+        let mut effective_rule_ix = rule_ix;
         let name = self.grammar.name(rule_ix);
-        let is_helper = name.contains('@');
+
+        if let Some(pos) = name.find("@drop_") {
+            let target_name = &name[..pos];
+            if let Some(ix) = self
+                .grammar
+                .table
+                .rules
+                .iter()
+                .position(|rule| rule.name == target_name)
+            {
+                effective_rule_ix = ix;
+            }
+        }
+
+        let filtered_children: Vec<GreenId> = children
+            .into_iter()
+            .filter(|child_id| !self.is_silent_token(*child_id))
+            .collect();
 
         if self.config.simple_ast {
-            if is_helper && name.contains("@drop_") && children.len() == 1 {
-                return children[0];
-            }
-
-            let mut flat_children = Vec::with_capacity(children.len());
-            for &child_id in &children {
+            let mut flat_children = Vec::with_capacity(filtered_children.len());
+            for &child_id in &filtered_children {
                 let child_node = self.alloc.get_node(child_id);
                 let should_flatten = if let Tag::Rule { rule_ix: child_ix } = child_node.tag {
                     let child_name = self.grammar.name(child_ix);
@@ -48,13 +62,19 @@ impl<'a> TreeBuilder<'a> {
                 .map(|id| self.alloc.get_node(*id).width)
                 .sum();
             self.alloc
-                .alloc(Tag::new_rule(rule_ix), flat_children, width)
+                .alloc(Tag::new_rule(effective_rule_ix), flat_children, width)
         } else {
-            let width: usize = children
+            let width: usize = filtered_children
                 .iter()
                 .map(|id| self.alloc.get_node(*id).width)
                 .sum();
-            self.alloc.alloc(Tag::new_rule(rule_ix), children, width)
+            self.alloc
+                .alloc(Tag::new_rule(effective_rule_ix), filtered_children, width)
         }
+    }
+
+    fn is_silent_token(&self, id: GreenId) -> bool {
+        let node = self.alloc.get_node(id);
+        matches!(node.tag, Tag::Token { .. }) && node.children.is_empty() && node.width == 0
     }
 }

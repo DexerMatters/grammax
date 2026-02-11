@@ -74,10 +74,36 @@ impl<'a> UpdateResult<'a> {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub parser: ParserConfig,
+    pub reparser: ReparserConfig,
+    pub incremental_reuse_enabled: bool,
+    pub incremental_reuse_cache_capacity: usize,
+    pub incremental_reuse_cache_failures: bool,
+}
+
+impl RuntimeConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            parser: ParserConfig::default(),
+            reparser: ReparserConfig::default(),
+            incremental_reuse_enabled: true,
+            incremental_reuse_cache_capacity: 512,
+            incremental_reuse_cache_failures: true,
+        }
+    }
+}
+
 pub struct Interactive {
     grammar: Grammar,
-    config: Option<ParserConfig>,
-    reparser_config: Option<ReparserConfig>,
+    runtime_config: RuntimeConfig,
     runtime_listener: Option<RuntimeListener>,
     parser_listener: Option<ParserListener>,
 }
@@ -86,15 +112,19 @@ impl Interactive {
     pub fn new(grammar: Grammar) -> Interactive {
         Interactive {
             grammar,
-            config: None,
-            reparser_config: None,
+            runtime_config: RuntimeConfig::default(),
             runtime_listener: None,
             parser_listener: None,
         }
     }
 
-    pub fn with_config(mut self, reparser_config: ReparserConfig) -> Self {
-        self.reparser_config = Some(reparser_config);
+    pub fn with_config(mut self, runtime_config: RuntimeConfig) -> Self {
+        self.runtime_config = runtime_config;
+        self
+    }
+
+    pub fn with_reparser_config(mut self, reparser_config: ReparserConfig) -> Self {
+        self.runtime_config.reparser = reparser_config;
         self
     }
 
@@ -104,7 +134,19 @@ impl Interactive {
     }
 
     pub fn with_parser_config(mut self, config: ParserConfig) -> Self {
-        self.config = Some(config);
+        self.runtime_config.parser = config;
+        self
+    }
+
+    pub fn with_incremental_reuse(
+        mut self,
+        enabled: bool,
+        cache_capacity: usize,
+        cache_failures: bool,
+    ) -> Self {
+        self.runtime_config.incremental_reuse_enabled = enabled;
+        self.runtime_config.incremental_reuse_cache_capacity = cache_capacity.max(1);
+        self.runtime_config.incremental_reuse_cache_failures = cache_failures;
         self
     }
 
@@ -116,8 +158,7 @@ impl Interactive {
     pub fn finish(self) -> InteractiveInstance {
         InteractiveInstance::init(
             self.grammar,
-            self.config.unwrap_or_else(ParserConfig::default),
-            self.reparser_config.unwrap_or_else(ReparserConfig::default),
+            self.runtime_config,
             self.runtime_listener.unwrap_or_default(),
             self.parser_listener.unwrap_or_default(),
         )
@@ -132,23 +173,27 @@ pub struct InteractiveInstance {
 impl InteractiveInstance {
     pub(crate) fn init(
         grammar: Grammar,
-        config: ParserConfig,
-        reparser_config: ReparserConfig,
+        runtime_config: RuntimeConfig,
         runtime_listener: RuntimeListener,
         parser_listener: ParserListener,
     ) -> Self {
         let (sender, inthread_receiver) = mpsc::channel();
         let thread_handle = thread::spawn(move || {
             let mut parser = Parser::new(grammar)
-                .with_config(config)
+                .with_config(runtime_config.parser)
                 .with_listener(parser_listener);
+            parser.configure_reuse(
+                runtime_config.incremental_reuse_enabled,
+                runtime_config.incremental_reuse_cache_capacity,
+                runtime_config.incremental_reuse_cache_failures,
+            );
             let alloc = parser.alloc.clone();
             let parsec::Result { root: cursor, .. } = parser.parse_text("");
 
             Runtime {
                 text: "".to_string(),
                 parser,
-                cursor: Reparser::new(cursor, alloc).with_config(reparser_config),
+                cursor: Reparser::new(cursor, alloc).with_config(runtime_config.reparser),
                 receiver: inthread_receiver,
                 mode: Mode::Ready,
                 runtime_listener,
@@ -268,11 +313,11 @@ impl Runtime {
                             (listener)();
                         });
                     let start = std::time::Instant::now();
-                    let new_len = text.len();
                     self.text.insert_str(offset, &text);
-                    self.parser.apply_edit(&self.text, offset, 0, new_len);
                     let span = Span::new(offset, offset);
-                    let result = self.cursor.handle_edit(&mut self.parser, span, text.len());
+                    let result =
+                        self.cursor
+                            .handle_edit(&mut self.parser, span, text.len(), &self.text);
                     let duration = start.elapsed();
                     self.runtime_listener.after_update.as_ref().map(|listener| {
                         (listener)(
@@ -297,10 +342,10 @@ impl Runtime {
                             (listener)();
                         });
                     let start = std::time::Instant::now();
-                    let old_len = span.len();
                     self.text.replace_range(ops::Range::from(span), "");
-                    self.parser.apply_edit(&self.text, span.start, old_len, 0);
-                    let result = self.cursor.handle_edit(&mut self.parser, span, 0);
+                    let result = self
+                        .cursor
+                        .handle_edit(&mut self.parser, span, 0, &self.text);
                     let duration = start.elapsed();
                     self.runtime_listener.after_update.as_ref().map(|listener| {
                         (listener)(
@@ -325,12 +370,11 @@ impl Runtime {
                             (listener)();
                         });
                     let start = std::time::Instant::now();
-                    let old_len = span.len();
                     let new_len = text.len();
                     self.text.replace_range(ops::Range::from(span), &text);
-                    self.parser
-                        .apply_edit(&self.text, span.start, old_len, new_len);
-                    let result = self.cursor.handle_edit(&mut self.parser, span, new_len);
+                    let result =
+                        self.cursor
+                            .handle_edit(&mut self.parser, span, new_len, &self.text);
                     let duration = start.elapsed();
                     self.runtime_listener.after_update.as_ref().map(|listener| {
                         (listener)(
@@ -359,9 +403,8 @@ impl Runtime {
             }
         }
         if self.mode == Mode::Paused {
-            return;
+            self.run_paused_mode();
         }
-        self.run_paused_mode();
     }
 
     fn run_paused_mode(&mut self) {
@@ -384,10 +427,9 @@ impl Runtime {
                 _ => { /* Ignored */ }
             }
         }
-        if self.mode == Mode::Interrupted {
-            return;
+        if self.mode == Mode::Running {
+            self.run_running_mode();
         }
-        self.run_running_mode();
     }
 }
 

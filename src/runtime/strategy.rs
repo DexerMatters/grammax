@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use crate::{
-    grammar_old::recovery::{ErrorRecoveryStrategy, RecoverySpecs},
-    parsec_old::{Parser, msg::ParserMessages, tree::TreeAllocRefExt},
+    grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs},
+    parsec::{Parser, msg::ParserMessages, tree::TreeAllocRefExt},
     runtime::reparser::{ReparserConfig, Zipper},
     utils::Span,
 };
@@ -50,7 +50,7 @@ pub(crate) fn pick_candidate(
     kind: EditKind,
 ) -> Option<StrategyCandidate> {
     let mut best: Option<StrategyCandidate> = None;
-    let best_with_clean_surrounding: Option<StrategyCandidate> = None;
+    let mut best_with_clean_surrounding: Option<StrategyCandidate> = None;
 
     for zipper in ctx.zippers.iter().rev() {
         if zipper.level < ctx.config.min_level {
@@ -70,7 +70,7 @@ pub(crate) fn pick_candidate(
         let is_clean = candidate.score.errors_outside == 0;
         if is_clean {
             if should_replace(&best_with_clean_surrounding, &candidate) {
-                return Some(candidate);
+                best_with_clean_surrounding = Some(candidate);
             }
         } else if should_replace(&best, &candidate) {
             best = Some(candidate);
@@ -94,17 +94,25 @@ fn evaluate_candidate(
     enforce_region_end: bool,
 ) -> Option<StrategyCandidate> {
     ctx.parser.messages.clear();
+    ctx.parser.newly_computed_nodes.clear();
+    ctx.parser.newly_computed_tokens.clear();
 
-    ctx.parser.set_incremental_insert_pos(None);
+    ctx.parser.set_insert_pos(None);
 
-    let new_green = ctx.parser.parse_rule(zipper.rule_ix, zipper.offset)?;
+    let expected_width_signed = zipper.old_width as isize + ctx.delta;
+    if expected_width_signed < 0 {
+        return None;
+    }
+    let expected_width = expected_width_signed as usize;
+
+    let new_green = ctx
+        .parser
+        .parse_rule(zipper.rule_ix, zipper.offset, expected_width)?;
 
     let new_width = {
         let new_node = ctx.parser.alloc.get_node(new_green);
         new_node.width
     };
-
-    let expected_width = (zipper.old_width as isize + ctx.delta) as usize;
 
     if new_width != expected_width {
         return None;
@@ -112,14 +120,8 @@ fn evaluate_candidate(
 
     let check_end = zipper.offset + new_width;
 
-    if enforce_region_end {
-        if let Some(specs) = ctx.specs {
-            if let Some(region_end) = specs.region_end_at(ctx.span.start) {
-                if check_end > region_end && ctx.config.enforce_region_end {
-                    return None;
-                }
-            }
-        }
+    if enforce_region_end && ctx.config.enforce_region_end {
+        let _ = (ctx.specs, check_end);
     }
 
     if let Some(strategy) = ctx.recovery_strategy {
@@ -143,20 +145,6 @@ fn evaluate_candidate(
     if ctx.config.min_level > 0 {
         errors_inside = 0;
         errors_outside = 0;
-    }
-
-    if errors_inside + errors_outside > 0 {
-        if let (Some(strategy), Some(state_id)) = (
-            ctx.recovery_strategy,
-            ctx.parser
-                .grammar
-                .analysis
-                .state_id_for_rule(zipper.rule_ix),
-        ) {
-            if !strategy.can_recover_at(state_id) {
-                errors_outside += 1;
-            }
-        }
     }
 
     let level = std::cmp::Reverse(zipper.level);

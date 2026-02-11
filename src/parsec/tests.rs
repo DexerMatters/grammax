@@ -1,29 +1,29 @@
 use crate::new_grammar;
 use crate::parsec::display::{format_ast, format_messages};
 use crate::parsec::parser::Parser;
-use crate::parsec::tree::TreeAllocRefExt;
+use crate::parsec::tree::{Tag, TreeAllocRefExt};
 use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
 #[test]
 fn test_simple_arithmetic_precedence() {
     let grammar = new_grammar!(
         start where
-        start -> r!(expr)
+        start -> r!(expr) + tt(EndOfInput)
         expr -> r!(add) | r!(mul) | r!(primary)
-        add  -> field("lhs:", r!(expr)) + t("+") + field("rhs:", r!(expr).drop(1))
-        mul  -> field("lhs:", r!(expr).drop(1)) + t("*") + field("rhs:", r!(expr).drop(2))
-        primary -> tt(NUMS) | t("(") + r!(expr) + t(")")
+        add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
+        mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
+        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
 
     let mut parser = Parser::new(grammar.clone());
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "1+4*x+4";
+    let text = "1+4*3+4";
     let result = parser.parse_text(text);
 
     let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
-    println!("AST 1+4*3+4:\n{}", output);
+    println!("AST {}:\n{}", text, output);
     println!(
         "Messages:\n{}",
         format_messages(&parser.grammar, &result.messages)
@@ -64,7 +64,7 @@ fn test_json() {
         "name": "John",
         "age": 30,
         "isStudent": true,
-        "scores": [85, x, 92],
+        "scores": [85, 90, 92],
         "address": {
             "street": "123 Main St",
             "city": "Anytown"
@@ -144,3 +144,84 @@ fn test_repetition() {
 
 #[test]
 fn test_right_associativity_check() {}
+
+#[test]
+fn test_parse_rule_partial_pair() {
+    let grammar = new_grammar!(
+        json where
+        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
+        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
+        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
+        string  -> tt("\"") + t(STRING) + tt("\"")
+        number  -> tt(NUMS)
+        boolean -> tt("true") | tt("false")
+        null    -> tt("null")
+    );
+
+    let mut parser = Parser::new(grammar);
+    let text = r#"{"name": "Dexer", "age": 30}"#;
+    let _ = parser.parse_text(text);
+
+    let pair_ix = parser
+        .grammar
+        .table
+        .rules
+        .iter()
+        .position(|r| r.name == "pair")
+        .expect("pair rule exists");
+
+    let target = r#" "age": 30"#;
+    let start = text.find(target).expect("target pair exists");
+    let green = parser
+        .parse_rule(pair_ix, start, target.len())
+        .expect("pair should parse as bounded rule");
+    let node = parser.alloc.get_node(green);
+
+    assert_eq!(node.width, target.len());
+    assert!(matches!(node.tag, Tag::Rule { rule_ix } if rule_ix == pair_ix));
+    assert!(parser.messages.is_empty());
+}
+
+#[test]
+fn test_parse_text_primes_reuse_cache() {
+    let grammar = new_grammar!(
+        json where
+        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
+        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
+        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
+        string  -> tt("\"") + t(STRING) + tt("\"")
+        number  -> tt(NUMS)
+        boolean -> tt("true") | tt("false")
+        null    -> tt("null")
+    );
+
+    let mut parser = Parser::new(grammar);
+    parser.configure_reuse(true, 512, true);
+    parser.reset_reuse_stats();
+
+    let text = r#"{"name": "Dexer"}"#;
+    let _ = parser.parse_text(text);
+    assert!(
+        parser.reuse_stats().inserts > 0,
+        "full parse should prime reuse cache"
+    );
+
+    let object_ix = parser
+        .grammar
+        .table
+        .rules
+        .iter()
+        .position(|r| r.name == "object")
+        .expect("object rule exists");
+
+    let green = parser
+        .parse_rule(object_ix, 0, text.len())
+        .expect("object should parse from cache");
+    assert_eq!(parser.alloc.get_node(green).width, text.len());
+    assert!(
+        parser.newly_computed_tokens().is_empty(),
+        "cache hit should not report freshly computed tokens"
+    );
+}

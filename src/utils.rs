@@ -106,6 +106,10 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
         self.data.len()
     }
 
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }

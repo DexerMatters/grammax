@@ -1,7 +1,7 @@
 pub mod grammar;
 pub mod parsec;
 
-// pub mod runtime;
+pub mod runtime;
 pub mod utils;
 
 pub mod ui;

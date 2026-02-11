@@ -233,9 +233,12 @@ impl Matcher for StartOfInput {
 
 impl<T: Matcher, U: Matcher> Matcher for Alternative<T, U> {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
-        self.0
-            .matches(input, pos)
-            .or_else(|| self.1.matches(input, pos))
+        let start = *pos;
+        if let Some(len) = self.0.matches(input, pos) {
+            return Some(len);
+        }
+        *pos = start;
+        self.1.matches(input, pos)
     }
 
     fn display(&self) -> String {
@@ -249,13 +252,28 @@ impl<T: Matcher, U: Matcher> Matcher for Alternative<T, U> {
     fn is_consuming(&self) -> bool {
         self.0.is_consuming() && self.1.is_consuming()
     }
+
+    fn preview(&self) -> Option<&str> {
+        let left = self.0.preview();
+        let right = self.1.preview();
+        if left.is_some() && left == right {
+            left
+        } else {
+            None
+        }
+    }
 }
 
 impl<T: Matcher, U: Matcher> Matcher for Sequence<T, U> {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
-        self.0.matches(input, pos)?;
-        self.1.matches(input, pos)?;
+        if self.0.matches(input, pos).is_none() {
+            return None;
+        }
+        if self.1.matches(input, pos).is_none() {
+            *pos = start;
+            return None;
+        }
         Some(*pos - start)
     }
 
@@ -269,6 +287,14 @@ impl<T: Matcher, U: Matcher> Matcher for Sequence<T, U> {
 
     fn is_consuming(&self) -> bool {
         self.0.is_consuming() || self.1.is_consuming()
+    }
+
+    fn preview(&self) -> Option<&str> {
+        if self.0.is_nullable() {
+            self.1.preview().or_else(|| self.0.preview())
+        } else {
+            self.0.preview()
+        }
     }
 }
 
@@ -319,6 +345,13 @@ impl<T: Matcher, R: ops::RangeBounds<usize> + Debug> Matcher for Repeat<T, R> {
     fn is_consuming(&self) -> bool {
         self.0.is_consuming()
     }
+
+    fn preview(&self) -> Option<&str> {
+        match self.1.start_bound() {
+            ops::Bound::Included(&0) | ops::Bound::Excluded(&0) | ops::Bound::Unbounded => None,
+            _ => self.0.preview(),
+        }
+    }
 }
 
 impl<M: Matcher> Matcher for NamedMatcher<M> {
@@ -336,5 +369,9 @@ impl<M: Matcher> Matcher for NamedMatcher<M> {
 
     fn is_consuming(&self) -> bool {
         self.matcher.is_consuming()
+    }
+
+    fn preview(&self) -> Option<&str> {
+        self.matcher.preview()
     }
 }

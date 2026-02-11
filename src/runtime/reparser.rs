@@ -1,7 +1,7 @@
 use std::rc::Rc;
 
 use crate::{
-    parsec_old::{
+    parsec::{
         Parser,
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
@@ -103,6 +103,7 @@ impl Reparser {
         parser: &mut Parser,
         span: Span,
         new_len: usize,
+        source_text: &str,
     ) -> ReparseResult {
         if span.len() == 0 && new_len == 0 {
             return ReparseResult {
@@ -114,9 +115,16 @@ impl Reparser {
         }
 
         let old_messages = parser.messages.clone();
+        let old_text = parser.text().to_string();
         parser.messages.clear();
         parser.newly_computed_nodes.clear();
         parser.newly_computed_tokens.clear();
+        parser.set_text(source_text);
+        let focus_span = Self::focus_span_for_edit(source_text, span, new_len);
+
+        if !old_messages.is_empty() {
+            return self.full_reparse(parser, source_text, focus_span);
+        }
 
         let (focus_node, mut steps, level) = self.get_context(span);
         let delta = new_len as isize - span.len() as isize;
@@ -139,7 +147,6 @@ impl Reparser {
             &mut steps,
             level,
             &mut zippers,
-            &parser.grammar.analysis.rule_terminators,
             parser,
         );
 
@@ -151,7 +158,7 @@ impl Reparser {
         }
 
         if zippers.is_empty() {
-            return self.full_reparse(parser);
+            return self.full_reparse(parser, source_text, focus_span);
         }
 
         let mut ctx = StrategyContext {
@@ -175,11 +182,19 @@ impl Reparser {
         let best = pick_candidate(&mut ctx, edit_span, kind);
 
         if let Some(candidate) = best {
-            return self.apply_candidate(parser, candidate, &old_messages, delta);
+            return self.apply_candidate(
+                parser,
+                candidate,
+                &old_messages,
+                delta,
+                focus_span,
+                &old_text,
+                source_text,
+            );
         }
 
         // If no candidate found among collected zippers, fall back to full reparse
-        self.full_reparse(parser)
+        self.full_reparse(parser, source_text, focus_span)
     }
 
     fn apply_candidate(
@@ -188,8 +203,11 @@ impl Reparser {
         candidate: StrategyCandidate,
         old_messages: &ParserMessages,
         delta: isize,
+        focus_span: Span,
+        old_source_text: &str,
+        new_source_text: &str,
     ) -> ReparseResult {
-        let (updated_node, root) = candidate.zipper.replace_green(&self.alloc, candidate.green);
+        let (_updated_node, root) = candidate.zipper.replace_green(&self.alloc, candidate.green);
         self.current = root;
 
         // Merge messages: keep old messages outside the replaced range (shifted if needed)
@@ -214,20 +232,32 @@ impl Reparser {
 
         parser.messages = new_messages;
         self.normalize_root(parser);
+        let reparsed_tree = self.focus_reparsed_tree(parser, focus_span);
+
+        let new_width = self.alloc.get_node(candidate.green).width;
+        let changed = Self::changed_window(
+            old_source_text,
+            new_source_text,
+            candidate.zipper.offset,
+            candidate.zipper.old_width,
+            new_width,
+        );
+        let newly_computed_nodes = Self::filter_spans_by_window(candidate.newly_computed_nodes, changed);
+        let newly_computed_tokens =
+            Self::filter_spans_by_window(candidate.newly_computed_tokens, changed);
 
         ReparseResult {
             messages: parser.messages.clone(),
-            reparsed_tree: updated_node,
-            newly_computed_nodes: candidate.newly_computed_nodes,
-            newly_computed_tokens: candidate.newly_computed_tokens,
+            reparsed_tree,
+            newly_computed_nodes,
+            newly_computed_tokens,
         }
     }
 
-    fn full_reparse(&mut self, parser: &mut Parser) -> ReparseResult {
-        let text = parser.text.clone();
-        let result = parser.parse_text(&text);
-        let reparsed_tree = Rc::new(result.root);
-        self.current = reparsed_tree.clone();
+    fn full_reparse(&mut self, parser: &mut Parser, source_text: &str, focus_span: Span) -> ReparseResult {
+        let result = parser.parse_text(source_text);
+        self.current = Rc::new(result.root);
+        let reparsed_tree = self.focus_reparsed_tree(parser, focus_span);
 
         ReparseResult {
             messages: result.messages,
@@ -242,6 +272,125 @@ impl Reparser {
             self.current = Rc::clone(parent);
         }
     }
+
+    fn focus_reparsed_tree(&self, parser: &Parser, focus_span: Span) -> Rc<RedNode> {
+        let zippers = collect_affected_zippers(self.current.clone(), focus_span, &self.alloc, parser);
+        if zippers.is_empty() {
+            return self.current.clone();
+        }
+
+        let containing = zippers
+            .iter()
+            .filter(|z| {
+                let end = z.offset + z.old_width;
+                z.offset <= focus_span.start && end >= focus_span.end
+            })
+            .min_by_key(|z| (z.old_width, std::cmp::Reverse(z.level)))
+            .map(|z| z.node.clone());
+
+        if let Some(node) = containing {
+            return node;
+        }
+
+        zippers
+            .iter()
+            .min_by_key(|z| (z.old_width, std::cmp::Reverse(z.level)))
+            .map(|z| z.node.clone())
+            .unwrap_or_else(|| self.current.clone())
+    }
+
+    fn focus_span_for_edit(source_text: &str, span: Span, new_len: usize) -> Span {
+        if span.len() > 0 {
+            return span;
+        }
+        if new_len == 0 {
+            return span;
+        }
+
+        let original_start = span.start.min(source_text.len());
+        let original_end = (span.start + new_len).min(source_text.len());
+        let mut start = original_start;
+        let mut end = original_end;
+        if start >= end {
+            return Span::new(start, end);
+        }
+
+        // Phase 1: trim insertion boundary trivia and list separators.
+        start = Self::trim_leading_boundary(source_text, start, end);
+        end = Self::trim_trailing_boundary(source_text, start, end);
+
+        if start >= end {
+            return Span::new(original_start, original_end);
+        }
+
+        // Keep inner text untouched; only trim outside boundary trivia.
+        let trimmed = &source_text[start..end];
+        let trailing_ws = trimmed
+            .char_indices()
+            .rev()
+            .find(|(_, c)| !c.is_whitespace())
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0);
+        end = start + trailing_ws;
+
+        if start >= end {
+            Span::new(original_start, original_end)
+        } else {
+            Span::new(start, end)
+        }
+    }
+
+    fn trim_leading_boundary(source_text: &str, mut start: usize, end: usize) -> usize {
+        loop {
+            let slice = &source_text[start..end];
+            let ws = slice
+                .char_indices()
+                .find(|(_, c)| !c.is_whitespace())
+                .map(|(i, _)| i)
+                .unwrap_or(slice.len());
+            start += ws;
+
+            if start >= end {
+                return start;
+            }
+
+            let first = source_text[start..end].chars().next();
+            if first.is_some_and(Self::is_list_separator) {
+                start += first.unwrap().len_utf8();
+                continue;
+            }
+            return start;
+        }
+    }
+
+    fn trim_trailing_boundary(source_text: &str, start: usize, mut end: usize) -> usize {
+        loop {
+            let slice = &source_text[start..end];
+            let trailing_ws = slice
+                .char_indices()
+                .rev()
+                .find(|(_, c)| !c.is_whitespace())
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0);
+            end = start + trailing_ws;
+
+            if end <= start {
+                return end;
+            }
+
+            let last = source_text[start..end].char_indices().last().map(|(_, c)| c);
+            if last.is_some_and(Self::is_list_separator) {
+                end -= last.unwrap().len_utf8();
+                continue;
+            }
+            return end;
+        }
+    }
+
+    fn is_list_separator(c: char) -> bool {
+        matches!(c, ',' | ';')
+    }
+
     fn normalize_root(&mut self, parser: &Parser) {
         if self.current.parent.is_some() {
             return;
@@ -259,8 +408,7 @@ impl Reparser {
 
         let children = root.children.clone();
 
-        let start_state = parser.grammar.analysis.start_state;
-        let start_rule_ix = parser.grammar.analysis.states[start_state].ref_ix();
+        let start_rule_ix = parser.grammar.table.start_rule;
 
         if let Tag::Rule { rule_ix } = &root.tag {
             if *rule_ix != start_rule_ix {
@@ -312,6 +460,55 @@ impl Reparser {
             }
         }
     }
+
+    fn changed_window(
+        old_text: &str,
+        new_text: &str,
+        start: usize,
+        old_width: usize,
+        new_width: usize,
+    ) -> Span {
+        let old_end = (start + old_width).min(old_text.len());
+        let new_end = (start + new_width).min(new_text.len());
+        if start > old_end || start > new_end {
+            return Span::new(start, new_end);
+        }
+
+        let old_slice = &old_text[start..old_end];
+        let new_slice = &new_text[start..new_end];
+        let old_bytes = old_slice.as_bytes();
+        let new_bytes = new_slice.as_bytes();
+
+        let mut prefix = 0usize;
+        while prefix < old_bytes.len()
+            && prefix < new_bytes.len()
+            && old_bytes[prefix] == new_bytes[prefix]
+        {
+            prefix += 1;
+        }
+
+        let mut suffix = 0usize;
+        while suffix < old_bytes.len().saturating_sub(prefix)
+            && suffix < new_bytes.len().saturating_sub(prefix)
+            && old_bytes[old_bytes.len() - 1 - suffix] == new_bytes[new_bytes.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+
+        let changed_start = start + prefix;
+        let changed_end = start + new_bytes.len().saturating_sub(suffix);
+        Span::new(changed_start.min(new_end), changed_end.min(new_end))
+    }
+
+    fn filter_spans_by_window(spans: Vec<Span>, changed: Span) -> Vec<Span> {
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        spans
+            .into_iter()
+            .filter(|span| span.start < changed.end && span.end > changed.start)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -342,12 +539,14 @@ impl Zipper {
         let mut current = updated_node.clone();
         for step in self.steps.iter().rev() {
             let mut parent = step.parent.clone();
-            let parent_green = alloc.get_node(parent.green);
-            let mut children = parent_green.children.clone();
+            let (parent_tag, mut children) = {
+                let parent_green = alloc.get_node(parent.green);
+                (parent_green.tag.clone(), parent_green.children.clone())
+            };
             children[step.child_idx] = current.green;
 
             let new_width: usize = children.iter().map(|&c| alloc.get_node(c).width).sum();
-            let new_parent_green = alloc.alloc(parent_green.tag.clone(), children, new_width);
+            let new_parent_green = alloc.alloc(parent_tag, children, new_width);
 
             Rc::make_mut(&mut parent).green = new_parent_green;
             current = parent;
@@ -364,16 +563,7 @@ pub fn collect_affected_zippers(
     parser: &Parser,
 ) -> Vec<Zipper> {
     let mut results = Vec::new();
-    collect_from(
-        root,
-        span,
-        alloc,
-        &mut Vec::new(),
-        0,
-        &mut results,
-        &parser.grammar.analysis.rule_terminators,
-        parser,
-    );
+    collect_from(root, span, alloc, &mut Vec::new(), 0, &mut results, parser);
 
     // Special handling for insertions in sep-based lists:
     // For insertions, prefer @sep_tail over @sep when available
@@ -436,7 +626,6 @@ fn collect_from(
     steps: &mut Vec<ZipperStep>,
     level: usize,
     out: &mut Vec<Zipper>,
-    terminators: &[Vec<String>],
     parser: &Parser,
 ) {
     let green = alloc.get_node(node.green);
@@ -645,27 +834,9 @@ fn collect_from(
                     });
                 }
                 // Continue recursing even after stopping at separator to find deeper tails
-                collect_from(
-                    child_node,
-                    span,
-                    alloc,
-                    steps,
-                    level + 1,
-                    out,
-                    terminators,
-                    parser,
-                );
+                collect_from(child_node, span, alloc, steps, level + 1, out, parser);
             } else {
-                collect_from(
-                    child_node,
-                    span,
-                    alloc,
-                    steps,
-                    level + 1,
-                    out,
-                    terminators,
-                    parser,
-                );
+                collect_from(child_node, span, alloc, steps, level + 1, out, parser);
             }
             steps.pop();
 
@@ -687,7 +858,10 @@ fn collect_from(
                             let remaining_name = parser.grammar.name(*remaining_rule);
                             if remaining_name == "@sep_tail" || remaining_name.ends_with("_tail") {
                                 // Found a tail rule, recurse into it
-                                let remaining_start = offset;
+                                let mut remaining_start = node.offset;
+                                for &prior_id in green.children.iter().take(remaining_idx) {
+                                    remaining_start += alloc.get_node(prior_id).width;
+                                }
                                 steps.push(ZipperStep {
                                     parent: node.clone(),
                                     child_idx: remaining_idx,
@@ -699,16 +873,7 @@ fn collect_from(
                                     green: remaining_id,
                                 });
 
-                                collect_from(
-                                    tail_node,
-                                    span,
-                                    alloc,
-                                    steps,
-                                    level + 1,
-                                    out,
-                                    terminators,
-                                    parser,
-                                );
+                                collect_from(tail_node, span, alloc, steps, level + 1, out, parser);
                                 steps.pop();
                             }
                         }
@@ -718,5 +883,41 @@ fn collect_from(
 
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Reparser;
+    use crate::utils::Span;
+
+    #[test]
+    fn insertion_focus_trims_leading_separator() {
+        let source = r#"{"name": "Dexer", "age": 30}"#;
+        let inserted = r#", "age": 30"#;
+        let start = source.find(inserted).expect("inserted text must exist");
+
+        let span = Reparser::focus_span_for_edit(source, Span::new(start, start), inserted.len());
+        assert_eq!(&source[span.start..span.end], r#""age": 30"#);
+    }
+
+    #[test]
+    fn insertion_focus_trims_trailing_separator() {
+        let source = r#"{"name": "Dexer", "age": 30, "city": "LA"}"#;
+        let inserted = r#""age": 30, "#;
+        let start = source.find(inserted).expect("inserted text must exist");
+
+        let span = Reparser::focus_span_for_edit(source, Span::new(start, start), inserted.len());
+        assert_eq!(&source[span.start..span.end], r#""age": 30"#);
+    }
+
+    #[test]
+    fn insertion_focus_falls_back_when_only_separator_inserted() {
+        let source = "{, }";
+        let inserted = ", ";
+        let start = source.find(inserted).expect("inserted text must exist");
+
+        let span = Reparser::focus_span_for_edit(source, Span::new(start, start), inserted.len());
+        assert_eq!(&source[span.start..span.end], inserted);
     }
 }

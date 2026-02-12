@@ -50,7 +50,7 @@ fn test_json() {
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
+        string  -> tt("\"") + t(STRING) + t("\"")
         number  -> tt(NUMS)
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
@@ -63,7 +63,7 @@ fn test_json() {
     let text = r#"{
         "name": "John",
         "age": 30,
-        "isStudent": true,
+        "isStudent": 333,
         "scores": [85, 90, 92],
         "address": {
             "street": "123 Main St",

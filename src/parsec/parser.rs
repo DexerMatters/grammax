@@ -206,6 +206,7 @@ impl Parser {
         let start_state = self.grammar.analysis.start_state;
         let mut state_stack = vec![start_state];
         let mut node_stack: Vec<StackEntry> = vec![];
+        let mut recovery_active = false;
 
         loop {
             let current_state_idx = *state_stack.last().unwrap();
@@ -221,6 +222,43 @@ impl Parser {
             if let Some(action) = action {
                 match action {
                     Action::Shift(next_state) => {
+                        if recovery_active && self.recovery_profile.sync_tokens.contains(&term_idx)
+                        {
+                            let old_pos = self.pos;
+                            let old_string_opened = self.string_opened;
+                            self.pos = old_pos + token_len;
+                            let (next_raw_term, _next_len, _next_node) = self.lex(None);
+                            self.pos = old_pos;
+                            self.string_opened = old_string_opened;
+
+                            if self
+                                .recovery_profile
+                                .closing_tokens
+                                .contains(&next_raw_term)
+                            {
+                                self.push_unexpected_trimmed(
+                                    self.pos,
+                                    self.pos + token_len,
+                                    self.expected_ids_for_analysis(
+                                        &self.grammar.analysis,
+                                        current_state_idx,
+                                        true,
+                                    ),
+                                );
+                                let deleted_node = self.alloc.alloc(
+                                    Tag::new_error(ParsecError::UnexpectedToken),
+                                    vec![],
+                                    token_len,
+                                );
+                                node_stack.push(StackEntry {
+                                    node: deleted_node,
+                                    binds_state: false,
+                                });
+                                self.consume(token_len);
+                                continue;
+                            }
+                        }
+
                         if self.is_quote_terminal(term_idx) {
                             self.string_opened = !self.string_opened;
                         }
@@ -271,6 +309,7 @@ impl Parser {
                     }
                 }
             } else {
+                recovery_active = true;
                 // Fast-path for unknown tokens: delete and resync locally instead of running CPCT+.
                 // This keeps errors localized and avoids costly repair search on junk input.
                 let (raw_term, raw_len, _raw_node) = self.lex(None);
@@ -777,7 +816,8 @@ impl Parser {
                     continue;
                 }
                 let len = probe - pos;
-                if len == 0 && !(pos >= bounded_end || self.text[pos..bounded_end].starts_with('"')) {
+                if len == 0 && !(pos >= bounded_end || self.text[pos..bounded_end].starts_with('"'))
+                {
                     continue;
                 }
                 return true;
@@ -894,6 +934,36 @@ impl Parser {
                 break;
             }
 
+            // If we have a non-structural expected token, consume the unexpected
+            // input as that token to avoid inserting a MissingToken afterwards.
+            if let Some(term_ix) = expected_ids
+                .iter()
+                .copied()
+                .filter(|term_ix| {
+                    !self.recovery_profile.opening_tokens.contains(term_ix)
+                        && !self.recovery_profile.closing_tokens.contains(term_ix)
+                        && !self.recovery_profile.sync_tokens.contains(term_ix)
+                        && !self.is_quote_terminal(*term_ix)
+                        && !self.is_json_string_terminal(*term_ix)
+                        && *term_ix != EOF_TOKEN
+                })
+                .min()
+            {
+                let start_pos = self.pos;
+                let err_node = self.alloc.alloc(
+                    Tag::new_error(ParsecError::UnexpectedToken),
+                    vec![],
+                    raw_len,
+                );
+                if self.apply_terminal(term_ix, raw_len, err_node, true, state_stack, node_stack) {
+                    self.messages.push(ParserMessage::new_unexpected(
+                        Span::new(start_pos, start_pos + raw_len),
+                        last_expected.clone(),
+                    ));
+                    return true;
+                }
+            }
+
             // If we can legally shift a sync/closing token by reducing, prefer that
             // over inserting synthetic openers that can swallow surrounding structure.
             if self.recovery_profile.sync_tokens.contains(&raw_term)
@@ -927,17 +997,22 @@ impl Parser {
                 self.string_opened = old_string_opened;
             }
 
-            // When we see a closing token while expecting a value, prefer inserting a
-            // non-structural expected token (e.g., null/number/boolean) instead of
-            // fabricating an opener that would swallow the closing token.
-            if self.recovery_profile.closing_tokens.contains(&raw_term) {
-                if let Some(term_ix) = expected_ids.iter().copied().find(|term_ix| {
-                    !self.recovery_profile.opening_tokens.contains(term_ix)
-                        && !self.recovery_profile.closing_tokens.contains(term_ix)
-                        && !self.is_quote_terminal(*term_ix)
-                        && !self.is_json_string_terminal(*term_ix)
-                        && *term_ix != EOF_TOKEN
-                }) {
+            // When we see a sync token while expecting a value, prefer inserting a
+            // non-structural expected token (e.g., null/number/boolean) so the
+            // sync token can be consumed by the enclosing construct.
+            if self.recovery_profile.sync_tokens.contains(&raw_term) {
+                if let Some(term_ix) = expected_ids
+                    .iter()
+                    .copied()
+                    .filter(|term_ix| {
+                        !self.recovery_profile.opening_tokens.contains(term_ix)
+                            && !self.recovery_profile.closing_tokens.contains(term_ix)
+                            && !self.is_quote_terminal(*term_ix)
+                            && !self.is_json_string_terminal(*term_ix)
+                            && *term_ix != EOF_TOKEN
+                    })
+                    .min()
+                {
                     let token_node =
                         self.alloc
                             .alloc(Tag::new_error(ParsecError::MissingToken), vec![], 0);
@@ -960,6 +1035,35 @@ impl Parser {
                         steps += 1;
                         continue;
                     }
+                }
+            }
+
+            // Trailing separator recovery: if we see a closing token while the last
+            // shifted terminal was a separator, drop the separator and retry.
+            if self.recovery_profile.closing_tokens.contains(&raw_term) {
+                if let Some((idx, term_ix)) =
+                    node_stack
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find_map(|(idx, entry)| {
+                            if !entry.binds_state {
+                                return None;
+                            }
+                            let node = self.alloc.get_node(entry.node);
+                            if let Tag::Token { rule_ix } = node.tag {
+                                if self.recovery_profile.sync_tokens.contains(&rule_ix) {
+                                    return Some((idx, rule_ix));
+                                }
+                            }
+                            None
+                        })
+                {
+                    let _ = term_ix; // used for clarity
+                    node_stack.truncate(idx);
+                    state_stack.pop();
+                    steps += 1;
+                    continue;
                 }
             }
 
@@ -1272,6 +1376,14 @@ impl Parser {
                     Symbol::NonTerminal(_),
                 ] = win
                 {
+                    profile.sync_tokens.insert(*t);
+                }
+            }
+
+            // Prefix separator/sync extraction: terminal followed by a nonterminal.
+            // This captures list separators like "," in sep-tail productions.
+            for win in prod.rhs.windows(2) {
+                if let [Symbol::Terminal(t), Symbol::NonTerminal(_)] = win {
                     profile.sync_tokens.insert(*t);
                 }
             }

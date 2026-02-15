@@ -50,6 +50,7 @@ pub struct UpdateResult<'a> {
     pub source_text: &'a str,
     pub newly_computed_nodes: Vec<Span>,
     pub newly_computed_tokens: Vec<Span>,
+    pub semantic_commands: Vec<crate::semantic::Command>,
 }
 
 impl<'a> UpdateResult<'a> {
@@ -61,6 +62,7 @@ impl<'a> UpdateResult<'a> {
         source_text: &'a str,
         newly_computed_nodes: Vec<Span>,
         newly_computed_tokens: Vec<Span>,
+        semantic_commands: Vec<crate::semantic::Command>,
     ) -> Self {
         Self {
             messages,
@@ -70,6 +72,7 @@ impl<'a> UpdateResult<'a> {
             source_text,
             newly_computed_nodes,
             newly_computed_tokens,
+            semantic_commands,
         }
     }
 }
@@ -329,6 +332,7 @@ impl Runtime {
                                 &self.text,
                                 result.newly_computed_nodes,
                                 result.newly_computed_tokens,
+                                result.semantic_commands,
                             ),
                             duration,
                         );
@@ -357,6 +361,7 @@ impl Runtime {
                                 &self.text,
                                 result.newly_computed_nodes,
                                 result.newly_computed_tokens,
+                                result.semantic_commands,
                             ),
                             duration,
                         );
@@ -386,6 +391,7 @@ impl Runtime {
                                 &self.text,
                                 result.newly_computed_nodes,
                                 result.newly_computed_tokens,
+                                result.semantic_commands,
                             ),
                             duration,
                         );

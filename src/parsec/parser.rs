@@ -45,6 +45,7 @@ pub struct ParserListener {
 pub struct Result {
     pub root: RedNode,
     pub messages: ParserMessages,
+    pub semantic_commands: Vec<crate::semantic::Command>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -381,8 +382,9 @@ impl Parser {
         self.prime_reuse_from_tree(root_green, 0);
 
         Result {
-            root: RedNode::root(&self.alloc, root_green),
+            root: RedNode::root(root_green),
             messages: self.messages.clone(),
+            semantic_commands: Vec::new(),
         }
     }
 
@@ -1303,6 +1305,10 @@ impl Parser {
         let builder =
             crate::parsec::builder::TreeBuilder::new(&self.grammar, &self.alloc, &self.config);
         let new_node = builder.build_node(lhs, children);
+
+        let node_width = self.alloc.get_node(new_node).width;
+        let node_start = self.pos - node_width;
+        self.newly_computed_nodes.push(Span::new(node_start, self.pos));
 
         node_stack.push(StackEntry {
             node: new_node,

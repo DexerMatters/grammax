@@ -4,6 +4,8 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use crate::utils::Span;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParsecError {
     Incomplete,
@@ -58,10 +60,18 @@ impl RedNode {
         }
     }
 
-    pub fn root(_alloc: &TreeAllocRef, green: GreenId) -> Self {
+    pub fn root(green: GreenId) -> Self {
         Self {
             parent: None,
             offset: 0,
+            green,
+        }
+    }
+
+    pub fn root_with_span(green: GreenId, span: Span) -> Self {
+        Self {
+            parent: None,
+            offset: span.start,
             green,
         }
     }

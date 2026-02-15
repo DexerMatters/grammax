@@ -63,7 +63,7 @@ fn test_json() {
     let text = r#"{
         "name": "John",
         "age": 30,
-        "isStudent": 333,
+        "isStudent": 33,
         "scores": [85, 90, 92],
         "address": {
             "street": "123 Main St",

@@ -12,3 +12,4 @@ internment = { version = "0.8.6", features = ["arena"] }
 parking_lot = "0.12.5"
 ndarray = "0.17.1"
 rustc-hash = "2.1.0"
+agility = "0.1.1"

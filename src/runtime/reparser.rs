@@ -7,15 +7,17 @@ use crate::{
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
     runtime::strategy::{EditKind, StrategyCandidate, StrategyContext, pick_candidate},
+    semantic::Command,
     utils::Span,
 };
 
 #[derive(Debug, Clone)]
-pub struct ReparseResult {
+pub(crate) struct EditResult {
     pub messages: ParserMessages,
     pub reparsed_tree: Rc<RedNode>,
     pub newly_computed_nodes: Vec<Span>,
     pub newly_computed_tokens: Vec<Span>,
+    pub semantic_commands: Vec<Command>,
 }
 
 pub struct Reparser {
@@ -104,13 +106,14 @@ impl Reparser {
         span: Span,
         new_len: usize,
         source_text: &str,
-    ) -> ReparseResult {
+    ) -> EditResult {
         if span.len() == 0 && new_len == 0 {
-            return ReparseResult {
+            return EditResult {
                 messages: parser.messages.clone(),
                 reparsed_tree: self.current.clone(),
                 newly_computed_nodes: Vec::new(),
                 newly_computed_tokens: Vec::new(),
+                semantic_commands: Vec::new(),
             };
         }
 
@@ -206,7 +209,7 @@ impl Reparser {
         focus_span: Span,
         old_source_text: &str,
         new_source_text: &str,
-    ) -> ReparseResult {
+    ) -> EditResult {
         let (_updated_node, root) = candidate.zipper.replace_green(&self.alloc, candidate.green);
         self.current = root;
 
@@ -242,28 +245,43 @@ impl Reparser {
             candidate.zipper.old_width,
             new_width,
         );
-        let newly_computed_nodes = Self::filter_spans_by_window(candidate.newly_computed_nodes, changed);
+        let newly_computed_nodes =
+            Self::filter_spans_by_window(candidate.newly_computed_nodes, changed);
         let newly_computed_tokens =
             Self::filter_spans_by_window(candidate.newly_computed_tokens, changed);
 
-        ReparseResult {
+        let semantic_commands = self.generate_commands(&self.current, &newly_computed_nodes);
+
+        EditResult {
             messages: parser.messages.clone(),
             reparsed_tree,
             newly_computed_nodes,
             newly_computed_tokens,
+            semantic_commands,
         }
     }
 
-    fn full_reparse(&mut self, parser: &mut Parser, source_text: &str, focus_span: Span) -> ReparseResult {
+    fn full_reparse(
+        &mut self,
+        parser: &mut Parser,
+        source_text: &str,
+        focus_span: Span,
+    ) -> EditResult {
         let result = parser.parse_text(source_text);
         self.current = Rc::new(result.root);
         let reparsed_tree = self.focus_reparsed_tree(parser, focus_span);
 
-        ReparseResult {
+        let newly_computed_nodes = parser.newly_computed_nodes();
+        let newly_computed_tokens = parser.newly_computed_tokens();
+
+        let semantic_commands = self.generate_commands(&self.current, &newly_computed_nodes);
+
+        EditResult {
             messages: result.messages,
             reparsed_tree,
-            newly_computed_nodes: parser.newly_computed_nodes(),
-            newly_computed_tokens: parser.newly_computed_tokens(),
+            newly_computed_nodes,
+            newly_computed_tokens,
+            semantic_commands,
         }
     }
 
@@ -274,7 +292,8 @@ impl Reparser {
     }
 
     fn focus_reparsed_tree(&self, parser: &Parser, focus_span: Span) -> Rc<RedNode> {
-        let zippers = collect_affected_zippers(self.current.clone(), focus_span, &self.alloc, parser);
+        let zippers =
+            collect_affected_zippers(self.current.clone(), focus_span, &self.alloc, parser);
         if zippers.is_empty() {
             return self.current.clone();
         }
@@ -378,7 +397,10 @@ impl Reparser {
                 return end;
             }
 
-            let last = source_text[start..end].char_indices().last().map(|(_, c)| c);
+            let last = source_text[start..end]
+                .char_indices()
+                .last()
+                .map(|(_, c)| c);
             if last.is_some_and(Self::is_list_separator) {
                 end -= last.unwrap().len_utf8();
                 continue;
@@ -508,6 +530,95 @@ impl Reparser {
             .into_iter()
             .filter(|span| span.start < changed.end && span.end > changed.start)
             .collect()
+    }
+
+    fn generate_commands(
+        &self,
+        reparsed_tree: &RedNode,
+        newly_computed_nodes: &[Span],
+    ) -> Vec<Command> {
+        if newly_computed_nodes.is_empty() {
+            return Vec::new();
+        }
+
+        let mut commands = Vec::new();
+
+        self.walk_tree_for_commands(
+            reparsed_tree,
+            newly_computed_nodes,
+            &mut commands,
+        );
+
+        commands
+    }
+
+    fn walk_tree_for_commands(
+        &self,
+        node: &RedNode,
+        newly_computed_spans: &[Span],
+        commands: &mut Vec<Command>,
+    ) {
+        let green = self.alloc.get_node(node.green);
+        let node_span = Span::new(node.offset, node.offset + green.width);
+
+        // Check if this span exactly matches a newly computed span
+        let is_exactly_newly_computed = newly_computed_spans
+            .iter()
+            .any(|span| *span == node_span);
+
+        // Check if this span contains newly computed content
+        let contains_newly_computed = newly_computed_spans
+            .iter()
+            .any(|span| node_span.start <= span.start && node_span.end >= span.end);
+
+        // Recurse into children first (bottom-up order)
+        let mut offset = node.offset;
+        let mut has_rule_child = false;
+        for &child_id in &green.children {
+            let child_node = RedNode {
+                parent: Some(Rc::new(node.clone())),
+                offset,
+                green: child_id,
+            };
+
+            self.walk_tree_for_commands(&child_node, newly_computed_spans, commands);
+
+            let child = self.alloc.get_node(child_id);
+            if matches!(&child.tag, Tag::Rule { .. }) {
+                has_rule_child = true;
+            }
+            offset += child.width;
+        }
+
+        // Then emit command for this node (after children)
+        if let Tag::Rule { .. } = &green.tag {
+            // Skip wrapper nodes that just delegate to a single rule child
+            // EXCEPT for the root node which should always be included
+            let is_root = node.parent.is_none();
+            let rule_children: Vec<_> = green.children.iter()
+                .filter(|&&child_id| {
+                    matches!(self.alloc.get_node(child_id).tag, Tag::Rule { .. })
+                })
+                .collect();
+
+            let is_simple_wrapper = !is_root && rule_children.len() == 1 && has_rule_child;
+
+            if !is_simple_wrapper {
+                if is_exactly_newly_computed {
+                    // Actually reparsed - fresh content
+                    commands.push(Command::Insert {
+                        green_id: node.green,
+                        span: node_span,
+                    });
+                } else if contains_newly_computed {
+                    // Ancestor rebuilt by replace_green - same content, new green_id
+                    commands.push(Command::Update {
+                        green_id: node.green,
+                        span: node_span,
+                    });
+                }
+            }
+        }
     }
 }
 

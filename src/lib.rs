@@ -4,6 +4,8 @@ pub mod parsec;
 pub mod runtime;
 pub mod utils;
 
+pub mod semantic;
+
 pub mod ui;
 
 #[cfg(test)]

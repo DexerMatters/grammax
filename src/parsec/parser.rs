@@ -14,7 +14,7 @@ use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, Tree
 use crate::utils::{LruCache, Span};
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
-const DEFAULT_REUSE_CAPACITY: usize = 512;
+const DEFAULT_REUSE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
@@ -1308,7 +1308,8 @@ impl Parser {
 
         let node_width = self.alloc.get_node(new_node).width;
         let node_start = self.pos - node_width;
-        self.newly_computed_nodes.push(Span::new(node_start, self.pos));
+        self.newly_computed_nodes
+            .push(Span::new(node_start, self.pos));
 
         node_stack.push(StackEntry {
             node: new_node,

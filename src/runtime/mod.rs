@@ -12,9 +12,11 @@ use crate::{
     utils::Span,
 };
 
+mod metrics;
 mod reparser;
 mod strategy;
 
+pub use metrics::EditMetrics;
 pub use reparser::ReparserConfig;
 
 #[cfg(test)]
@@ -51,6 +53,7 @@ pub struct UpdateResult<'a> {
     pub newly_computed_nodes: Vec<Span>,
     pub newly_computed_tokens: Vec<Span>,
     pub semantic_commands: Vec<crate::semantic::Command>,
+    pub metrics: EditMetrics,
 }
 
 impl<'a> UpdateResult<'a> {
@@ -63,6 +66,7 @@ impl<'a> UpdateResult<'a> {
         newly_computed_nodes: Vec<Span>,
         newly_computed_tokens: Vec<Span>,
         semantic_commands: Vec<crate::semantic::Command>,
+        metrics: EditMetrics,
     ) -> Self {
         Self {
             messages,
@@ -73,6 +77,7 @@ impl<'a> UpdateResult<'a> {
             newly_computed_nodes,
             newly_computed_tokens,
             semantic_commands,
+            metrics,
         }
     }
 }
@@ -98,7 +103,7 @@ impl Default for RuntimeConfig {
             parser: ParserConfig::default(),
             reparser: ReparserConfig::default(),
             incremental_reuse_enabled: true,
-            incremental_reuse_cache_capacity: 512,
+            incremental_reuse_cache_capacity: 4096,
             incremental_reuse_cache_failures: true,
         }
     }
@@ -214,16 +219,19 @@ impl InteractiveInstance {
         &self,
         start: usize,
         end: usize,
-        text: String,
+        text: &str,
     ) -> Result<(), mpsc::SendError<Action>> {
         self.sender.send(Action::Update {
             span: Span::new(start, end),
-            text,
+            text: text.to_string(),
         })
     }
 
-    pub fn insert(&self, offset: usize, text: String) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Insert { offset, text })
+    pub fn insert(&self, offset: usize, text: &str) -> Result<(), mpsc::SendError<Action>> {
+        self.sender.send(Action::Insert {
+            offset,
+            text: text.to_string(),
+        })
     }
 
     pub fn delete(&self, start: usize, end: usize) -> Result<(), mpsc::SendError<Action>> {
@@ -318,9 +326,14 @@ impl Runtime {
                     let start = std::time::Instant::now();
                     self.text.insert_str(offset, &text);
                     let span = Span::new(offset, offset);
-                    let result =
-                        self.cursor
-                            .handle_edit(&mut self.parser, span, text.len(), &self.text);
+                    let mut metrics = EditMetrics::new();
+                    let result = self.cursor.handle_edit(
+                        &mut self.parser,
+                        span,
+                        text.len(),
+                        &self.text,
+                        Some(&mut metrics),
+                    );
                     let duration = start.elapsed();
                     self.runtime_listener.after_update.as_ref().map(|listener| {
                         (listener)(
@@ -333,6 +346,7 @@ impl Runtime {
                                 result.newly_computed_nodes,
                                 result.newly_computed_tokens,
                                 result.semantic_commands,
+                                metrics,
                             ),
                             duration,
                         );
@@ -347,9 +361,14 @@ impl Runtime {
                         });
                     let start = std::time::Instant::now();
                     self.text.replace_range(ops::Range::from(span), "");
-                    let result = self
-                        .cursor
-                        .handle_edit(&mut self.parser, span, 0, &self.text);
+                    let mut metrics = EditMetrics::new();
+                    let result = self.cursor.handle_edit(
+                        &mut self.parser,
+                        span,
+                        0,
+                        &self.text,
+                        Some(&mut metrics),
+                    );
                     let duration = start.elapsed();
                     self.runtime_listener.after_update.as_ref().map(|listener| {
                         (listener)(
@@ -362,6 +381,7 @@ impl Runtime {
                                 result.newly_computed_nodes,
                                 result.newly_computed_tokens,
                                 result.semantic_commands,
+                                metrics,
                             ),
                             duration,
                         );
@@ -377,9 +397,14 @@ impl Runtime {
                     let start = std::time::Instant::now();
                     let new_len = text.len();
                     self.text.replace_range(ops::Range::from(span), &text);
-                    let result =
-                        self.cursor
-                            .handle_edit(&mut self.parser, span, new_len, &self.text);
+                    let mut metrics = EditMetrics::new();
+                    let result = self.cursor.handle_edit(
+                        &mut self.parser,
+                        span,
+                        new_len,
+                        &self.text,
+                        Some(&mut metrics),
+                    );
                     let duration = start.elapsed();
                     self.runtime_listener.after_update.as_ref().map(|listener| {
                         (listener)(
@@ -392,6 +417,7 @@ impl Runtime {
                                 result.newly_computed_nodes,
                                 result.newly_computed_tokens,
                                 result.semantic_commands,
+                                metrics,
                             ),
                             duration,
                         );

@@ -1,49 +1,22 @@
-use crate::parsec::tree::GreenId;
-use crate::utils::Span;
+/// Semantic ID uniquely identifies semantic nodes in the tree
+pub type SemanticId = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    Insert {
-        green_id: GreenId,
-        span: Span,
-    },
-    Delete {
-        green_id: GreenId,
-        span: Span,
-    },
-    Update {
-        green_id: GreenId,
-        span: Span,
-    },
+    /// Create a new semantic node with the given rule name
+    Create(SemanticId, String),
 
-    Invalidate {
-        green_id: GreenId,
-        reason: InvalidationReason,
-    },
-}
+    /// Create a new token node with the given token value
+    CreateToken(SemanticId, String),
 
-impl Command {
-    pub fn green_id(&self) -> GreenId {
-        match self {
-            Command::Insert { green_id, .. } => *green_id,
-            Command::Delete { green_id, .. } => *green_id,
-            Command::Update { green_id, .. } => *green_id,
-            Command::Invalidate { green_id, .. } => *green_id,
-        }
-    }
-    pub fn span(&self) -> Span {
-        match self {
-            Command::Insert { span, .. } => *span,
-            Command::Delete { span, .. } => *span,
-            Command::Update { span, .. } => *span,
-            Command::Invalidate { .. } => Span::empty(),
-        }
-    }
-}
+    /// Replace old semantic node with new semantic node (rebuild due to content change)
+    /// Replace(old_id, new_id)
+    Replace(SemanticId, SemanticId),
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InvalidationReason {
-    DependencyChanged(GreenId),
-    RawStructureChanged,
-    RawTokenValueChanged,
+    /// Delete a semantic node
+    Delete(SemanticId),
+
+    /// Insert a child node into a parent
+    /// Insert(parent_id, child_id)
+    Insert(SemanticId, SemanticId),
 }

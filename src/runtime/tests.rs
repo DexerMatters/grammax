@@ -13,7 +13,6 @@ use crate::{
         words::*,
     },
     runtime::{Interactive, RuntimeConfig, RuntimeListener},
-    semantic::{Lower, LowerContext, SemanticTree},
 };
 
 #[test]
@@ -67,7 +66,7 @@ fn test_expr_example() {
         })
         .finish();
     runtime.run().unwrap();
-    runtime.insert(0, "1 + 1".to_string()).unwrap();
+    runtime.insert(0, "1 + 1").unwrap();
     thread::sleep(std::time::Duration::from_millis(100));
 }
 
@@ -120,14 +119,12 @@ fn test_example() {
         })
         .finish();
     runtime.run().unwrap();
-    runtime
-        .insert(0, r#"{"name": dDexerd}"#.to_string())
-        .unwrap();
-    runtime.insert(16, r#", "age": 30"#.to_string()).unwrap();
+    runtime.insert(0, r#"{"name": dDexerd}"#).unwrap();
+    runtime.insert(16, r#", "age": 30"#).unwrap();
     runtime.delete(16, 27).unwrap();
-    runtime.insert(3, "x".to_string()).unwrap();
+    runtime.insert(3, "x").unwrap();
     println!("====Inserted 'x' at offset 3");
-    runtime.insert(3, "x".to_string()).unwrap();
+    runtime.insert(3, "x").unwrap();
 
     thread::sleep(std::time::Duration::from_millis(10000));
 }
@@ -138,26 +135,6 @@ enum Expr {
     Mul(Box<Expr>, Box<Expr>),
     Num(i64),
     Error,
-}
-
-impl Lower for Expr {
-    fn lower(ctx: &LowerContext) -> Self {
-        match ctx.rule_name() {
-            "add" => Expr::Add(Box::new(ctx.child(0)), Box::new(ctx.child(2))),
-            "mul" => Expr::Mul(Box::new(ctx.child(0)), Box::new(ctx.child(2))),
-            "primary" => {
-                println!("Lowering primary with text: '{}'", ctx.text());
-                let text = ctx.text().trim();
-                if text.starts_with('(') {
-                    ctx.child(1)
-                } else {
-                    text.parse().map(Expr::Num).unwrap_or(Expr::Error)
-                }
-            }
-            "expr" | "start" => ctx.child(0),
-            _ => Expr::Error,
-        }
-    }
 }
 
 fn eval(expr: &Expr) -> Expr {
@@ -197,22 +174,30 @@ fn test_semantic_commands() {
         primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
 
-    let semantic_tree = Arc::new(Mutex::<parking_lot::RawMutex, _>::new(
-        SemanticTree::<Expr>::new(),
-    ));
+    let listener = RuntimeListener::new().after_update(move |result, duration| {
+        println!("=== After Update ===");
+        println!("Duration (wall): {:?}", duration);
+        println!("{}", result.metrics.summary());
+        println!("Source Text:\n{}", result.source_text);
 
-    let listener = RuntimeListener::new().after_update(move |result, _duration| {
-        semantic_tree.lock().apply_commands(
-            &result.semantic_commands,
-            &result.current_parser.alloc,
-            result.source_text,
-            &result.current_parser.grammar,
-        );
-
-        if let Some(expr) = semantic_tree.lock().root(result.current_tree.green) {
-            let evaluated = eval(expr);
-            eprintln!("Semantic AST: {:?}", expr);
-            eprintln!("Evaluated: {}", evaluated);
+        for cmd in &result.semantic_commands {
+            match cmd {
+                crate::semantic::Command::Create(id, name) => {
+                    eprintln!("Applied command: Create({}, \"{}\")", id, name);
+                }
+                crate::semantic::Command::CreateToken(id, val) => {
+                    eprintln!("Applied command: CreateToken({}, \"{}\")", id, val);
+                }
+                crate::semantic::Command::Replace(old_id, new_id) => {
+                    eprintln!("Applied command: Replace({}, {})", old_id, new_id);
+                }
+                crate::semantic::Command::Delete(id) => {
+                    eprintln!("Applied command: Delete({})", id);
+                }
+                crate::semantic::Command::Insert(parent_id, child_id) => {
+                    eprintln!("Applied command: Insert({}, {})", parent_id, child_id);
+                }
+            }
         }
     });
 
@@ -225,9 +210,9 @@ fn test_semantic_commands() {
         .finish();
 
     runtime.run().unwrap();
-    runtime
-        .insert(0, "1 + 4 * 4 + (5 + 5)".to_string())
-        .unwrap();
-    runtime.update(0, 1, "3".to_string()).unwrap();
+    runtime.insert(0, "1 + 4 * 4 + (5 + 5) * 2").unwrap();
+    runtime.update(0, 1, "3 * 5").unwrap();
+    runtime.insert(0, "2 + 2 + ").unwrap();
+    runtime.delete(0, 4).unwrap();
     thread::sleep(std::time::Duration::from_millis(100));
 }

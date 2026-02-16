@@ -1,9 +1,14 @@
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 use crate::{
     grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs},
     parsec::{Parser, msg::ParserMessages, tree::TreeAllocRefExt},
-    runtime::reparser::{ReparserConfig, Zipper},
+    runtime::{
+        metrics::EditMetrics,
+        reparser::{ReparserConfig, Zipper},
+    },
     utils::Span,
 };
 
@@ -35,6 +40,7 @@ pub(crate) struct StrategyContext<'a> {
     pub recovery_strategy: Option<&'a ErrorRecoveryStrategy>,
     pub zippers: &'a [Zipper],
     pub config: ReparserConfig,
+    pub metrics: Option<&'a mut EditMetrics>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,13 +50,32 @@ pub(crate) enum EditKind {
     Update,
 }
 
+#[derive(Clone)]
+struct MemoizedCandidate {
+    green: usize,
+    messages: Arc<ParserMessages>,
+    newly_computed_nodes: Vec<Span>,
+    newly_computed_tokens: Vec<Span>,
+    errors_inside: usize,
+    errors_outside: usize,
+}
+
 pub(crate) fn pick_candidate(
     ctx: &mut StrategyContext,
     edit_span: Span,
     kind: EditKind,
 ) -> Option<StrategyCandidate> {
+    let eval_start = if ctx.metrics.is_some() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let mut best: Option<StrategyCandidate> = None;
     let mut best_with_clean_surrounding: Option<StrategyCandidate> = None;
+    let mut candidates_evaluated = 0;
+    let mut candidate_memo: FxHashMap<(usize, usize, usize, bool), Option<MemoizedCandidate>> =
+        FxHashMap::default();
 
     for zipper in ctx.zippers.iter().rev() {
         if zipper.level < ctx.config.min_level {
@@ -58,22 +83,43 @@ pub(crate) fn pick_candidate(
         }
 
         let candidate = match kind {
-            EditKind::Insertion => evaluate_candidate(ctx, zipper, edit_span, true),
-            EditKind::Deletion => evaluate_candidate(ctx, zipper, edit_span, false),
-            EditKind::Update => evaluate_candidate(ctx, zipper, edit_span, true),
+            EditKind::Insertion => {
+                evaluate_candidate(ctx, zipper, edit_span, true, &mut candidate_memo)
+            }
+            EditKind::Deletion => {
+                evaluate_candidate(ctx, zipper, edit_span, false, &mut candidate_memo)
+            }
+            EditKind::Update => {
+                evaluate_candidate(ctx, zipper, edit_span, true, &mut candidate_memo)
+            }
         };
 
         let Some(candidate) = candidate else {
             continue;
         };
 
+        candidates_evaluated += 1;
+
         let is_clean = candidate.score.errors_outside == 0;
         if is_clean {
             if should_replace(&best_with_clean_surrounding, &candidate) {
                 best_with_clean_surrounding = Some(candidate);
+                if best_with_clean_surrounding
+                    .as_ref()
+                    .is_some_and(|c| c.score.errors_inside == 0)
+                {
+                    break;
+                }
             }
         } else if should_replace(&best, &candidate) {
             best = Some(candidate);
+        }
+    }
+
+    if let Some(m) = &mut ctx.metrics {
+        m.candidates_evaluated = candidates_evaluated;
+        if let Some(start) = eval_start {
+            m.candidate_evaluation_us = start.elapsed().as_micros();
         }
     }
 
@@ -92,22 +138,57 @@ fn evaluate_candidate(
     zipper: &Zipper,
     edit_span: Span,
     enforce_region_end: bool,
+    memo: &mut FxHashMap<(usize, usize, usize, bool), Option<MemoizedCandidate>>,
 ) -> Option<StrategyCandidate> {
-    ctx.parser.messages.clear();
-    ctx.parser.newly_computed_nodes.clear();
-    ctx.parser.newly_computed_tokens.clear();
-
-    ctx.parser.set_insert_pos(None);
-
     let expected_width_signed = zipper.old_width as isize + ctx.delta;
     if expected_width_signed < 0 {
         return None;
     }
     let expected_width = expected_width_signed as usize;
 
+    let memo_key = (
+        zipper.rule_ix,
+        zipper.offset,
+        expected_width,
+        enforce_region_end,
+    );
+    if let Some(cached) = memo.get(&memo_key) {
+        let cached = cached.as_ref()?;
+        return Some(StrategyCandidate {
+            score: CandidateScore {
+                errors_outside: cached.errors_outside,
+                errors_inside: cached.errors_inside,
+                level: std::cmp::Reverse(zipper.level),
+            },
+            green: cached.green,
+            messages: Arc::clone(&cached.messages),
+            newly_computed_nodes: cached.newly_computed_nodes.clone(),
+            newly_computed_tokens: cached.newly_computed_tokens.clone(),
+            zipper: zipper.clone(),
+        });
+    }
+
+    ctx.parser.messages.clear();
+    ctx.parser.newly_computed_nodes.clear();
+    ctx.parser.newly_computed_tokens.clear();
+
+    ctx.parser.set_insert_pos(None);
+
+    let parse_start = if ctx.metrics.is_some() {
+        Some(std::time::Instant::now())
+    } else {
+        None
+    };
+
     let new_green = ctx
         .parser
         .parse_rule(zipper.rule_ix, zipper.offset, expected_width)?;
+
+    if let Some(m) = &mut ctx.metrics {
+        if let Some(start) = parse_start {
+            m.parse_rule_total_us += start.elapsed().as_micros();
+        }
+    }
 
     let new_width = {
         let new_node = ctx.parser.alloc.get_node(new_green);
@@ -115,6 +196,7 @@ fn evaluate_candidate(
     };
 
     if new_width != expected_width {
+        memo.insert(memo_key, None);
         return None;
     }
 
@@ -135,6 +217,7 @@ fn evaluate_candidate(
                 && check_end > sync_point
                 && ctx.config.enforce_sync_bound
             {
+                memo.insert(memo_key, None);
                 return None;
             }
         }
@@ -155,12 +238,28 @@ fn evaluate_candidate(
         level,
     };
 
+    let messages = Arc::new(ctx.parser.messages.clone());
+    let newly_computed_nodes = ctx.parser.newly_computed_nodes();
+    let newly_computed_tokens = ctx.parser.newly_computed_tokens();
+
+    memo.insert(
+        memo_key,
+        Some(MemoizedCandidate {
+            green: new_green,
+            messages: Arc::clone(&messages),
+            newly_computed_nodes: newly_computed_nodes.clone(),
+            newly_computed_tokens: newly_computed_tokens.clone(),
+            errors_inside,
+            errors_outside,
+        }),
+    );
+
     Some(StrategyCandidate {
         score,
         green: new_green,
-        messages: Arc::new(ctx.parser.messages.clone()),
-        newly_computed_nodes: ctx.parser.newly_computed_nodes(),
-        newly_computed_tokens: ctx.parser.newly_computed_tokens(),
+        messages,
+        newly_computed_nodes,
+        newly_computed_tokens,
         zipper: zipper.clone(),
     })
 }

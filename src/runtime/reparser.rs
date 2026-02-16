@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use crate::{
@@ -6,8 +7,11 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
-    runtime::strategy::{EditKind, StrategyCandidate, StrategyContext, pick_candidate},
-    semantic::Command,
+    runtime::{
+        metrics::EditMetrics,
+        strategy::{EditKind, StrategyCandidate, StrategyContext, pick_candidate},
+    },
+    semantic::{Command, SemanticId},
     utils::Span,
 };
 
@@ -24,6 +28,12 @@ pub struct Reparser {
     pub current: Rc<RedNode>,
     alloc: TreeAllocRef,
     config: ReparserConfig,
+    next_semantic_id: SemanticId,
+    semantic_roots: Vec<SemanticId>,
+    semantic_nodes: HashMap<SemanticId, PersistSemanticNode>,
+    rule_green_to_semantic: HashMap<usize, SemanticId>,
+    token_label_to_id: HashMap<String, SemanticId>,
+    token_refcount: HashMap<SemanticId, usize>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +61,12 @@ impl Reparser {
             current: Rc::new(root),
             alloc,
             config: ReparserConfig::default(),
+            next_semantic_id: 0,
+            semantic_roots: Vec::new(),
+            semantic_nodes: HashMap::new(),
+            rule_green_to_semantic: HashMap::new(),
+            token_label_to_id: HashMap::new(),
+            token_refcount: HashMap::new(),
         }
     }
 
@@ -106,8 +122,21 @@ impl Reparser {
         span: Span,
         new_len: usize,
         source_text: &str,
+        mut metrics: Option<&mut EditMetrics>,
     ) -> EditResult {
+        let total_start = if metrics.is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         if span.len() == 0 && new_len == 0 {
+            if let Some(m) = &mut metrics {
+                if let Some(start) = total_start {
+                    m.total_duration_us = start.elapsed().as_micros();
+                }
+                m.used_incremental_path = false;
+            }
             return EditResult {
                 messages: parser.messages.clone(),
                 reparsed_tree: self.current.clone(),
@@ -126,7 +155,14 @@ impl Reparser {
         let focus_span = Self::focus_span_for_edit(source_text, span, new_len);
 
         if !old_messages.is_empty() {
-            return self.full_reparse(parser, source_text, focus_span);
+            let result = self.full_reparse(parser, source_text, focus_span);
+            if let Some(m) = &mut metrics {
+                if let Some(start) = total_start {
+                    m.total_duration_us = start.elapsed().as_micros();
+                }
+                m.used_incremental_path = false;
+            }
+            return result;
         }
 
         let (focus_node, mut steps, level) = self.get_context(span);
@@ -142,6 +178,12 @@ impl Reparser {
             span
         };
 
+        let zipper_start = if metrics.is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
         let mut zippers = Vec::new();
         collect_from(
             focus_node,
@@ -153,16 +195,36 @@ impl Reparser {
             parser,
         );
 
+        if let Some(m) = &mut metrics {
+            m.candidates_collected = zippers.len();
+            if let Some(start) = zipper_start {
+                m.zipper_collection_us = start.elapsed().as_micros();
+            }
+        }
+
         if zippers.is_empty() {
             // Fallback: If focus node based search failed (rare), try from root
             self.ascend_to_root();
             zippers =
                 collect_affected_zippers(self.current.clone(), search_span, &self.alloc, parser);
+
+            if let Some(m) = &mut metrics {
+                m.candidates_collected = zippers.len();
+            }
         }
 
         if zippers.is_empty() {
-            return self.full_reparse(parser, source_text, focus_span);
+            let result = self.full_reparse(parser, source_text, focus_span);
+            if let Some(m) = &mut metrics {
+                if let Some(start) = total_start {
+                    m.total_duration_us = start.elapsed().as_micros();
+                }
+                m.used_incremental_path = false;
+            }
+            return result;
         }
+
+        let reuse_before = parser.reuse_stats();
 
         let mut ctx = StrategyContext {
             parser,
@@ -172,6 +234,7 @@ impl Reparser {
             recovery_strategy: strategy.as_ref(),
             zippers: &zippers,
             config: self.config,
+            metrics: metrics.as_deref_mut(),
         };
 
         let kind = if delta > 0 {
@@ -184,8 +247,14 @@ impl Reparser {
 
         let best = pick_candidate(&mut ctx, edit_span, kind);
 
+        let reuse_after = parser.reuse_stats();
+        if let Some(m) = &mut metrics {
+            m.parse_rule_calls = reuse_after.lookups.saturating_sub(reuse_before.lookups);
+            m.parse_rule_cache_hits = reuse_after.hits.saturating_sub(reuse_before.hits);
+        }
+
         if let Some(candidate) = best {
-            return self.apply_candidate(
+            let result = self.apply_candidate(
                 parser,
                 candidate,
                 &old_messages,
@@ -193,11 +262,26 @@ impl Reparser {
                 focus_span,
                 &old_text,
                 source_text,
+                metrics.as_deref_mut(),
             );
+            if let Some(m) = &mut metrics {
+                if let Some(start) = total_start {
+                    m.total_duration_us = start.elapsed().as_micros();
+                }
+                m.used_incremental_path = true;
+            }
+            return result;
         }
 
         // If no candidate found among collected zippers, fall back to full reparse
-        self.full_reparse(parser, source_text, focus_span)
+        let result = self.full_reparse(parser, source_text, focus_span);
+        if let Some(m) = &mut metrics {
+            if let Some(start) = total_start {
+                m.total_duration_us = start.elapsed().as_micros();
+            }
+            m.used_incremental_path = false;
+        }
+        result
     }
 
     fn apply_candidate(
@@ -209,6 +293,7 @@ impl Reparser {
         focus_span: Span,
         old_source_text: &str,
         new_source_text: &str,
+        mut metrics: Option<&mut EditMetrics>,
     ) -> EditResult {
         let (_updated_node, root) = candidate.zipper.replace_green(&self.alloc, candidate.green);
         self.current = root;
@@ -250,7 +335,26 @@ impl Reparser {
         let newly_computed_tokens =
             Self::filter_spans_by_window(candidate.newly_computed_tokens, changed);
 
-        let semantic_commands = self.generate_commands(&self.current, &newly_computed_nodes);
+        let semantic_start = if metrics.is_some() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
+
+        let semantic_commands = self.generate_commands_incremental(
+            parser,
+            candidate.zipper.node.green,
+            candidate.green,
+            candidate.zipper.offset,
+            &newly_computed_nodes,
+        );
+
+        if let Some(m) = &mut metrics {
+            m.semantic_commands_emitted = semantic_commands.len();
+            if let Some(start) = semantic_start {
+                m.semantic_diff_us = start.elapsed().as_micros();
+            }
+        }
 
         EditResult {
             messages: parser.messages.clone(),
@@ -274,7 +378,9 @@ impl Reparser {
         let newly_computed_nodes = parser.newly_computed_nodes();
         let newly_computed_tokens = parser.newly_computed_tokens();
 
-        let semantic_commands = self.generate_commands(&self.current, &newly_computed_nodes);
+        let current_tree = self.current.clone();
+        let semantic_commands =
+            self.generate_commands(parser, &current_tree, &newly_computed_nodes);
 
         EditResult {
             messages: result.messages,
@@ -533,93 +639,557 @@ impl Reparser {
     }
 
     fn generate_commands(
-        &self,
+        &mut self,
+        parser: &Parser,
         reparsed_tree: &RedNode,
         newly_computed_nodes: &[Span],
     ) -> Vec<Command> {
-        if newly_computed_nodes.is_empty() {
+        let _ = newly_computed_nodes;
+        let (temp_nodes, temp_roots) = self.build_temp_semantic_tree(parser, reparsed_tree);
+        if temp_nodes.is_empty() || temp_roots.is_empty() {
+            self.semantic_nodes.clear();
+            self.semantic_roots.clear();
             return Vec::new();
         }
 
-        let mut commands = Vec::new();
+        let old_nodes = self.semantic_nodes.clone();
+        let old_roots = self.semantic_roots.clone();
 
-        self.walk_tree_for_commands(
-            reparsed_tree,
-            newly_computed_nodes,
+        let mut commands = Vec::new();
+        let mut new_nodes = HashMap::<SemanticId, PersistSemanticNode>::new();
+        let mut used_old = HashSet::<SemanticId>::new();
+        let mut replaced_old = HashSet::<SemanticId>::new();
+        let mut token_reuse = self.token_label_to_id.clone();
+
+        let new_roots = self.diff_child_list(
+            None,
+            &old_roots,
+            &temp_roots,
+            &old_nodes,
+            &temp_nodes,
+            &mut new_nodes,
+            &mut used_old,
+            &mut replaced_old,
+            &mut token_reuse,
             &mut commands,
         );
+
+        for old_id in old_nodes.keys().copied() {
+            if !used_old.contains(&old_id)
+                && !replaced_old.contains(&old_id)
+                && !new_nodes.contains_key(&old_id)
+            {
+                commands.push(Command::Delete(old_id));
+            }
+        }
+
+        self.semantic_nodes = new_nodes;
+        self.semantic_roots = new_roots;
+        self.rebuild_rule_green_index();
+        self.rebuild_token_tables();
 
         commands
     }
 
-    fn walk_tree_for_commands(
-        &self,
-        node: &RedNode,
-        newly_computed_spans: &[Span],
-        commands: &mut Vec<Command>,
-    ) {
-        let green = self.alloc.get_node(node.green);
-        let node_span = Span::new(node.offset, node.offset + green.width);
-
-        // Check if this span exactly matches a newly computed span
-        let is_exactly_newly_computed = newly_computed_spans
-            .iter()
-            .any(|span| *span == node_span);
-
-        // Check if this span contains newly computed content
-        let contains_newly_computed = newly_computed_spans
-            .iter()
-            .any(|span| node_span.start <= span.start && node_span.end >= span.end);
-
-        // Recurse into children first (bottom-up order)
-        let mut offset = node.offset;
-        let mut has_rule_child = false;
-        for &child_id in &green.children {
-            let child_node = RedNode {
-                parent: Some(Rc::new(node.clone())),
-                offset,
-                green: child_id,
-            };
-
-            self.walk_tree_for_commands(&child_node, newly_computed_spans, commands);
-
-            let child = self.alloc.get_node(child_id);
-            if matches!(&child.tag, Tag::Rule { .. }) {
-                has_rule_child = true;
-            }
-            offset += child.width;
+    fn generate_commands_incremental(
+        &mut self,
+        parser: &Parser,
+        old_rule_green: usize,
+        new_rule_green: usize,
+        new_offset: usize,
+        newly_computed_nodes: &[Span],
+    ) -> Vec<Command> {
+        if self.semantic_roots.is_empty() {
+            let current_tree = self.current.clone();
+            return self.generate_commands(parser, &current_tree, newly_computed_nodes);
         }
 
-        // Then emit command for this node (after children)
-        if let Tag::Rule { .. } = &green.tag {
-            // Skip wrapper nodes that just delegate to a single rule child
-            // EXCEPT for the root node which should always be included
-            let is_root = node.parent.is_none();
-            let rule_children: Vec<_> = green.children.iter()
-                .filter(|&&child_id| {
-                    matches!(self.alloc.get_node(child_id).tag, Tag::Rule { .. })
-                })
-                .collect();
+        let Some(old_root_id) = self.rule_green_to_semantic.get(&old_rule_green).copied() else {
+            let current_tree = self.current.clone();
+            return self.generate_commands(parser, &current_tree, newly_computed_nodes);
+        };
 
-            let is_simple_wrapper = !is_root && rule_children.len() == 1 && has_rule_child;
+        let new_subtree =
+            RedNode::root_with_span(new_rule_green, Span::new(new_offset, new_offset));
+        let (temp_nodes, temp_roots) = self.build_temp_semantic_tree(parser, &new_subtree);
+        if temp_roots.is_empty() {
+            let current_tree = self.current.clone();
+            return self.generate_commands(parser, &current_tree, newly_computed_nodes);
+        }
 
-            if !is_simple_wrapper {
-                if is_exactly_newly_computed {
-                    // Actually reparsed - fresh content
-                    commands.push(Command::Insert {
-                        green_id: node.green,
-                        span: node_span,
-                    });
-                } else if contains_newly_computed {
-                    // Ancestor rebuilt by replace_green - same content, new green_id
-                    commands.push(Command::Update {
-                        green_id: node.green,
-                        span: node_span,
-                    });
+        let old_parent = self.semantic_nodes.get(&old_root_id).and_then(|n| n.parent);
+        let mut commands = Vec::new();
+        let mut token_reuse = self.token_label_to_id.clone();
+        let mut created = HashMap::<SemanticId, PersistSemanticNode>::new();
+
+        let replacement_root = self.create_subtree(
+            temp_roots[0],
+            &temp_nodes,
+            &mut created,
+            old_parent,
+            &mut token_reuse,
+            &mut commands,
+        );
+        commands.push(Command::Replace(old_root_id, replacement_root));
+
+        if let Some(parent_id) = old_parent {
+            if let Some(parent_node) = self.semantic_nodes.get_mut(&parent_id) {
+                if let Some(pos) = parent_node
+                    .children
+                    .iter()
+                    .position(|&id| id == old_root_id)
+                {
+                    parent_node.children[pos] = replacement_root;
+                }
+            }
+        } else {
+            if let Some(pos) = self.semantic_roots.iter().position(|&id| id == old_root_id) {
+                self.semantic_roots[pos] = replacement_root;
+            }
+        }
+
+        for (id, mut node) in created {
+            if node.parent == Some(old_root_id) {
+                node.parent = old_parent;
+            }
+            self.semantic_nodes.insert(id, node);
+        }
+
+        self.remove_rule_green_subtree(old_root_id);
+        self.add_rule_green_subtree(replacement_root);
+        self.token_label_to_id = token_reuse;
+
+        commands
+    }
+
+    fn rebuild_rule_green_index(&mut self) {
+        self.rule_green_to_semantic.clear();
+        let roots = self.semantic_roots.clone();
+        for root in roots {
+            self.add_rule_green_subtree(root);
+        }
+    }
+
+    fn add_rule_green_subtree(&mut self, root_id: SemanticId) {
+        let mut stack = vec![root_id];
+        while let Some(node_id) = stack.pop() {
+            if let Some(node) = self.semantic_nodes.get(&node_id) {
+                if let Some(green) = node.rule_green {
+                    self.rule_green_to_semantic.insert(green, node_id);
+                }
+                for &child in &node.children {
+                    stack.push(child);
                 }
             }
         }
     }
+
+    fn remove_rule_green_subtree(&mut self, root_id: SemanticId) {
+        let mut stack = vec![root_id];
+        while let Some(node_id) = stack.pop() {
+            if let Some(node) = self.semantic_nodes.get(&node_id) {
+                if let Some(green) = node.rule_green {
+                    self.rule_green_to_semantic.remove(&green);
+                }
+                for &child in &node.children {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    fn build_temp_semantic_tree(
+        &self,
+        parser: &Parser,
+        root: &RedNode,
+    ) -> (Vec<TempSemanticNode>, Vec<usize>) {
+        let mut nodes = Vec::<TempSemanticNode>::new();
+        let roots = self.collect_temp_semantic_nodes(parser, root, &mut nodes);
+        (nodes, roots)
+    }
+
+    fn collect_temp_semantic_nodes(
+        &self,
+        parser: &Parser,
+        node: &RedNode,
+        out_nodes: &mut Vec<TempSemanticNode>,
+    ) -> Vec<usize> {
+        let green = self.alloc.get_node(node.green);
+
+        let mut child_offset = node.offset;
+        let mut semantic_children = Vec::<usize>::new();
+        for &child_id in &green.children {
+            let child_node = RedNode {
+                parent: Some(Rc::new(node.clone())),
+                offset: child_offset,
+                green: child_id,
+            };
+            semantic_children.extend(self.collect_temp_semantic_nodes(
+                parser,
+                &child_node,
+                out_nodes,
+            ));
+            child_offset += self.alloc.get_node(child_id).width;
+        }
+
+        let mut include = false;
+        let mut kind = SemanticNodeKind::Rule;
+        let mut label = String::new();
+
+        match &green.tag {
+            Tag::Rule { rule_ix } => {
+                let is_root = node.parent.is_none();
+                let rule_child_count = green
+                    .children
+                    .iter()
+                    .filter(|&&child_id| {
+                        matches!(self.alloc.get_node(child_id).tag, Tag::Rule { .. })
+                    })
+                    .count();
+                let is_simple_wrapper = !is_root && rule_child_count == 1;
+                if !is_simple_wrapper {
+                    include = true;
+                    kind = SemanticNodeKind::Rule;
+                    label = parser.grammar.name(*rule_ix).to_string();
+                }
+            }
+            Tag::Token { .. } => {
+                if green.width > 0 {
+                    include = true;
+                    kind = SemanticNodeKind::Token;
+                    let token_end = (node.offset + green.width).min(parser.text().len());
+                    label = parser.text()[node.offset..token_end].to_string();
+                }
+            }
+            _ => {}
+        }
+
+        if !include {
+            return semantic_children;
+        }
+
+        let node_ix = out_nodes.len();
+        out_nodes.push(TempSemanticNode {
+            kind,
+            label,
+            rule_green: matches!(kind, SemanticNodeKind::Rule).then_some(node.green),
+            children: semantic_children,
+        });
+        vec![node_ix]
+    }
+
+    fn diff_child_list(
+        &mut self,
+        parent_id: Option<SemanticId>,
+        old_children: &[SemanticId],
+        new_children: &[usize],
+        old_nodes: &HashMap<SemanticId, PersistSemanticNode>,
+        temp_nodes: &[TempSemanticNode],
+        new_nodes: &mut HashMap<SemanticId, PersistSemanticNode>,
+        used_old: &mut HashSet<SemanticId>,
+        replaced_old: &mut HashSet<SemanticId>,
+        token_reuse: &mut HashMap<String, SemanticId>,
+        commands: &mut Vec<Command>,
+    ) -> Vec<SemanticId> {
+        let mut out = Vec::<SemanticId>::new();
+        let mut i = 0;
+        let mut j = 0;
+
+        while i < old_children.len() && j < new_children.len() {
+            let old_id = old_children[i];
+            let new_ix = new_children[j];
+
+            let old_sig = old_nodes.get(&old_id).map(|n| (&n.kind, &n.label));
+            let new_sig = temp_nodes.get(new_ix).map(|n| (&n.kind, &n.label));
+
+            if old_sig.is_some() && old_sig == new_sig {
+                let reused_id = self.diff_node_reuse(
+                    old_id,
+                    new_ix,
+                    old_nodes,
+                    temp_nodes,
+                    new_nodes,
+                    used_old,
+                    replaced_old,
+                    token_reuse,
+                    commands,
+                );
+                out.push(reused_id);
+                i += 1;
+                j += 1;
+                continue;
+            }
+
+            let can_skip_old = i + 1 < old_children.len()
+                && old_nodes
+                    .get(&old_children[i + 1])
+                    .map(|n| (&n.kind, &n.label))
+                    == new_sig;
+
+            if can_skip_old {
+                i += 1;
+                continue;
+            }
+
+            let can_insert_new = j + 1 < new_children.len()
+                && old_sig
+                    == temp_nodes
+                        .get(new_children[j + 1])
+                        .map(|n| (&n.kind, &n.label));
+
+            if can_insert_new {
+                let inserted_id = self.create_subtree(
+                    new_ix,
+                    temp_nodes,
+                    new_nodes,
+                    parent_id,
+                    token_reuse,
+                    commands,
+                );
+                if let Some(parent) = parent_id {
+                    commands.push(Command::Insert(parent, inserted_id));
+                }
+                out.push(inserted_id);
+                j += 1;
+                continue;
+            }
+
+            let replaced_id = self.create_subtree(
+                new_ix,
+                temp_nodes,
+                new_nodes,
+                parent_id,
+                token_reuse,
+                commands,
+            );
+            commands.push(Command::Replace(old_id, replaced_id));
+            self.mark_replaced_subtree(old_id, old_nodes, replaced_old);
+            used_old.insert(old_id);
+            out.push(replaced_id);
+            i += 1;
+            j += 1;
+        }
+
+        while j < new_children.len() {
+            let new_ix = new_children[j];
+            let inserted_id = self.create_subtree(
+                new_ix,
+                temp_nodes,
+                new_nodes,
+                parent_id,
+                token_reuse,
+                commands,
+            );
+            if let Some(parent) = parent_id {
+                commands.push(Command::Insert(parent, inserted_id));
+            }
+            out.push(inserted_id);
+            j += 1;
+        }
+
+        out
+    }
+
+    fn diff_node_reuse(
+        &mut self,
+        old_id: SemanticId,
+        new_ix: usize,
+        old_nodes: &HashMap<SemanticId, PersistSemanticNode>,
+        temp_nodes: &[TempSemanticNode],
+        new_nodes: &mut HashMap<SemanticId, PersistSemanticNode>,
+        used_old: &mut HashSet<SemanticId>,
+        replaced_old: &mut HashSet<SemanticId>,
+        token_reuse: &mut HashMap<String, SemanticId>,
+        commands: &mut Vec<Command>,
+    ) -> SemanticId {
+        used_old.insert(old_id);
+
+        let old_children = old_nodes
+            .get(&old_id)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+        let new_children_ix = temp_nodes
+            .get(new_ix)
+            .map(|n| n.children.clone())
+            .unwrap_or_default();
+
+        let new_children = self.diff_child_list(
+            Some(old_id),
+            &old_children,
+            &new_children_ix,
+            old_nodes,
+            temp_nodes,
+            new_nodes,
+            used_old,
+            replaced_old,
+            token_reuse,
+            commands,
+        );
+
+        if let Some(new_node) = temp_nodes.get(new_ix) {
+            new_nodes.insert(
+                old_id,
+                PersistSemanticNode {
+                    kind: new_node.kind,
+                    label: new_node.label.clone(),
+                    rule_green: new_node.rule_green,
+                    parent: old_nodes.get(&old_id).and_then(|n| n.parent),
+                    children: new_children,
+                },
+            );
+        }
+
+        old_id
+    }
+
+    fn create_subtree(
+        &mut self,
+        root_ix: usize,
+        temp_nodes: &[TempSemanticNode],
+        new_nodes: &mut HashMap<SemanticId, PersistSemanticNode>,
+        parent: Option<SemanticId>,
+        token_reuse: &mut HashMap<String, SemanticId>,
+        commands: &mut Vec<Command>,
+    ) -> SemanticId {
+        let node = &temp_nodes[root_ix];
+
+        if matches!(node.kind, SemanticNodeKind::Token) {
+            if let Some(existing_id) = token_reuse.get(&node.label).copied() {
+                if !new_nodes.contains_key(&existing_id) {
+                    if let Some(existing_node) = self.semantic_nodes.get(&existing_id).cloned() {
+                        new_nodes.insert(existing_id, existing_node);
+                    } else {
+                        new_nodes.insert(
+                            existing_id,
+                            PersistSemanticNode {
+                                kind: SemanticNodeKind::Token,
+                                label: node.label.clone(),
+                                rule_green: None,
+                                parent,
+                                children: Vec::new(),
+                            },
+                        );
+                    }
+                }
+                return existing_id;
+            }
+        }
+
+        let id = self.next_semantic_id;
+        self.next_semantic_id += 1;
+
+        match node.kind {
+            SemanticNodeKind::Rule => commands.push(Command::Create(id, node.label.clone())),
+            SemanticNodeKind::Token => {
+                commands.push(Command::CreateToken(id, node.label.clone()));
+                token_reuse.insert(node.label.clone(), id);
+            }
+        }
+
+        let mut child_ids = Vec::new();
+        for &child_ix in &node.children {
+            let child_id = self.create_subtree(
+                child_ix,
+                temp_nodes,
+                new_nodes,
+                Some(id),
+                token_reuse,
+                commands,
+            );
+            commands.push(Command::Insert(id, child_id));
+            child_ids.push(child_id);
+        }
+
+        new_nodes.insert(
+            id,
+            PersistSemanticNode {
+                kind: node.kind,
+                label: node.label.clone(),
+                rule_green: node.rule_green,
+                parent,
+                children: child_ids,
+            },
+        );
+
+        id
+    }
+
+    fn mark_replaced_subtree(
+        &self,
+        root_id: SemanticId,
+        old_nodes: &HashMap<SemanticId, PersistSemanticNode>,
+        replaced_old: &mut HashSet<SemanticId>,
+    ) {
+        let mut stack = vec![root_id];
+        while let Some(node_id) = stack.pop() {
+            if !replaced_old.insert(node_id) {
+                continue;
+            }
+            if let Some(node) = old_nodes.get(&node_id) {
+                for &child in &node.children {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    fn rebuild_token_tables(&mut self) {
+        let mut label_to_id = HashMap::<String, SemanticId>::new();
+        let mut refcount = HashMap::<SemanticId, usize>::new();
+
+        for &root_id in &self.semantic_roots {
+            self.count_token_occurrences(root_id, &mut label_to_id, &mut refcount);
+        }
+
+        self.token_label_to_id = label_to_id;
+        self.token_refcount = refcount;
+    }
+
+    fn count_token_occurrences(
+        &self,
+        node_id: SemanticId,
+        label_to_id: &mut HashMap<String, SemanticId>,
+        refcount: &mut HashMap<SemanticId, usize>,
+    ) {
+        let Some(node) = self.semantic_nodes.get(&node_id) else {
+            return;
+        };
+
+        match node.kind {
+            SemanticNodeKind::Token => {
+                label_to_id.entry(node.label.clone()).or_insert(node_id);
+                *refcount.entry(node_id).or_insert(0) += 1;
+            }
+            SemanticNodeKind::Rule => {
+                for &child in &node.children {
+                    self.count_token_occurrences(child, label_to_id, refcount);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticNodeKind {
+    Rule,
+    Token,
+}
+
+#[derive(Debug, Clone)]
+struct TempSemanticNode {
+    kind: SemanticNodeKind,
+    label: String,
+    rule_green: Option<usize>,
+    children: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+struct PersistSemanticNode {
+    kind: SemanticNodeKind,
+    label: String,
+    rule_green: Option<usize>,
+    parent: Option<SemanticId>,
+    children: Vec<SemanticId>,
 }
 
 #[derive(Debug, Clone)]
@@ -762,14 +1332,14 @@ fn collect_from(
     let is_insertion = span.len() == 0;
 
     let mut has_separator_children = false;
-    let mut separator_indices = Vec::new();
+    let mut separator_index = vec![false; green.children.len()];
 
     for (idx, &child_id) in green.children.iter().enumerate() {
         let child = alloc.get_node(child_id);
         if matches!(&child.tag, Tag::Token { .. }) {
             if child.width <= 2 {
                 has_separator_children = true;
-                separator_indices.push(idx);
+                separator_index[idx] = true;
             }
         }
     }
@@ -796,7 +1366,7 @@ fn collect_from(
             overlaps.push((idx, child_id, child_start, child_end));
 
             if has_separator_children && (insertion_at_end || insertion_is_inside) {
-                if idx + 1 < green.children.len() && separator_indices.contains(&(idx + 1)) {
+                if idx + 1 < green.children.len() && separator_index[idx + 1] {
                     overlaps.push((
                         idx + 1,
                         green.children[idx + 1],
@@ -843,7 +1413,7 @@ fn collect_from(
                     let (idx, _child_id, _cstart, cend) = *candidate;
                     let is_after_insertion_end = cend == span.start;
                     let next_is_separator =
-                        idx + 1 < green.children.len() && separator_indices.contains(&(idx + 1));
+                        idx + 1 < green.children.len() && separator_index[idx + 1];
                     if is_after_insertion_end
                         && !next_is_separator
                         && idx + 1 < green.children.len()
@@ -917,7 +1487,7 @@ fn collect_from(
             let should_stop_at_separator = is_insertion
                 && has_separator_children
                 && child_idx > 0
-                && separator_indices.contains(&(child_idx - 1));
+                && separator_index[child_idx - 1];
 
             steps.push(ZipperStep {
                 parent: node.clone(),

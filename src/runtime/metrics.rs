@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 /// Per-edit performance metrics collected during reparse and semantic phases
 #[derive(Clone, Debug)]
 pub struct EditMetrics {
@@ -80,90 +78,5 @@ impl EditMetrics {
             self.used_incremental_path,
             self.fell_back_to_full_diff,
         )
-    }
-}
-
-/// High-resolution timer for nested measurements
-pub struct Timer {
-    start: Instant,
-    name: String,
-}
-
-impl Timer {
-    pub fn start(name: &str) -> Self {
-        Self {
-            start: Instant::now(),
-            name: name.to_string(),
-        }
-    }
-
-    pub fn stop(self) -> u128 {
-        self.start.elapsed().as_micros()
-    }
-
-    pub fn stop_and_record(self, dest: &mut u128) {
-        let elapsed = self.stop();
-        *dest += elapsed;
-    }
-}
-
-/// RAII-style scoped timer that auto-records on drop
-pub struct ScopedTimer {
-    start: Instant,
-    dest: *mut u128,
-    _name: String,
-}
-
-impl ScopedTimer {
-    pub fn new(dest: &mut u128, name: &str) -> Self {
-        Self {
-            start: Instant::now(),
-            dest: dest as *mut u128,
-            _name: name.to_string(),
-        }
-    }
-}
-
-impl Drop for ScopedTimer {
-    fn drop(&mut self) {
-        let elapsed = self.start.elapsed().as_micros();
-        unsafe {
-            *self.dest += elapsed;
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread;
-
-    #[test]
-    fn test_timer() {
-        let t = Timer::start("test");
-        thread::sleep(std::time::Duration::from_millis(1));
-        let us = t.stop();
-        assert!(us >= 1000, "Expected >= 1000µs, got {}", us);
-    }
-
-    #[test]
-    fn test_scoped_timer() {
-        let mut dest = 0u128;
-        {
-            let _t = ScopedTimer::new(&mut dest, "test");
-            thread::sleep(std::time::Duration::from_millis(1));
-        }
-        assert!(dest >= 1000, "Expected >= 1000µs, got {}", dest);
-    }
-
-    #[test]
-    fn test_metrics_summary() {
-        let mut m = EditMetrics::new();
-        m.total_duration_us = 5000;
-        m.parse_rule_calls = 10;
-        m.parse_rule_cache_hits = 7;
-        m.candidates_collected = 5;
-        m.candidates_evaluated = 3;
-        println!("{}", m.summary());
     }
 }

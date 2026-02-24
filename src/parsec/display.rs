@@ -285,7 +285,11 @@ fn format_expected(grammar: &Grammar, expected: &[usize]) -> String {
         return String::new();
     }
 
-    let expected_terms: FxHashSet<usize> = expected.iter().copied().filter(|id| *id != EOF_TOKEN).collect();
+    let expected_terms: FxHashSet<usize> = expected
+        .iter()
+        .copied()
+        .filter(|id| *id != EOF_TOKEN)
+        .collect();
     let first_sets = compute_first_sets(grammar);
     let mut exact_rules = Vec::new();
     for (rule_ix, firsts) in &first_sets {

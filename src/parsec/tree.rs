@@ -122,8 +122,9 @@ impl TreeAllocRefExt for TreeAllocRef {
             width,
         };
 
-        // Deduplicate tokens and errors (leaves)
-        let should_dedup = matches!(node.tag, Tag::Token { .. } | Tag::Error(_));
+        // Deduplicate only errors. Tokens carry user text via source spans, so they
+        // should remain distinct per allocation.
+        let should_dedup = matches!(node.tag, Tag::Error(_));
         if should_dedup {
             let mut hasher = DefaultHasher::new();
             node.hash(&mut hasher);

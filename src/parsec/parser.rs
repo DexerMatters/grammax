@@ -419,6 +419,7 @@ impl Parser {
         let analysis = self.analysis_for_rule(rule_ix);
         let mut state_stack = vec![analysis.start_state];
         let mut node_stack: Vec<StackEntry> = vec![];
+        let mut recovery_steps = 0usize;
 
         loop {
             let current_state_idx = *state_stack.last().unwrap();
@@ -432,12 +433,168 @@ impl Parser {
                 .cloned();
 
             let Some(action) = action else {
-                // Strict local parse: bail out quickly for candidate scoring.
                 let expected = self.expected_ids_for_analysis(&analysis, current_state_idx, true);
-                let (_raw_term, raw_len, _raw_node) = self.lex_with_end(None, parse_end);
+                let (raw_term, raw_len, raw_node) = self.lex_with_end(None, parse_end);
+
                 if raw_len > 0 {
+                    if let Some(term_ix) = expected
+                        .iter()
+                        .copied()
+                        .filter(|term_ix| {
+                            !self.recovery_profile.opening_tokens.contains(term_ix)
+                                && !self.recovery_profile.closing_tokens.contains(term_ix)
+                                && !self.recovery_profile.sync_tokens.contains(term_ix)
+                                && !self.is_quote_terminal(*term_ix)
+                                && !self.is_json_string_terminal(*term_ix)
+                                && *term_ix != EOF_TOKEN
+                        })
+                        .min()
+                    {
+                        let start_pos = self.pos;
+                        let err_node = self.alloc.alloc(
+                            Tag::new_error(ParsecError::UnexpectedToken),
+                            vec![],
+                            raw_len,
+                        );
+                        if self.apply_terminal_with_analysis(
+                            term_ix,
+                            raw_len,
+                            err_node,
+                            true,
+                            &mut state_stack,
+                            &mut node_stack,
+                            analysis.as_ref(),
+                        ) {
+                            self.messages.push(ParserMessage::new_unexpected(
+                                Span::new(start_pos, start_pos + raw_len),
+                                expected.clone(),
+                            ));
+                            recovery_steps += 1;
+                            if recovery_steps <= 128 {
+                                continue;
+                            }
+                        }
+                    }
+
+                    let raw_is_beacon = self.recovery_profile.sync_tokens.contains(&raw_term)
+                        || self.recovery_profile.closing_tokens.contains(&raw_term);
+
+                    if raw_is_beacon {
+                        let old_pos = self.pos;
+                        let old_string_opened = self.string_opened;
+                        let mut trial_states = state_stack.clone();
+                        let mut trial_nodes = node_stack.clone();
+
+                        if self.apply_terminal_with_analysis(
+                            raw_term,
+                            raw_len,
+                            raw_node,
+                            true,
+                            &mut trial_states,
+                            &mut trial_nodes,
+                            analysis.as_ref(),
+                        ) {
+                            state_stack = trial_states;
+                            node_stack = trial_nodes;
+                            recovery_steps += 1;
+                            if recovery_steps <= 128 {
+                                continue;
+                            }
+                        }
+
+                        self.pos = old_pos;
+                        self.string_opened = old_string_opened;
+
+                        if let Some(term_ix) = expected
+                            .iter()
+                            .copied()
+                            .filter(|term_ix| {
+                                !self.recovery_profile.opening_tokens.contains(term_ix)
+                                    && !self.recovery_profile.closing_tokens.contains(term_ix)
+                                    && !self.recovery_profile.sync_tokens.contains(term_ix)
+                                    && !self.is_quote_terminal(*term_ix)
+                                    && !self.is_json_string_terminal(*term_ix)
+                                    && *term_ix != EOF_TOKEN
+                            })
+                            .min()
+                        {
+                            let missing = self.alloc.alloc(
+                                Tag::new_error(ParsecError::MissingToken),
+                                vec![],
+                                0,
+                            );
+                            let before = (self.pos, state_stack.len(), node_stack.len());
+                            if self.apply_terminal_with_analysis(
+                                term_ix,
+                                0,
+                                missing,
+                                false,
+                                &mut state_stack,
+                                &mut node_stack,
+                                analysis.as_ref(),
+                            ) {
+                                let after = (self.pos, state_stack.len(), node_stack.len());
+                                if after != before {
+                                    self.messages.push(ParserMessage::new_missing(
+                                        Span::new(self.pos, self.pos),
+                                        vec![term_ix],
+                                    ));
+                                    recovery_steps += 1;
+                                    if recovery_steps <= 128 {
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     self.push_unexpected_trimmed(self.pos, self.pos + raw_len, expected);
+                    let deleted_node = self.alloc.alloc(
+                        Tag::new_error(ParsecError::UnexpectedToken),
+                        vec![],
+                        raw_len,
+                    );
+                    node_stack.push(StackEntry {
+                        node: deleted_node,
+                        binds_state: false,
+                    });
+                    self.consume(raw_len);
+                    recovery_steps += 1;
+                    if recovery_steps <= 128 {
+                        continue;
+                    }
                 } else {
+                    let before = (self.pos, state_stack.len(), node_stack.len());
+                    if let Some(term_ix) = expected
+                        .iter()
+                        .copied()
+                        .find(|term_ix| *term_ix != EOF_TOKEN)
+                    {
+                        let missing =
+                            self.alloc
+                                .alloc(Tag::new_error(ParsecError::MissingToken), vec![], 0);
+                        if self.apply_terminal_with_analysis(
+                            term_ix,
+                            0,
+                            missing,
+                            false,
+                            &mut state_stack,
+                            &mut node_stack,
+                            analysis.as_ref(),
+                        ) {
+                            let after = (self.pos, state_stack.len(), node_stack.len());
+                            if after != before {
+                                self.messages.push(ParserMessage::new_missing(
+                                    Span::new(self.pos, self.pos),
+                                    vec![term_ix],
+                                ));
+                                recovery_steps += 1;
+                                if recovery_steps <= 128 {
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     self.messages.push(ParserMessage::new_unexpected(
                         Span::new(self.pos, self.pos),
                         expected,
@@ -1213,6 +1370,54 @@ impl Parser {
         }
     }
 
+    fn apply_terminal_with_analysis(
+        &mut self,
+        term: usize,
+        len: usize,
+        token_node: GreenId,
+        consume_input: bool,
+        state_stack: &mut Vec<usize>,
+        node_stack: &mut Vec<StackEntry>,
+        analysis: &GrammarStateAnalysis,
+    ) -> bool {
+        loop {
+            let current_state_idx = *state_stack.last().unwrap();
+            let action = analysis.states[current_state_idx]
+                .actions
+                .get(&term)
+                .cloned();
+
+            match action {
+                Some(Action::Shift(next_state)) => {
+                    if consume_input && self.is_quote_terminal(term) {
+                        self.string_opened = !self.string_opened;
+                    }
+                    if consume_input {
+                        self.consume(len);
+                    }
+                    state_stack.push(next_state);
+                    node_stack.push(StackEntry {
+                        node: token_node,
+                        binds_state: true,
+                    });
+                    return true;
+                }
+                Some(Action::Reduce(prod_idx)) => {
+                    if !self.perform_reduce_with_analysis(
+                        prod_idx,
+                        state_stack,
+                        node_stack,
+                        analysis,
+                    ) {
+                        return false;
+                    }
+                }
+                Some(Action::Accept) => return true,
+                None => return false,
+            }
+        }
+    }
+
     fn finalize_root(&self, node_stack: &mut Vec<StackEntry>) -> GreenId {
         if node_stack.is_empty() {
             return self.alloc.new_placeholder(0);
@@ -1271,9 +1476,14 @@ impl Parser {
         node_stack: &mut Vec<StackEntry>,
         analysis: &GrammarStateAnalysis,
     ) -> bool {
-        let (lhs, rhs_len, field_positions) = {
+        let (lhs, rhs_len, field_positions, is_single_terminal_prod) = {
             let prod = &self.grammar.table.productions[prod_idx];
-            (prod.lhs, prod.rhs.len(), prod.field_positions.clone())
+            (
+                prod.lhs,
+                prod.rhs.len(),
+                prod.field_positions.clone(),
+                prod.rhs.len() == 1 && matches!(prod.rhs[0], Symbol::Terminal(_)),
+            )
         };
 
         let popped = match self.pop_reduce_entries(rhs_len, state_stack, node_stack) {
@@ -1302,9 +1512,20 @@ impl Parser {
             }
         }
 
-        let builder =
-            crate::parsec::builder::TreeBuilder::new(&self.grammar, &self.alloc, &self.config);
-        let new_node = builder.build_node(lhs, children);
+        let passthrough_unexpected = is_single_terminal_prod
+            && children.len() == 1
+            && matches!(
+                &self.alloc.get_node(children[0]).tag,
+                Tag::Error(errs) if errs.iter().any(|e| matches!(e, ParsecError::UnexpectedToken))
+            );
+
+        let new_node = if passthrough_unexpected {
+            children[0]
+        } else {
+            let builder =
+                crate::parsec::builder::TreeBuilder::new(&self.grammar, &self.alloc, &self.config);
+            builder.build_node(lhs, children)
+        };
 
         let node_width = self.alloc.get_node(new_node).width;
         let node_start = self.pos - node_width;

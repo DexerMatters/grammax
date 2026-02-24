@@ -1,22 +1,27 @@
-/// Semantic ID uniquely identifies semantic nodes in the tree
-pub type SemanticId = usize;
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Create a new semantic node with the given rule name
-    Create(SemanticId, String),
+    /// Declare a newly introduced green node (and its structural metadata)
+    CreateGreen { green: usize },
 
-    /// Create a new token node with the given token value
-    CreateToken(SemanticId, String),
+    /// Replace a green child under a parent position.
+    /// parent_green is None when the root green changes.
+    ReplaceGreen {
+        parent_green: Option<usize>,
+        child_index: usize,
+        new_green: usize,
+    },
 
-    /// Replace old semantic node with new semantic node (rebuild due to content change)
-    /// Replace(old_id, new_id)
-    Replace(SemanticId, SemanticId),
+    /// Insert a green child at an index under a parent green.
+    InsertGreen {
+        parent_green: usize,
+        child_index: usize,
+        green: usize,
+    },
 
-    /// Delete a semantic node
-    Delete(SemanticId),
-
-    /// Insert a child node into a parent
-    /// Insert(parent_id, child_id)
-    Insert(SemanticId, SemanticId),
+    /// Delete a green child at an index under a parent green.
+    DeleteGreen {
+        parent_green: usize,
+        child_index: usize,
+        green: usize,
+    },
 }

@@ -1,14 +1,16 @@
 use std::{
+    marker::PhantomData,
     ops,
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::mpsc,
     thread::{self, JoinHandle},
 };
 
 use crate::{
     grammar::Grammar,
-    impl_listener,
     parsec::{self, Parser, ParserConfig, ParserListener, msg::ParserMessages, tree::RedNode},
-    runtime::reparser::Reparser,
+    runtime::reparser::{ReparseError, Reparser},
+    semantic::{ASTCell, AstArena, AstDelta, AstMapper, IncrementalLowerer},
     utils::Span,
 };
 
@@ -28,23 +30,160 @@ pub enum Action {
     Delete { span: Span },
     Update { span: Span, text: String },
 
-    // Control actions
     Run,
     Pause,
     Resume,
     Exit,
 }
 
-#[derive(Default)]
-pub struct RuntimeListener {
+impl Action {
+    fn kind(&self) -> RuntimeAction {
+        match self {
+            Action::Insert { .. } => RuntimeAction::Insert,
+            Action::Delete { .. } => RuntimeAction::Delete,
+            Action::Update { .. } => RuntimeAction::Update,
+            Action::Run => RuntimeAction::Run,
+            Action::Pause => RuntimeAction::Pause,
+            Action::Resume => RuntimeAction::Resume,
+            Action::Exit => RuntimeAction::Exit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeAction {
+    Insert,
+    Delete,
+    Update,
+    Run,
+    Pause,
+    Resume,
+    Exit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuntimeMode {
+    Ready,
+    Running,
+    Paused,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenerHook {
+    BeforeUpdate,
+    AfterUpdate,
+    OnPause,
+    OnResume,
+    OnInterrupt,
+    OnError,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RuntimeError {
+    QueueFull,
+    ChannelClosed,
+    WorkerPanicked,
+    InvalidOffset {
+        offset: usize,
+        text_len: usize,
+    },
+    InvalidRange {
+        start: usize,
+        end: usize,
+        text_len: usize,
+    },
+    InvalidMode {
+        mode: RuntimeMode,
+        action: RuntimeAction,
+    },
+    NoIncrementalCandidate {
+        span: Span,
+        delta: isize,
+        candidates_collected: usize,
+    },
+    ListenerPanic {
+        hook: ListenerHook,
+    },
+}
+
+impl From<ReparseError> for RuntimeError {
+    fn from(value: ReparseError) -> Self {
+        match value {
+            ReparseError::NoIncrementalCandidate {
+                span,
+                delta,
+                candidates_collected,
+            } => RuntimeError::NoIncrementalCandidate {
+                span,
+                delta,
+                candidates_collected,
+            },
+        }
+    }
+}
+
+pub type RuntimeResult<T> = Result<T, RuntimeError>;
+
+pub struct RuntimeListener<T = ()> {
     before_update: Option<Box<dyn Fn() + Send>>,
-    after_update: Option<Box<dyn Fn(UpdateResult, std::time::Duration) + Send>>,
+    after_update: Option<Box<dyn Fn(UpdateResult<T>) + Send>>,
     on_pause: Option<Box<dyn Fn() + Send>>,
     on_resume: Option<Box<dyn Fn() + Send>>,
     on_interrupt: Option<Box<dyn Fn() + Send>>,
+    on_error: Option<Box<dyn Fn(&RuntimeError) + Send>>,
 }
 
-pub struct UpdateResult<'a> {
+impl<T> Default for RuntimeListener<T> {
+    fn default() -> Self {
+        Self {
+            before_update: None,
+            after_update: None,
+            on_pause: None,
+            on_resume: None,
+            on_interrupt: None,
+            on_error: None,
+        }
+    }
+}
+
+impl<T> RuntimeListener<T> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn before_update(mut self, callback: impl Fn() + Send + 'static) -> Self {
+        self.before_update = Some(Box::new(callback));
+        self
+    }
+
+    pub fn after_update(mut self, callback: impl Fn(UpdateResult<T>) + Send + 'static) -> Self {
+        self.after_update = Some(Box::new(callback));
+        self
+    }
+
+    pub fn on_pause(mut self, callback: impl Fn() + Send + 'static) -> Self {
+        self.on_pause = Some(Box::new(callback));
+        self
+    }
+
+    pub fn on_resume(mut self, callback: impl Fn() + Send + 'static) -> Self {
+        self.on_resume = Some(Box::new(callback));
+        self
+    }
+
+    pub fn on_interrupt(mut self, callback: impl Fn() + Send + 'static) -> Self {
+        self.on_interrupt = Some(Box::new(callback));
+        self
+    }
+
+    pub fn on_error(mut self, callback: impl Fn(&RuntimeError) + Send + 'static) -> Self {
+        self.on_error = Some(Box::new(callback));
+        self
+    }
+}
+
+pub struct UpdateResult<'a, T = ()> {
     pub messages: ParserMessages,
     pub current_tree: &'a RedNode,
     pub reparsed_tree: &'a RedNode,
@@ -53,10 +192,15 @@ pub struct UpdateResult<'a> {
     pub newly_computed_nodes: Vec<Span>,
     pub newly_computed_tokens: Vec<Span>,
     pub semantic_commands: Vec<crate::semantic::Command>,
+    pub semantic_ir_delta: Option<AstDelta<T>>,
+    pub semantic_ir_root: Option<&'a T>,
+    pub semantic_ir_root_cell: Option<ASTCell<T>>,
+    pub semantic_ir_arena: Option<&'a AstArena<T>>,
     pub metrics: EditMetrics,
 }
 
-impl<'a> UpdateResult<'a> {
+impl<'a, T> UpdateResult<'a, T> {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         messages: ParserMessages,
         current_tree: &'a RedNode,
@@ -66,6 +210,10 @@ impl<'a> UpdateResult<'a> {
         newly_computed_nodes: Vec<Span>,
         newly_computed_tokens: Vec<Span>,
         semantic_commands: Vec<crate::semantic::Command>,
+        semantic_ir_delta: Option<AstDelta<T>>,
+        semantic_ir_root: Option<&'a T>,
+        semantic_ir_root_cell: Option<ASTCell<T>>,
+        semantic_ir_arena: Option<&'a AstArena<T>>,
         metrics: EditMetrics,
     ) -> Self {
         Self {
@@ -77,6 +225,10 @@ impl<'a> UpdateResult<'a> {
             newly_computed_nodes,
             newly_computed_tokens,
             semantic_commands,
+            semantic_ir_delta,
+            semantic_ir_root,
+            semantic_ir_root_cell,
+            semantic_ir_arena,
             metrics,
         }
     }
@@ -89,6 +241,7 @@ pub struct RuntimeConfig {
     pub incremental_reuse_enabled: bool,
     pub incremental_reuse_cache_capacity: usize,
     pub incremental_reuse_cache_failures: bool,
+    pub action_queue_capacity: usize,
 }
 
 impl RuntimeConfig {
@@ -105,27 +258,57 @@ impl Default for RuntimeConfig {
             incremental_reuse_enabled: true,
             incremental_reuse_cache_capacity: 4096,
             incremental_reuse_cache_failures: true,
+            action_queue_capacity: 1024,
         }
     }
 }
 
-pub struct Interactive {
+pub struct Interactive<T = (), M = ()> {
     grammar: Grammar,
     runtime_config: RuntimeConfig,
-    runtime_listener: Option<RuntimeListener>,
+    runtime_listener: Option<RuntimeListener<T>>,
     parser_listener: Option<ParserListener>,
+    semantic_map: Option<M>,
+    _semantic_ty: PhantomData<T>,
 }
 
-impl Interactive {
-    pub fn new(grammar: Grammar) -> Interactive {
+impl Interactive<(), ()> {
+    pub fn new(grammar: Grammar) -> Interactive<(), ()> {
         Interactive {
             grammar,
             runtime_config: RuntimeConfig::default(),
             runtime_listener: None,
             parser_listener: None,
+            semantic_map: None,
+            _semantic_ty: PhantomData,
         }
     }
 
+    pub fn with_map<T, M>(self, map: M) -> Interactive<T, M>
+    where
+        T: Clone + PartialEq + 'static,
+        M: AstMapper<T> + Send + 'static,
+    {
+        assert!(
+            self.runtime_listener.is_none(),
+            "call `with_map` before `with_listener` so listener can be typed with IR node type",
+        );
+        Interactive {
+            grammar: self.grammar,
+            runtime_config: self.runtime_config,
+            runtime_listener: None,
+            parser_listener: self.parser_listener,
+            semantic_map: Some(map),
+            _semantic_ty: PhantomData,
+        }
+    }
+}
+
+impl<T, M> Interactive<T, M>
+where
+    T: Clone + PartialEq + 'static,
+    M: AstMapper<T> + Send + 'static,
+{
     pub fn with_config(mut self, runtime_config: RuntimeConfig) -> Self {
         self.runtime_config = runtime_config;
         self
@@ -136,7 +319,7 @@ impl Interactive {
         self
     }
 
-    pub fn with_listener(mut self, listener: RuntimeListener) -> Self {
+    pub fn with_listener(mut self, listener: RuntimeListener<T>) -> Self {
         self.runtime_listener = Some(listener);
         self
     }
@@ -158,6 +341,11 @@ impl Interactive {
         self
     }
 
+    pub fn with_action_queue_capacity(mut self, capacity: usize) -> Self {
+        self.runtime_config.action_queue_capacity = capacity.max(1);
+        self
+    }
+
     pub fn with_parser_listener(mut self, listener: ParserListener) -> Self {
         self.parser_listener = Some(listener);
         self
@@ -169,23 +357,34 @@ impl Interactive {
             self.runtime_config,
             self.runtime_listener.unwrap_or_default(),
             self.parser_listener.unwrap_or_default(),
+            self.semantic_map,
         )
     }
 }
 
+struct RuntimeRequest {
+    action: Action,
+    reply: mpsc::Sender<RuntimeResult<()>>,
+}
+
 pub struct InteractiveInstance {
-    sender: mpsc::Sender<Action>,
+    sender: mpsc::SyncSender<RuntimeRequest>,
     thread_handle: JoinHandle<()>,
 }
 
 impl InteractiveInstance {
-    pub(crate) fn init(
+    pub(crate) fn init<T, M>(
         grammar: Grammar,
         runtime_config: RuntimeConfig,
-        runtime_listener: RuntimeListener,
+        runtime_listener: RuntimeListener<T>,
         parser_listener: ParserListener,
-    ) -> Self {
-        let (sender, inthread_receiver) = mpsc::channel();
+        semantic_map: Option<M>,
+    ) -> Self
+    where
+        T: Clone + PartialEq + 'static,
+        M: AstMapper<T> + Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel(runtime_config.action_queue_capacity.max(1));
         let thread_handle = thread::spawn(move || {
             let mut parser = Parser::new(grammar)
                 .with_config(runtime_config.parser)
@@ -197,16 +396,20 @@ impl InteractiveInstance {
             );
             let alloc = parser.alloc.clone();
             let parsec::Result { root: cursor, .. } = parser.parse_text("");
+            let semantic_map = semantic_map
+                .map(|map| IncrementalLowerer::new(alloc.clone(), parser.grammar.clone(), map));
 
-            Runtime {
-                text: "".to_string(),
+            let mut runtime = Runtime {
+                text: String::new(),
                 parser,
-                cursor: Reparser::new(cursor, alloc).with_config(runtime_config.reparser),
-                receiver: inthread_receiver,
-                mode: Mode::Ready,
                 runtime_listener,
-            }
-            .run_ready_mode();
+                cursor: Reparser::new(cursor, alloc).with_config(runtime_config.reparser),
+                semantic_map,
+                semantic_map_initialized: false,
+                receiver,
+                mode: RuntimeMode::Ready,
+            };
+            runtime.run_event_loop();
         });
 
         Self {
@@ -215,261 +418,324 @@ impl InteractiveInstance {
         }
     }
 
-    pub fn update(
-        &self,
-        start: usize,
-        end: usize,
-        text: &str,
-    ) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Update {
+    fn request(&self, action: Action) -> RuntimeResult<()> {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        let request = RuntimeRequest {
+            action,
+            reply: reply_tx,
+        };
+        match self.sender.try_send(request) {
+            Ok(()) => reply_rx.recv().map_err(|_| RuntimeError::ChannelClosed)?,
+            Err(mpsc::TrySendError::Full(_)) => Err(RuntimeError::QueueFull),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(RuntimeError::ChannelClosed),
+        }
+    }
+
+    pub fn update(&self, start: usize, end: usize, text: &str) -> RuntimeResult<()> {
+        self.request(Action::Update {
             span: Span::new(start, end),
             text: text.to_string(),
         })
     }
 
-    pub fn insert(&self, offset: usize, text: &str) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Insert {
+    pub fn insert(&self, offset: usize, text: &str) -> RuntimeResult<()> {
+        self.request(Action::Insert {
             offset,
             text: text.to_string(),
         })
     }
 
-    pub fn delete(&self, start: usize, end: usize) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Delete {
+    pub fn delete(&self, start: usize, end: usize) -> RuntimeResult<()> {
+        self.request(Action::Delete {
             span: Span::new(start, end),
         })
     }
 
-    pub fn pause(&self) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Pause)
+    pub fn pause(&self) -> RuntimeResult<()> {
+        self.request(Action::Pause)
     }
 
-    pub fn join(self) -> thread::Result<()> {
-        self.thread_handle.join()
+    pub fn resume(&self) -> RuntimeResult<()> {
+        self.request(Action::Resume)
     }
 
-    pub fn resume(&self) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Resume)
+    pub fn run(&self) -> RuntimeResult<()> {
+        self.request(Action::Run)
     }
 
-    pub fn run(&self) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Run)
+    pub fn exit(&self) -> RuntimeResult<()> {
+        self.request(Action::Exit)
     }
 
-    pub fn exit(&self) -> Result<(), mpsc::SendError<Action>> {
-        self.sender.send(Action::Exit)
+    pub fn join(self) -> RuntimeResult<()> {
+        drop(self.sender);
+        self.thread_handle
+            .join()
+            .map_err(|_| RuntimeError::WorkerPanicked)?;
+        Ok(())
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Mode {
-    Ready,
-    Running,
-    Paused,
-    Interrupted,
+struct StagedEdit {
+    span: Span,
+    new_len: usize,
+    text: String,
 }
 
-pub struct Runtime {
+pub struct Runtime<T, M> {
     text: String,
     parser: Parser,
-    runtime_listener: RuntimeListener,
+    runtime_listener: RuntimeListener<T>,
     cursor: Reparser,
-    receiver: mpsc::Receiver<Action>,
-
-    mode: Mode,
+    semantic_map: Option<IncrementalLowerer<T, M>>,
+    semantic_map_initialized: bool,
+    receiver: mpsc::Receiver<RuntimeRequest>,
+    mode: RuntimeMode,
 }
 
-impl Runtime {
-    fn run_ready_mode(&mut self) {
-        while let Ok(action) = self.receiver.recv() {
-            match action {
-                Action::Run => {
-                    self.mode = Mode::Running;
-                    break;
+impl<T, M> Runtime<T, M>
+where
+    T: Clone + PartialEq + 'static,
+    M: AstMapper<T> + Send + 'static,
+{
+    fn run_event_loop(&mut self) {
+        while let Ok(request) = self.receiver.recv() {
+            let mut result = self.handle_action(request.action);
+            if let Err(error) = result.as_ref() {
+                if let Err(listener_error) = self.emit_error(error) {
+                    result = Err(listener_error);
                 }
-                Action::Exit => {
-                    self.mode = Mode::Interrupted;
-                    self.runtime_listener.on_interrupt.as_ref().map(|listener| {
-                        (listener)();
-                    });
-                    break;
-                }
-                _ => { /* Ignored */ }
             }
-        }
-        if self.mode == Mode::Interrupted {
-            self.runtime_listener.on_interrupt.as_ref().map(|listener| {
-                (listener)();
-            });
-            return;
-        }
-        self.run_running_mode();
-    }
-
-    fn run_running_mode(&mut self) {
-        while let Ok(action) = self.receiver.recv() {
-            match action {
-                Action::Pause => {
-                    self.mode = Mode::Paused;
-                    self.runtime_listener.on_pause.as_ref().map(|listener| {
-                        (listener)();
-                    });
-                    break;
-                }
-                Action::Insert { offset, text } => {
-                    self.runtime_listener
-                        .before_update
-                        .as_ref()
-                        .map(|listener| {
-                            (listener)();
-                        });
-                    let start = std::time::Instant::now();
-                    self.text.insert_str(offset, &text);
-                    let span = Span::new(offset, offset);
-                    let mut metrics = EditMetrics::new();
-                    let result = self.cursor.handle_edit(
-                        &mut self.parser,
-                        span,
-                        text.len(),
-                        &self.text,
-                        Some(&mut metrics),
-                    );
-                    let duration = start.elapsed();
-                    self.runtime_listener.after_update.as_ref().map(|listener| {
-                        (listener)(
-                            UpdateResult::new(
-                                result.messages,
-                                &self.cursor.current,
-                                &result.reparsed_tree,
-                                &self.parser,
-                                &self.text,
-                                result.newly_computed_nodes,
-                                result.newly_computed_tokens,
-                                result.semantic_commands,
-                                metrics,
-                            ),
-                            duration,
-                        );
-                    });
-                }
-                Action::Delete { span } => {
-                    self.runtime_listener
-                        .before_update
-                        .as_ref()
-                        .map(|listener| {
-                            (listener)();
-                        });
-                    let start = std::time::Instant::now();
-                    self.text.replace_range(ops::Range::from(span), "");
-                    let mut metrics = EditMetrics::new();
-                    let result = self.cursor.handle_edit(
-                        &mut self.parser,
-                        span,
-                        0,
-                        &self.text,
-                        Some(&mut metrics),
-                    );
-                    let duration = start.elapsed();
-                    self.runtime_listener.after_update.as_ref().map(|listener| {
-                        (listener)(
-                            UpdateResult::new(
-                                result.messages,
-                                &self.cursor.current,
-                                &result.reparsed_tree,
-                                &self.parser,
-                                &self.text,
-                                result.newly_computed_nodes,
-                                result.newly_computed_tokens,
-                                result.semantic_commands,
-                                metrics,
-                            ),
-                            duration,
-                        );
-                    });
-                }
-                Action::Update { span, text } => {
-                    self.runtime_listener
-                        .before_update
-                        .as_ref()
-                        .map(|listener| {
-                            (listener)();
-                        });
-                    let start = std::time::Instant::now();
-                    let new_len = text.len();
-                    self.text.replace_range(ops::Range::from(span), &text);
-                    let mut metrics = EditMetrics::new();
-                    let result = self.cursor.handle_edit(
-                        &mut self.parser,
-                        span,
-                        new_len,
-                        &self.text,
-                        Some(&mut metrics),
-                    );
-                    let duration = start.elapsed();
-                    self.runtime_listener.after_update.as_ref().map(|listener| {
-                        (listener)(
-                            UpdateResult::new(
-                                result.messages,
-                                &self.cursor.current,
-                                &result.reparsed_tree,
-                                &self.parser,
-                                &self.text,
-                                result.newly_computed_nodes,
-                                result.newly_computed_tokens,
-                                result.semantic_commands,
-                                metrics,
-                            ),
-                            duration,
-                        );
-                    });
-                }
-                Action::Exit => {
-                    self.mode = Mode::Interrupted;
-                    self.runtime_listener.on_interrupt.as_ref().map(|listener| {
-                        (listener)();
-                    });
-                    break;
-                }
-                Action::Run => { /* Already running */ }
-                Action::Resume => { /* Already running */ }
+            let _ = request.reply.send(result);
+            if self.mode == RuntimeMode::Interrupted {
+                break;
             }
-        }
-        if self.mode == Mode::Paused {
-            self.run_paused_mode();
         }
     }
 
-    fn run_paused_mode(&mut self) {
-        while let Ok(action) = self.receiver.recv() {
-            match action {
-                Action::Resume => {
-                    self.mode = Mode::Running;
-                    self.runtime_listener.on_resume.as_ref().map(|listener| {
-                        (listener)();
-                    });
-                    break;
+    fn emit_error(&self, error: &RuntimeError) -> RuntimeResult<()> {
+        if let Some(listener) = self.runtime_listener.on_error.as_ref() {
+            catch_unwind(AssertUnwindSafe(|| (listener)(error))).map_err(|_| {
+                RuntimeError::ListenerPanic {
+                    hook: ListenerHook::OnError,
                 }
-                Action::Exit => {
-                    self.mode = Mode::Interrupted;
-                    self.runtime_listener.on_interrupt.as_ref().map(|listener| {
-                        (listener)();
-                    });
-                    return;
-                }
-                _ => { /* Ignored */ }
+            })?;
+        }
+        Ok(())
+    }
+
+    fn call_simple_listener(
+        &self,
+        hook: ListenerHook,
+        callback: Option<&Box<dyn Fn() + Send>>,
+    ) -> RuntimeResult<()> {
+        let Some(callback) = callback else {
+            return Ok(());
+        };
+        catch_unwind(AssertUnwindSafe(|| (callback)()))
+            .map_err(|_| RuntimeError::ListenerPanic { hook })
+    }
+
+    fn call_after_update_listener(&self, result: UpdateResult<T>) -> RuntimeResult<()> {
+        let Some(listener) = self.runtime_listener.after_update.as_ref() else {
+            return Ok(());
+        };
+        catch_unwind(AssertUnwindSafe(|| (listener)(result))).map_err(|_| {
+            RuntimeError::ListenerPanic {
+                hook: ListenerHook::AfterUpdate,
+            }
+        })
+    }
+
+    fn ensure_mode(&self, expected: RuntimeMode, action: RuntimeAction) -> RuntimeResult<()> {
+        if self.mode == expected {
+            return Ok(());
+        }
+        Err(RuntimeError::InvalidMode {
+            mode: self.mode,
+            action,
+        })
+    }
+
+    fn semantic_delta(&mut self, commands: &[crate::semantic::Command]) -> Option<AstDelta<T>> {
+        let map = self.semantic_map.as_mut()?;
+        if !self.semantic_map_initialized {
+            self.semantic_map_initialized = true;
+            Some(map.initialize_root_with_source(self.cursor.current.green, &self.text))
+        } else {
+            Some(map.apply_parse_delta_with_source(commands, &self.text))
+        }
+    }
+
+    fn semantic_root(&self) -> (Option<ASTCell<T>>, Option<&AstArena<T>>, Option<&T>) {
+        let Some(map) = self.semantic_map.as_ref() else {
+            return (None, None, None);
+        };
+        let arena = map.arena();
+        let root = map.root_ast();
+        let node = root.and_then(|id| arena.get(id));
+        (root, Some(arena), node)
+    }
+
+    fn validate_offset(&self, offset: usize) -> RuntimeResult<()> {
+        if offset <= self.text.len() {
+            return Ok(());
+        }
+        Err(RuntimeError::InvalidOffset {
+            offset,
+            text_len: self.text.len(),
+        })
+    }
+
+    fn validate_span(&self, span: Span) -> RuntimeResult<()> {
+        if span.start <= span.end && span.end <= self.text.len() {
+            return Ok(());
+        }
+        Err(RuntimeError::InvalidRange {
+            start: span.start,
+            end: span.end,
+            text_len: self.text.len(),
+        })
+    }
+
+    fn stage_edit(&self, action: &Action) -> RuntimeResult<StagedEdit> {
+        match action {
+            Action::Insert { offset, text } => {
+                self.validate_offset(*offset)?;
+                let mut next = self.text.clone();
+                next.insert_str(*offset, text);
+                Ok(StagedEdit {
+                    span: Span::new(*offset, *offset),
+                    new_len: text.len(),
+                    text: next,
+                })
+            }
+            Action::Delete { span } => {
+                self.validate_span(*span)?;
+                let mut next = self.text.clone();
+                next.replace_range(ops::Range::from(*span), "");
+                Ok(StagedEdit {
+                    span: *span,
+                    new_len: 0,
+                    text: next,
+                })
+            }
+            Action::Update { span, text } => {
+                self.validate_span(*span)?;
+                let mut next = self.text.clone();
+                next.replace_range(ops::Range::from(*span), text);
+                Ok(StagedEdit {
+                    span: *span,
+                    new_len: text.len(),
+                    text: next,
+                })
+            }
+            Action::Run | Action::Pause | Action::Resume | Action::Exit => {
+                Err(RuntimeError::InvalidMode {
+                    mode: self.mode,
+                    action: action.kind(),
+                })
             }
         }
-        if self.mode == Mode::Running {
-            self.run_running_mode();
+    }
+
+    fn handle_edit_request(&mut self, action: Action) -> RuntimeResult<()> {
+        let staged = self.stage_edit(&action)?;
+
+        self.call_simple_listener(
+            ListenerHook::BeforeUpdate,
+            self.runtime_listener.before_update.as_ref(),
+        )?;
+
+        let mut metrics = EditMetrics::new();
+
+        let previous_messages = self.parser.messages.clone();
+        let previous_nodes = self.parser.newly_computed_nodes.clone();
+        let previous_tokens = self.parser.newly_computed_tokens.clone();
+        let previous_cursor = self.cursor.current.clone();
+
+        let result = match self.cursor.handle_edit(
+            &mut self.parser,
+            staged.span,
+            staged.new_len,
+            &staged.text,
+            Some(&mut metrics),
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                self.parser.set_text(&self.text);
+                self.parser.messages = previous_messages;
+                self.parser.newly_computed_nodes = previous_nodes;
+                self.parser.newly_computed_tokens = previous_tokens;
+                self.cursor.current = previous_cursor;
+                return Err(error.into());
+            }
+        };
+
+        self.text = staged.text;
+
+        let semantic_ir_delta = self.semantic_delta(&result.semantic_commands);
+        let (semantic_ir_root_cell, semantic_ir_arena, semantic_ir_root) = self.semantic_root();
+
+        let update = UpdateResult::new(
+            result.messages,
+            &self.cursor.current,
+            &result.reparsed_tree,
+            &self.parser,
+            &self.text,
+            result.newly_computed_nodes,
+            result.newly_computed_tokens,
+            result.semantic_commands,
+            semantic_ir_delta,
+            semantic_ir_root,
+            semantic_ir_root_cell,
+            semantic_ir_arena,
+            metrics,
+        );
+
+        self.call_after_update_listener(update)
+    }
+
+    fn handle_action(&mut self, action: Action) -> RuntimeResult<()> {
+        match action {
+            Action::Run => {
+                self.ensure_mode(RuntimeMode::Ready, RuntimeAction::Run)?;
+                self.mode = RuntimeMode::Running;
+                Ok(())
+            }
+            Action::Pause => {
+                self.ensure_mode(RuntimeMode::Running, RuntimeAction::Pause)?;
+                self.mode = RuntimeMode::Paused;
+                self.call_simple_listener(
+                    ListenerHook::OnPause,
+                    self.runtime_listener.on_pause.as_ref(),
+                )
+            }
+            Action::Resume => {
+                self.ensure_mode(RuntimeMode::Paused, RuntimeAction::Resume)?;
+                self.mode = RuntimeMode::Running;
+                self.call_simple_listener(
+                    ListenerHook::OnResume,
+                    self.runtime_listener.on_resume.as_ref(),
+                )
+            }
+            Action::Exit => {
+                let call_interrupt = self.mode != RuntimeMode::Interrupted;
+                self.mode = RuntimeMode::Interrupted;
+                if call_interrupt {
+                    self.call_simple_listener(
+                        ListenerHook::OnInterrupt,
+                        self.runtime_listener.on_interrupt.as_ref(),
+                    )?;
+                }
+                Ok(())
+            }
+            edit @ Action::Insert { .. }
+            | edit @ Action::Delete { .. }
+            | edit @ Action::Update { .. } => {
+                self.ensure_mode(RuntimeMode::Running, edit.kind())?;
+                self.handle_edit_request(edit)
+            }
         }
     }
 }
-
-impl_listener!(
-    RuntimeListener,
-    before_update(),
-    after_update(UpdateResult, std::time::Duration),
-    on_pause(),
-    on_resume(),
-    on_interrupt()
-);

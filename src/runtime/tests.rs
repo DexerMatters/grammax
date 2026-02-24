@@ -1,207 +1,180 @@
-use std::thread;
-use std::{fmt::Display, sync::Arc};
-
-use parking_lot::lock_api::Mutex;
-
 use crate::{
     new_grammar,
     parsec::{
         ParserConfig,
         display::{format_ast, format_messages},
         recovery::RecoveryConfig,
-        tree::RedNode,
         words::*,
     },
-    runtime::{Interactive, RuntimeConfig, RuntimeListener},
+    runtime::{Interactive, RuntimeListener},
+    semantic::{ASTCell, MapOutput, RuleMap},
 };
 
 #[test]
 fn test_expr_example() {
-    let grammar = new_grammar!(
-        start where
-        start -> r!(expr) + tt(EndOfInput)
-        expr -> r!(add) | r!(mul) | r!(primary)
-        add  -> r!(primary) + tt("+") + r!(expr)
-        mul  -> r!(primary) + tt("*") + r!(expr)
-        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
-    );
-    println!("===== Grammar =====");
-    println!("{}", grammar.table);
-
-    let listener = RuntimeListener::new()
-        .before_update(|| {
-            eprintln!("Update started...");
-        })
-        .after_update(|result, duration| {
-            eprintln!("Updated source text:\n{}", result.source_text);
-            // eprintln!(
-            //     "Updated parse tree:\n{}",
-            //     result.current_tree.display(&result.current_parser)
-            // );
-            eprintln!(
-                "Reparsed tree:\n{}",
-                format_ast(
-                    &result.current_parser.grammar,
-                    result.reparsed_tree,
-                    &result.current_parser.alloc,
-                    result.current_parser.text(),
-                )
-            );
-            eprintln!("Offset: {}", result.reparsed_tree.offset);
-            eprintln!("Messages:");
-            eprintln!(
-                "{}",
-                format_messages(&result.current_parser.grammar, &result.messages)
-            );
-            eprintln!("Update took: {:?}", duration);
-        });
-    let runtime = Interactive::new(grammar)
-        .with_listener(listener)
-        .with_config(RuntimeConfig {
-            parser: ParserConfig {
-                simple_ast: false,
-                recovery: RecoveryConfig::default(),
-            },
-            ..RuntimeConfig::default()
-        })
-        .finish();
-    runtime.run().unwrap();
-    runtime.insert(0, "1 + 1").unwrap();
-    thread::sleep(std::time::Duration::from_millis(100));
-}
-
-#[test]
-fn test_example() {
     let grammar = new_grammar!(
         json where
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
+        string  -> tt("\"") + t(STRING) + t("\"")
         number  -> tt(NUMS)
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
-    let listener = RuntimeListener::new()
-        .before_update(|| {
-            eprintln!("=== Update started ===");
-        })
-        .after_update(|result, duration| {
-            eprintln!("Updated source text:\n{}", result.source_text);
-            // eprintln!(
-            //     "Updated parse tree:\n{}",
-            //     result.current_tree.display(&result.current_parser)
-            // );
-            eprintln!(
-                "Reparsed parse tree:\n{}",
-                format_ast(
-                    &result.current_parser.grammar,
-                    result.reparsed_tree,
-                    &result.current_parser.alloc,
-                    result.current_parser.text(),
-                )
-            );
 
-            eprintln!("Messages:");
-            eprintln!(
-                "{}",
-                format_messages(&result.current_parser.grammar, &result.messages)
-            );
-            eprintln!("Update took: {:?}", duration);
-        });
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum Json {
+        Object(Vec<(String, ASTCell<JsonPrimitive>)>),
+        Error,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum JsonPrimitive {
+        Null,
+        Boolean(bool),
+        Number(u64),
+        Array(Vec<ASTCell<Json>>),
+        String(String),
+    }
+
+    let expr_map = RuleMap::new()
+        .on_rule("object", |cx| {
+            let entries = cx
+                .next_each_rule("pair")
+                .map(|mut pair| {
+                    let _ = pair.step_in();
+                    let _ = pair.next_field("key");
+                    let key = pair.text_trimmed().trim_matches('"').to_string();
+                    let _ = pair.next_field("value");
+                    let value = pair.mapped::<JsonPrimitive>();
+                    let _ = pair.step_out();
+                    (key, value)
+                })
+                .collect();
+            MapOutput::node(Json::Object(entries))
+        })
+        .on_rule("null", |_| MapOutput::node(JsonPrimitive::Null))
+        .on_rule("boolean", |cx| {
+            let text = cx.text_trimmed();
+            let value = text == "true";
+            MapOutput::node(JsonPrimitive::Boolean(value))
+        })
+        .on_rule("number", |cx| {
+            MapOutput::node(JsonPrimitive::Number(
+                cx.text_trimmed().parse().unwrap_or(0),
+            ))
+        })
+        .on_rule("string", |cx| {
+            let text = cx.text_trimmed();
+            let value = text
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(text)
+                .to_string();
+            MapOutput::node(JsonPrimitive::String(value))
+        })
+        .on_rule("array", |cx| {
+            MapOutput::node(JsonPrimitive::Array(cx.mapped_children().collect()))
+        })
+        .on_error(|_| MapOutput::node(Json::Error));
+
+    let listener = RuntimeListener::new().after_update(move |result| {
+        println!("> Updated source: {}", result.source_text);
+        println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
+        println!("> Duration: {}µs", result.metrics.total_duration_us);
+        println!("> Metrics: {:#?}", result.metrics);
+    });
 
     let runtime = Interactive::new(grammar)
+        .with_map::<Json, _>(expr_map)
         .with_listener(listener)
         .with_parser_config(ParserConfig {
             simple_ast: true,
             recovery: RecoveryConfig::default(),
         })
         .finish();
+
     runtime.run().unwrap();
-    runtime.insert(0, r#"{"name": dDexerd}"#).unwrap();
-    runtime.insert(16, r#", "age": 30"#).unwrap();
-    runtime.delete(16, 27).unwrap();
-    runtime.insert(3, "x").unwrap();
-    println!("====Inserted 'x' at offset 3");
-    runtime.insert(3, "x").unwrap();
-
-    thread::sleep(std::time::Duration::from_millis(10000));
-}
-
-#[derive(Debug, Clone, PartialEq)]
-enum Expr {
-    Add(Box<Expr>, Box<Expr>),
-    Mul(Box<Expr>, Box<Expr>),
-    Num(i64),
-    Error,
-}
-
-fn eval(expr: &Expr) -> Expr {
-    match expr {
-        Expr::Add(l, r) => match (eval(l), eval(r)) {
-            (Expr::Num(lv), Expr::Num(rv)) => Expr::Num(lv + rv),
-            (x, y) => Expr::Add(Box::new(x), Box::new(y)),
-        },
-        Expr::Mul(l, r) => match (eval(l), eval(r)) {
-            (Expr::Num(lv), Expr::Num(rv)) => Expr::Num(lv * rv),
-            (x, y) => Expr::Mul(Box::new(x), Box::new(y)),
-        },
-        Expr::Num(n) => Expr::Num(*n),
-        Expr::Error => Expr::Error,
-    }
-}
-
-impl Display for Expr {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Expr::Add(l, r) => write!(f, "({} + {})", l, r),
-            Expr::Mul(l, r) => write!(f, "({} * {})", l, r),
-            Expr::Num(n) => write!(f, "{}", n),
-            Expr::Error => write!(f, "<error>"),
-        }
-    }
+    runtime
+        .insert(
+            0,
+            r#"{
+                "name": "Alice",
+                "age": 30,
+                "isStudent": false,
+                "courses": ["Math", "Science"],
+                "address": {
+                    "street": "123 Main St",
+                    "city": "Anytown"
+                },
+                "nullValue": null
+            }"#,
+        )
+        .unwrap();
+    runtime.insert(1, r#" "good" : 123, "#).unwrap();
+    runtime.insert(2, r#" "bad": [true, false, 44], "#).unwrap();
+    runtime.exit().unwrap();
+    runtime.join().unwrap();
 }
 
 #[test]
 fn test_semantic_commands() {
-    let grammar = new_grammar!(
+    let expr_grammar = new_grammar!(
         start where
         start -> r!(expr) + tt(EndOfInput)
         expr -> r!(add) | r!(mul) | r!(primary)
-        add  -> r!(expr) + tt("+") + r!(expr).drop(1)
-        mul  -> r!(expr).drop(1) + tt("*") + r!(expr).drop(2)
+        add  -> field("lhs", r!(expr)) + tt("+") + field("rhs", r!(expr).drop(1))
+        mul  -> field("lhs", r!(expr).drop(1)) + tt("*") + field("rhs", r!(expr).drop(2))
         primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum ExprIr {
+        Number(u64),
+        Add(ASTCell<ExprIr>, ASTCell<ExprIr>),
+        Mul(ASTCell<ExprIr>, ASTCell<ExprIr>),
+        Error,
+    }
 
-    let listener = RuntimeListener::new().after_update(move |result, duration| {
-        println!("=== After Update ===");
-        println!("Duration (wall): {:?}", duration);
-        println!("{}", result.metrics.summary());
-        println!("Source Text:\n{}", result.source_text);
+    fn expr_map() -> RuleMap<ExprIr> {
+        RuleMap::new()
+            .on_rule("add", |mut cx| {
+                let _ = cx.step_in();
+                let _ = cx.next_field("lhs");
+                let lhs = cx.mapped();
+                let _ = cx.next_field("rhs");
+                let rhs = cx.mapped();
+                let _ = cx.step_out();
+                MapOutput::node(ExprIr::Add(lhs, rhs))
+            })
+            .on_rule("mul", |mut cx| {
+                let _ = cx.step_in();
+                let _ = cx.next_field("lhs");
+                let lhs = cx.mapped();
+                let _ = cx.next_field("rhs");
+                let rhs = cx.mapped();
+                let _ = cx.step_out();
+                MapOutput::node(ExprIr::Mul(lhs, rhs))
+            })
+            .on_rule("primary", |mut cx| {
+                if cx.step_in() && cx.next_rule("expr") {
+                    MapOutput::alias(cx.mapped::<ExprIr>())
+                } else {
+                    MapOutput::node(ExprIr::Number(cx.text_trimmed().parse().unwrap_or(0)))
+                }
+            })
+            .on_error(|_cx| MapOutput::node(ExprIr::Error))
+    }
 
-        for cmd in &result.semantic_commands {
-            match cmd {
-                crate::semantic::Command::Create(id, name) => {
-                    eprintln!("Applied command: Create({}, \"{}\")", id, name);
-                }
-                crate::semantic::Command::CreateToken(id, val) => {
-                    eprintln!("Applied command: CreateToken({}, \"{}\")", id, val);
-                }
-                crate::semantic::Command::Replace(old_id, new_id) => {
-                    eprintln!("Applied command: Replace({}, {})", old_id, new_id);
-                }
-                crate::semantic::Command::Delete(id) => {
-                    eprintln!("Applied command: Delete({})", id);
-                }
-                crate::semantic::Command::Insert(parent_id, child_id) => {
-                    eprintln!("Applied command: Insert({}, {})", parent_id, child_id);
-                }
-            }
-        }
+    let listener = RuntimeListener::new().after_update(move |result| {
+        println!("> Updated source: {}", result.source_text);
+        println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
+        println!("> Duration: {}µs", result.metrics.total_duration_us);
     });
 
-    let runtime = Interactive::new(grammar)
+    let runtime = Interactive::new(expr_grammar)
+        .with_map::<ExprIr, _>(expr_map())
         .with_listener(listener)
         .with_parser_config(ParserConfig {
             simple_ast: true,
@@ -214,5 +187,6 @@ fn test_semantic_commands() {
     runtime.update(0, 1, "3 * 5").unwrap();
     runtime.insert(0, "2 + 2 + ").unwrap();
     runtime.delete(0, 4).unwrap();
-    thread::sleep(std::time::Duration::from_millis(100));
+    runtime.exit().unwrap();
+    runtime.join().unwrap();
 }

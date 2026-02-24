@@ -43,7 +43,7 @@ pub(crate) struct StrategyContext<'a> {
     pub metrics: Option<&'a mut EditMetrics>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EditKind {
     Insertion,
     Deletion,

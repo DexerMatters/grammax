@@ -1,11 +1,11 @@
 use crate::grammar::analysis::{Action, EOF_TOKEN, GrammarStateAnalysis};
 use crate::grammar::ir::Production;
 use crate::parsec::words::MatcherRef;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
-use rustc_hash::FxHashMap;
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
 const MAX_NULLABLE_SHIFT_LEN: usize = 4;
@@ -350,9 +350,7 @@ pub fn recover(
             // Generate neighbors using →CR rules (Figure 5)
 
             // CR Shift (up to 1 shift at a time, per CR Shift 3)
-            if let Some(next) =
-                cr_shift(analysis, productions, terminals, &token_stream, &cfg)
-            {
+            if let Some(next) = cr_shift(analysis, productions, terminals, &token_stream, &cfg) {
                 if next.cost < buckets.len() {
                     buckets[next.cost].push_back(next);
                 }

@@ -8,6 +8,7 @@ use std::{
 
 use crate::{
     grammar::Grammar,
+    interface::Interface,
     parsec::{self, Parser, ParserConfig, ParserListener, msg::ParserMessages, tree::RedNode},
     runtime::reparser::{ReparseError, Reparser},
     semantic::{ASTCell, AstArena, AstDelta, AstMapper, IncrementalLowerer},
@@ -18,15 +19,14 @@ mod metrics;
 mod reparser;
 mod strategy;
 
-pub mod sources;
-
 pub use metrics::EditMetrics;
 pub use reparser::ReparserConfig;
+use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Action {
     Insert { offset: usize, text: String },
     Delete { span: Span },
@@ -124,6 +124,8 @@ impl From<ReparseError> for RuntimeError {
         }
     }
 }
+
+pub enum RuntimeResultKind {}
 
 pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
@@ -274,6 +276,7 @@ pub struct Interactive<T = (), M = ()> {
     runtime_listener: Option<RuntimeListener<T>>,
     parser_listener: Option<ParserListener>,
     semantic_map: Option<M>,
+    interface: Option<Box<dyn Interface>>,
     _semantic_ty: PhantomData<T>,
 }
 
@@ -285,6 +288,7 @@ impl Interactive<(), ()> {
             runtime_listener: None,
             parser_listener: None,
             semantic_map: None,
+            interface: None,
             _semantic_ty: PhantomData,
         }
     }
@@ -304,6 +308,7 @@ impl Interactive<(), ()> {
             runtime_listener: None,
             parser_listener: self.parser_listener,
             semantic_map: Some(map),
+            interface: self.interface,
             _semantic_ty: PhantomData,
         }
     }
@@ -356,6 +361,14 @@ where
         self
     }
 
+    pub fn with_interface<I: Interface + 'static>(mut self, interface: I) -> Self
+    where
+        I: Source,
+    {
+        self.interface = Some(Box::new(interface));
+        self
+    }
+
     pub fn finish(self) -> InteractiveInstance {
         InteractiveInstance::init(
             self.grammar,
@@ -363,11 +376,12 @@ where
             self.runtime_listener.unwrap_or_default(),
             self.parser_listener.unwrap_or_default(),
             self.semantic_map,
+            self.interface,
         )
     }
 }
 
-struct RuntimeRequest {
+pub struct RuntimeRequest {
     action: Action,
     reply: mpsc::Sender<RuntimeResult<()>>,
 }
@@ -384,6 +398,7 @@ impl InteractiveInstance {
         runtime_listener: RuntimeListener<T>,
         parser_listener: ParserListener,
         semantic_map: Option<M>,
+        interface: Option<Box<dyn Interface>>,
     ) -> Self
     where
         T: Clone + PartialEq + 'static,
@@ -416,6 +431,10 @@ impl InteractiveInstance {
             };
             runtime.run_event_loop();
         });
+
+        if let Some(mut interface) = interface {
+            interface.start(sender.clone());
+        }
 
         Self {
             sender,

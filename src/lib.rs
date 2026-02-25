@@ -6,7 +6,8 @@ pub mod utils;
 
 pub mod semantic;
 
-pub mod ui;
+#[cfg(any(feature = "webui", feature = "vsclsp"))]
+pub mod interface;
 
 #[cfg(test)]
 mod tests {

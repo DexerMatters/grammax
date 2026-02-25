@@ -1,25 +1,29 @@
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::VecDeque;
 
+use serde::{Deserialize, Serialize};
+
 use crate::grammar::ir::{Production, Symbol};
 use crate::grammar::norm::RuleTable;
 
 pub const EOF_TOKEN: usize = usize::MAX;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Action {
     Shift(usize),
     Reduce(usize), // Production index
     Accept,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LRState {
+    #[serde(with = "crate::grammar::cache::serde_fxhashmap")]
     pub actions: FxHashMap<usize, Action>, // terminal_idx -> Action
-    pub goto: FxHashMap<usize, usize>,     // rule_idx -> state_idx
+    #[serde(with = "crate::grammar::cache::serde_fxhashmap")]
+    pub goto: FxHashMap<usize, usize>, // rule_idx -> state_idx
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GrammarStateAnalysis {
     pub states: Vec<LRState>,
     pub start_state: usize,

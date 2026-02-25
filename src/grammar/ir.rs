@@ -1,5 +1,7 @@
 use std::ops;
 
+use serde::{Deserialize, Serialize};
+
 use crate::parsec::words::MatcherRef;
 
 /// Normalized representation of grammar after desugaring
@@ -75,7 +77,7 @@ pub struct Production {
     pub field_positions: Vec<(usize, &'static str)>, // (position, field_name)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Symbol {
     Terminal(usize),    // Index into terminal table
     NonTerminal(usize), // Rule index

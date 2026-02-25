@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use serde::{Deserialize, Serialize};
 use std::hash::Hash;
 use std::ops;
 
@@ -189,7 +190,7 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
     pub start: usize,
     pub end: usize,

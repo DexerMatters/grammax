@@ -1,10 +1,15 @@
 pub(crate) mod analysis;
+pub(crate) mod cache;
 pub mod display;
 pub mod dsl;
 pub(crate) mod ir;
 pub(crate) mod norm;
 pub(crate) mod recovery;
 
+use std::fs;
+use std::hash::{Hash, Hasher};
+use std::io;
+use std::path::Path;
 use std::sync::Arc;
 
 use rustc_hash::FxHashMap;
@@ -43,20 +48,28 @@ pub enum GrammarInfo {
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,
-    /// Pre-warmed incremental LR analyses for every non-start rule.
-    /// Built once at grammar construction time so no parse path ever pays
-    /// LR-table-construction cost at runtime.
     pub(crate) rule_analyses: FxHashMap<usize, Arc<analysis::GrammarStateAnalysis>>,
 }
 
 impl Grammar {
     pub fn new(node: dsl::GrammarNode, start_rule: &'static str) -> Self {
+        let cache_key = Self::cache_key_from_dsl(&node, start_rule);
+        if let Some(grammar) = cache::load(cache_key) {
+            return grammar;
+        }
+
+        let grammar = Self::new_uncached(node, start_rule);
+
+        let _ = cache::store(cache_key, &grammar);
+        grammar
+    }
+
+    pub fn new_uncached(node: dsl::GrammarNode, start_rule: &'static str) -> Self {
         let table = norm::RuleTable::normalize(node, start_rule);
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
             table.start_rule,
         ));
-
         let rule_analyses = Self::build_rule_analyses(&table);
 
         Self {
@@ -101,6 +114,77 @@ impl Grammar {
         map
     }
 
+    fn cache_key_from_dsl(node: &dsl::GrammarNode, start_rule: &'static str) -> u64 {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        start_rule.hash(&mut hasher);
+        Self::hash_dsl_node(node, &mut hasher);
+
+        hasher.finish()
+    }
+
+    fn hash_dsl_node(
+        node: &dsl::GrammarNode,
+        hasher: &mut std::collections::hash_map::DefaultHasher,
+    ) {
+        use dsl::GrammarNode;
+
+        match node {
+            GrammarNode::Terminal(matcher) => {
+                0u8.hash(hasher);
+                matcher.display().hash(hasher);
+                matcher.preview().hash(hasher);
+                matcher.is_nullable().hash(hasher);
+                matcher.is_consuming().hash(hasher);
+            }
+            GrammarNode::Alternative(nodes) => {
+                1u8.hash(hasher);
+                nodes.len().hash(hasher);
+                for child in nodes {
+                    Self::hash_dsl_node(child, hasher);
+                }
+            }
+            GrammarNode::Sequence(nodes) => {
+                2u8.hash(hasher);
+                nodes.len().hash(hasher);
+                for child in nodes {
+                    Self::hash_dsl_node(child, hasher);
+                }
+            }
+            GrammarNode::Reference(_, name) => {
+                3u8.hash(hasher);
+                name.hash(hasher);
+            }
+            GrammarNode::Field(name, inner) => {
+                4u8.hash(hasher);
+                name.hash(hasher);
+                Self::hash_dsl_node(inner, hasher);
+            }
+            GrammarNode::Drop { node, count } => {
+                5u8.hash(hasher);
+                count.hash(hasher);
+                Self::hash_dsl_node(node, hasher);
+            }
+            GrammarNode::Repetition { node, min, max } => {
+                6u8.hash(hasher);
+                min.hash(hasher);
+                max.hash(hasher);
+                Self::hash_dsl_node(node, hasher);
+            }
+            GrammarNode::SeparatedRepetition {
+                node,
+                separator,
+                min,
+                max,
+            } => {
+                7u8.hash(hasher);
+                min.hash(hasher);
+                max.hash(hasher);
+                Self::hash_dsl_node(node, hasher);
+                Self::hash_dsl_node(separator, hasher);
+            }
+        }
+    }
+
     pub fn name(&self, rule_idx: usize) -> &'static str {
         self.table
             .rules
@@ -117,6 +201,19 @@ impl Grammar {
             panic!("Rule '{}' not found in grammar", rule_name);
         }
         self
+    }
+
+    /// Load a grammar from a .gmx file.
+    pub fn load_from(path: &Path) -> io::Result<Self> {
+        let bytes = fs::read(path)?;
+        cache::deserialize_grammar_file(&bytes)
+    }
+
+    /// Save this grammar to a .gmx file.
+    pub fn save_to(&self, path: &Path) -> io::Result<()> {
+        let bytes = cache::serialize_grammar_file(self)?;
+        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        fs::write(path, bytes)
     }
 }
 

@@ -6,8 +6,13 @@ edition = "2024"
 [dependencies]
 internment = { version = "0.8.6", features = ["arena"] }
 rustc-hash = "2.1.0"
-warp = { version = "0.4.2", optional = true }
+serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3"
+rouille = { version = "3.6.2", optional = true }
+clap = { version = "4.5.60", features = ["derive"] }
+color-print = "0.3.7"
+
 
 [features]
-webui = ["dep:warp"]
+webui = ["dep:rouille"]
 vsclsp = []

@@ -145,6 +145,9 @@ impl Reparser {
         let old_messages = parser.messages.clone();
         let old_text = parser.text().to_string();
         parser.messages.clear();
+        // Prime reuse cache with the OLD tree using the OLD text (content-addressed),
+        // so unchanged subtrees are cache-hits when parse_rule runs on the new text.
+        parser.prime_reuse_from_tree(self.current.green, 0);
         parser.newly_computed_nodes.clear();
         parser.newly_computed_tokens.clear();
         parser.set_text(source_text);
@@ -156,7 +159,7 @@ impl Reparser {
         let specs = parser.recovery_specs().cloned();
         let strategy = parser.recovery_strategy().cloned();
 
-        let search_span = span;
+        let seRch_span = span;
         let edit_span = if span.len() == 0 {
             Span::new(span.start, span.start + new_len)
         } else {
@@ -172,7 +175,7 @@ impl Reparser {
         let mut zippers = Vec::new();
         collect_from(
             focus_node,
-            search_span,
+            seRch_span,
             &self.alloc,
             &mut steps,
             level,
@@ -188,10 +191,10 @@ impl Reparser {
         }
 
         if zippers.is_empty() {
-            // Fallback: If focus node based search failed (rare), try from root
+            // Fallback: If focus node based seRch failed (rare), try from root
             self.ascend_to_root();
             zippers =
-                collect_affected_zippers(self.current.clone(), search_span, &self.alloc, parser);
+                collect_affected_zippers(self.current.clone(), seRch_span, &self.alloc, parser);
 
             if let Some(m) = &mut metrics {
                 m.candidates_collected = zippers.len();
@@ -299,9 +302,8 @@ impl Reparser {
         if let Some(m) = &mut metrics {
             m.used_incremental_path = true;
         }
-        let old_root_green = Self::root_green_of(&candidate.zipper.node);
-        let (_updated_node, root) = candidate.zipper.replace_green(&self.alloc, candidate.green);
-        self.current = root;
+        let replaced = candidate.zipper.replace_green(&self.alloc, candidate.green);
+        self.current = replaced.root.clone();
 
         // Merge messages: keep old messages outside the replaced range (shifted if needed)
         // and add new messages from the candidate.
@@ -358,8 +360,11 @@ impl Reparser {
             None
         };
 
-        let semantic_commands =
-            self.generate_commands_incremental(old_root_green, self.current.green);
+        let semantic_commands = self.generate_commands_incremental(
+            &candidate.zipper,
+            candidate.green,
+            &replaced.ancestor_greens,
+        );
 
         if let Some(m) = &mut metrics {
             m.semantic_commands_emitted = semantic_commands.len();
@@ -626,38 +631,32 @@ impl Reparser {
 
     fn generate_commands_incremental(
         &self,
-        old_root_green: usize,
-        new_root_green: usize,
+        zipper: &Zipper,
+        replacement_green: usize,
+        ancestor_greens: &[usize],
     ) -> Vec<Command> {
-        self.generate_root_replace_commands(old_root_green, new_root_green)
-    }
-
-    fn generate_root_replace_commands(
-        &self,
-        old_root_green: usize,
-        new_root_green: usize,
-    ) -> Vec<Command> {
-        if old_root_green == new_root_green {
-            return Vec::new();
+        if zipper.steps.is_empty() {
+            return vec![Command::TreeChanged {
+                changed_green: replacement_green,
+                changed_offset: zipper.offset,
+                lineage: Vec::new(),
+                new_root: replacement_green,
+            }];
         }
-        vec![
-            Command::CreateGreen {
-                green: new_root_green,
-            },
-            Command::ReplaceGreen {
-                parent_green: None,
-                child_index: 0,
-                new_green: new_root_green,
-            },
-        ]
-    }
 
-    fn root_green_of(node: &Rc<RedNode>) -> usize {
-        let mut current = Rc::clone(node);
-        while let Some(parent) = &current.parent {
-            current = Rc::clone(parent);
+        let mut lineage = Vec::with_capacity(zipper.steps.len());
+        for step_ix in (0..zipper.steps.len()).rev() {
+            let step = &zipper.steps[step_ix];
+            let parent_green = ancestor_greens[step_ix];
+            lineage.push((parent_green, step.child_idx));
         }
-        current.green
+
+        vec![Command::TreeChanged {
+            changed_green: replacement_green,
+            changed_offset: zipper.offset,
+            lineage,
+            new_root: ancestor_greens[0],
+        }]
     }
 }
 
@@ -678,32 +677,60 @@ pub struct Zipper {
 }
 
 impl Zipper {
-    pub fn replace_green(
-        &self,
-        alloc: &TreeAllocRef,
-        new_green: usize,
-    ) -> (Rc<RedNode>, Rc<RedNode>) {
-        let mut updated_node = self.node.clone();
-        Rc::make_mut(&mut updated_node).green = new_green;
-
-        let mut current = updated_node.clone();
-        for step in self.steps.iter().rev() {
-            let mut parent = step.parent.clone();
-            let (parent_tag, mut children) = {
-                let parent_green = alloc.get_node(parent.green);
-                (parent_green.tag.clone(), parent_green.children.clone())
+    pub fn replace_green(&self, alloc: &TreeAllocRef, new_green: usize) -> ReplaceResult {
+        if self.steps.is_empty() {
+            let updated_root = Rc::new(RedNode {
+                parent: None,
+                offset: self.offset,
+                green: new_green,
+            });
+            return ReplaceResult {
+                root: updated_root,
+                ancestor_greens: Vec::new(),
             };
-            children[step.child_idx] = current.green;
-
-            let new_width: usize = children.iter().map(|&c| alloc.get_node(c).width).sum();
-            let new_parent_green = alloc.alloc(parent_tag, children, new_width);
-
-            Rc::make_mut(&mut parent).green = new_parent_green;
-            current = parent;
         }
 
-        (updated_node, current)
+        let mut ancestor_greens = vec![0usize; self.steps.len()];
+        let mut child_green = new_green;
+
+        for (ix, step) in self.steps.iter().enumerate().rev() {
+            let (parent_tag, mut children) = {
+                let parent_green = alloc.get_node(step.parent.green);
+                (parent_green.tag.clone(), parent_green.children.clone())
+            };
+            children[step.child_idx] = child_green;
+            let new_width: usize = children.iter().map(|&c| alloc.get_node(c).width).sum();
+            let new_parent_green = alloc.alloc(parent_tag, children, new_width);
+            ancestor_greens[ix] = new_parent_green;
+            child_green = new_parent_green;
+        }
+
+        let root = Rc::new(RedNode {
+            parent: None,
+            offset: self.steps[0].parent.offset,
+            green: ancestor_greens[0],
+        });
+
+        let mut chain_parent = root.clone();
+        for (ix, step) in self.steps.iter().enumerate().skip(1) {
+            let next = Rc::new(RedNode {
+                parent: Some(chain_parent),
+                offset: step.parent.offset,
+                green: ancestor_greens[ix],
+            });
+            chain_parent = next;
+        }
+
+        ReplaceResult {
+            root,
+            ancestor_greens,
+        }
     }
+}
+
+struct ReplaceResult {
+    root: Rc<RedNode>,
+    ancestor_greens: Vec<usize>,
 }
 
 pub fn collect_affected_zippers(

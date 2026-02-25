@@ -180,15 +180,18 @@ fn evaluate_candidate(
         None
     };
 
-    let new_green = ctx
+    let parse_result = ctx
         .parser
-        .parse_rule(zipper.rule_ix, zipper.offset, expected_width)?;
+        .parse_rule(zipper.rule_ix, zipper.offset, expected_width);
 
+    // Stop timer before early-return so failed parses are also measured.
     if let Some(m) = &mut ctx.metrics {
         if let Some(start) = parse_start {
             m.parse_rule_total_us += start.elapsed().as_micros();
         }
     }
+
+    let new_green = parse_result?;
 
     let new_width = {
         let new_node = ctx.parser.alloc.get_node(new_green);

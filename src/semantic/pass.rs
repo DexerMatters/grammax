@@ -913,6 +913,10 @@ where
         self.root_ast
     }
 
+    pub fn has_parse_node(&self, green: GreenId) -> bool {
+        self.parse_nodes.contains_key(&green)
+    }
+
     pub fn initialize_root(&mut self, root_green: GreenId) -> AstDelta<T> {
         self.initialize_root_with_source(root_green, "")
     }
@@ -939,15 +943,128 @@ where
         commands: &[Command],
         source_text: &str,
     ) -> AstDelta<T> {
+        if let [
+            Command::TreeChanged {
+                changed_green,
+                changed_offset,
+                lineage,
+                new_root,
+            },
+        ] = commands
+        {
+            return self.apply_tree_changed(
+                *changed_green,
+                *changed_offset,
+                lineage,
+                *new_root,
+                source_text,
+            );
+        }
+
         let mut ops = Vec::new();
-        let mut recompute_starts = FxHashSet::default();
+        let mut recompute_starts = Vec::new();
+        let mut seen_recompute = FxHashSet::default();
         for command in commands {
             if let Some(start) = self.apply_command(command, &mut ops) {
-                recompute_starts.insert(start);
+                if seen_recompute.insert(start) {
+                    recompute_starts.push(start);
+                }
             }
         }
         for start in recompute_starts {
-            self.recompute_lineage(start, &mut ops, source_text);
+            if self.parse_nodes.contains_key(&start) {
+                self.recompute_lineage(start, &mut ops, source_text);
+            }
+        }
+
+        let next_root = self.root_green.and_then(|green| {
+            self.parse_nodes
+                .get(&green)
+                .and_then(|memo| memo.binding.cell())
+                .filter(|id| id.arena_ty == Some(type_name::<T>()))
+        });
+
+        if next_root != self.root_ast {
+            self.root_ast = next_root;
+            ops.push(AstDeltaOp::SetRoot { root: next_root });
+        }
+
+        AstDelta {
+            root: self.root_ast,
+            ops,
+        }
+    }
+
+    fn apply_tree_changed(
+        &mut self,
+        changed_green: GreenId,
+        changed_offset: usize,
+        lineage: &[(GreenId, usize)],
+        new_root: GreenId,
+        source_text: &str,
+    ) -> AstDelta<T> {
+        let mut ops = Vec::new();
+        let old_root = self.root_green;
+
+        self.ensure_parse_subtree(changed_green, changed_offset);
+
+        let mut child = changed_green;
+        let mut child_offset = changed_offset;
+        for &(parent_green, child_index) in lineage {
+            let children = self.alloc.get_node(parent_green).children.clone();
+            let prefix_width: usize = children
+                .iter()
+                .take(child_index)
+                .map(|&green| self.alloc.get_node(green).width)
+                .sum();
+            let parent_offset = child_offset.saturating_sub(prefix_width);
+
+            match self.parse_nodes.get_mut(&parent_green) {
+                Some(memo) => {
+                    memo.children = children.clone();
+                    memo.offset = parent_offset;
+                }
+                None => {
+                    self.parse_nodes.insert(
+                        parent_green,
+                        ParseMemo {
+                            children: children.clone(),
+                            offset: parent_offset,
+                            binding: AstBinding::None,
+                        },
+                    );
+                }
+            }
+
+            self.add_parent(child, parent_green);
+            for &sibling in &children {
+                if sibling != child {
+                    self.add_parent(sibling, parent_green);
+                }
+            }
+
+            child = parent_green;
+            child_offset = parent_offset;
+        }
+
+        self.root_green = Some(new_root);
+        if self.parse_nodes.contains_key(&new_root) {
+            if let Some(root_memo) = self.parse_nodes.get_mut(&new_root) {
+                root_memo.offset = 0;
+            }
+        } else {
+            self.ensure_parse_subtree(new_root, 0);
+        }
+
+        if let Some(previous_root) = old_root {
+            if previous_root != new_root {
+                self.prune_unreachable(previous_root, &mut ops);
+            }
+        }
+
+        self.recompute_one(changed_green, &mut ops, source_text);
+        for &(parent_green, _) in lineage {
+            self.recompute_one(parent_green, &mut ops, source_text);
         }
 
         let next_root = self.root_green.and_then(|green| {
@@ -1040,6 +1157,50 @@ where
                 self.refresh_offsets(*parent_green);
                 Some(*parent_green)
             }
+            Command::PathUpdate { path } => {
+                // Path contains (parent_green: Option, child_idx, new_green)
+                // Apply updates sequentially, starting from root and working down
+                let mut last_updated = None;
+                for (parent_opt, child_idx, new_green) in path.iter() {
+                    match parent_opt {
+                        Some(parent) => {
+                            // Ensure the new green node's subtree exists in parse_nodes
+                            let child_offset = self.child_offset(*parent, *child_idx);
+                            self.ensure_parse_subtree(*new_green, child_offset);
+                            let old_child = std::mem::replace(
+                                &mut self.memo_mut(*parent).children[*child_idx],
+                                *new_green,
+                            );
+                            self.remove_parent(old_child, *parent);
+                            self.add_parent(*new_green, *parent);
+                            if self.parent_count(old_child) == 0
+                                && self.root_green != Some(old_child)
+                            {
+                                self.prune_unreachable(old_child, ops);
+                            }
+                            self.refresh_offsets(*parent);
+                            last_updated = Some(*parent);
+                        }
+                        None => {
+                            // Root update
+                            self.ensure_parse_subtree(*new_green, 0);
+                            if let Some(old_root) = self.root_green.replace(*new_green) {
+                                if old_root != *new_green {
+                                    self.prune_unreachable(old_root, ops);
+                                }
+                            }
+                            last_updated = Some(*new_green);
+                        }
+                    }
+                }
+                last_updated
+            }
+            Command::TreeChanged {
+                changed_green: _,
+                changed_offset: _,
+                lineage: _,
+                new_root: _,
+            } => None,
         }
     }
 
@@ -1223,16 +1384,20 @@ where
 
     #[inline]
     fn memo(&self, green: GreenId) -> &ParseMemo<T> {
-        self.parse_nodes
-            .get(&green)
-            .expect("well-formed command stream should reference existing parse nodes")
+        self.parse_nodes.get(&green).unwrap_or_else(|| {
+            panic!(
+                "well-formed command stream should reference existing parse nodes (missing green={green})"
+            )
+        })
     }
 
     #[inline]
     fn memo_mut(&mut self, green: GreenId) -> &mut ParseMemo<T> {
-        self.parse_nodes
-            .get_mut(&green)
-            .expect("well-formed command stream should reference existing parse nodes")
+        self.parse_nodes.get_mut(&green).unwrap_or_else(|| {
+            panic!(
+                "well-formed command stream should reference existing parse nodes (missing green={green})"
+            )
+        })
     }
 
     fn add_parent(&mut self, child: GreenId, parent: GreenId) {

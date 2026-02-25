@@ -1,11 +1,6 @@
 use crate::{
     new_grammar,
-    parsec::{
-        ParserConfig,
-        display::{format_ast, format_messages},
-        recovery::RecoveryConfig,
-        words::*,
-    },
+    parsec::{ParserConfig, recovery::RecoveryConfig, words::*},
     runtime::{Interactive, RuntimeListener},
     semantic::{ASTCell, MapOutput, RuleMap},
 };
@@ -81,9 +76,10 @@ fn test_expr_example() {
         .on_error(|_| MapOutput::node(Json::Error));
 
     let listener = RuntimeListener::new().after_update(move |result| {
-        println!("> Updated source: {}", result.source_text);
+        println!("==== Updated source: {}", result.source_text);
         println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
         println!("> Duration: {}µs", result.metrics.total_duration_us);
+        println!("> Commands: {:?}", result.semantic_commands);
         println!("> Metrics: {:#?}", result.metrics);
     });
 
@@ -171,6 +167,8 @@ fn test_semantic_commands() {
         println!("> Updated source: {}", result.source_text);
         println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
         println!("> Duration: {}µs", result.metrics.total_duration_us);
+        println!("> Commands: {:?}", result.semantic_commands);
+        println!("> Metrics: {:#?}", result.metrics);
     });
 
     let runtime = Interactive::new(expr_grammar)

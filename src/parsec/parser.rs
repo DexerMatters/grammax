@@ -100,7 +100,7 @@ pub struct Parser {
     // For incremental/reparsing (stubs)
     inc_insert_pos: Option<usize>,
     string_opened: bool,
-    rule_analyses: FxHashMap<usize, Arc<GrammarStateAnalysis>>,
+    // rule_analyses is pre-warmed on Grammar; no per-parser cache needed.
     recovery_profile: RecoveryProfile,
     reuse_enabled: bool,
     reuse_cache_failures: bool,
@@ -124,7 +124,7 @@ impl Parser {
             pos: 0,
             inc_insert_pos: None,
             string_opened: false,
-            rule_analyses: FxHashMap::default(),
+
             recovery_profile,
             reuse_enabled: true,
             reuse_cache_failures: true,
@@ -688,33 +688,17 @@ impl Parser {
         Some(parsed_rule_green)
     }
 
-    fn analysis_for_rule(&mut self, rule_ix: usize) -> Arc<GrammarStateAnalysis> {
+    fn analysis_for_rule(&self, rule_ix: usize) -> Arc<GrammarStateAnalysis> {
         if rule_ix == self.grammar.table.start_rule {
             return Arc::clone(&self.grammar.analysis);
         }
-
-        if let Some(analysis) = self.rule_analyses.get(&rule_ix) {
-            return Arc::clone(analysis);
-        }
-
-        let mut table = self.grammar.table.clone();
-        let wrapper_ix = table.rules.len();
-        table.rules.push(RuleInfo {
-            name: "$inc_root",
-            description: "$inc_root",
-            node: NormalizedNode::Reference(rule_ix),
-            is_expression: false,
-        });
-        table.productions.push(Production {
-            lhs: wrapper_ix,
-            rhs: vec![Symbol::NonTerminal(rule_ix)],
-            field_positions: vec![],
-        });
-        table.start_rule = wrapper_ix;
-
-        let analysis = Arc::new(GrammarStateAnalysis::from_table(&table, wrapper_ix));
-        self.rule_analyses.insert(rule_ix, Arc::clone(&analysis));
-        analysis
+        // All analyses pre-warmed at grammar construction time — O(1) lookup.
+        Arc::clone(
+            self.grammar
+                .rule_analyses
+                .get(&rule_ix)
+                .expect("rule_ix should be pre-warmed in grammar"),
+        )
     }
 
     fn build_parse_rule_cache_key(
@@ -803,7 +787,7 @@ impl Parser {
         self.reuse_stats.inserts += 1;
     }
 
-    fn prime_reuse_from_tree(&mut self, green: GreenId, offset: usize) {
+    pub fn prime_reuse_from_tree(&mut self, green: GreenId, offset: usize) {
         if !self.reuse_enabled {
             return;
         }

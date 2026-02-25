@@ -7,6 +7,8 @@ pub(crate) mod recovery;
 
 use std::sync::Arc;
 
+use rustc_hash::FxHashMap;
+
 #[macro_export]
 macro_rules! r {
     ($fn:ident) => {
@@ -37,10 +39,14 @@ pub enum GrammarInfo {
     DirectReference(usize),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,
+    /// Pre-warmed incremental LR analyses for every non-start rule.
+    /// Built once at grammar construction time so no parse path ever pays
+    /// LR-table-construction cost at runtime.
+    pub(crate) rule_analyses: FxHashMap<usize, Arc<analysis::GrammarStateAnalysis>>,
 }
 
 impl Grammar {
@@ -51,7 +57,48 @@ impl Grammar {
             table.start_rule,
         ));
 
-        Self { table, analysis }
+        let rule_analyses = Self::build_rule_analyses(&table);
+
+        Self {
+            table,
+            analysis,
+            rule_analyses,
+        }
+    }
+
+    /// Build incremental LR analyses for every non-start rule.
+    /// Each rule needs a thin wrapper production so the LR automaton
+    /// can treat it as an independent parse entry point.
+    fn build_rule_analyses(
+        table: &norm::RuleTable,
+    ) -> FxHashMap<usize, Arc<analysis::GrammarStateAnalysis>> {
+        use ir::{NormalizedNode, Production, RuleInfo, Symbol};
+
+        let mut map = FxHashMap::default();
+        for rule_ix in 0..table.rules.len() {
+            if rule_ix == table.start_rule {
+                continue;
+            }
+            let mut wrapped = table.clone();
+            let wrapper_ix = wrapped.rules.len();
+            wrapped.rules.push(RuleInfo {
+                name: "$inc_root",
+                description: "$inc_root",
+                node: NormalizedNode::Reference(rule_ix),
+                is_expression: false,
+            });
+            wrapped.productions.push(Production {
+                lhs: wrapper_ix,
+                rhs: vec![Symbol::NonTerminal(rule_ix)],
+                field_positions: vec![],
+            });
+            wrapped.start_rule = wrapper_ix;
+            let a = Arc::new(analysis::GrammarStateAnalysis::from_table(
+                &wrapped, wrapper_ix,
+            ));
+            map.insert(rule_ix, a);
+        }
+        map
     }
 
     pub fn name(&self, rule_idx: usize) -> &'static str {

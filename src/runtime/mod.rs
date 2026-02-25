@@ -18,6 +18,8 @@ mod metrics;
 mod reparser;
 mod strategy;
 
+pub mod sources;
+
 pub use metrics::EditMetrics;
 pub use reparser::ReparserConfig;
 
@@ -263,6 +265,9 @@ impl Default for RuntimeConfig {
     }
 }
 
+pub trait Source {
+    fn run(inst: InteractiveInstance);
+}
 pub struct Interactive<T = (), M = ()> {
     grammar: Grammar,
     runtime_config: RuntimeConfig,
@@ -431,6 +436,10 @@ impl InteractiveInstance {
         }
     }
 
+    pub fn receive_from<S: Source>(self) -> () {
+        S::run(self);
+    }
+
     pub fn update(&self, start: usize, end: usize, text: &str) -> RuntimeResult<()> {
         self.request(Action::Update {
             span: Span::new(start, end),
@@ -561,7 +570,11 @@ where
         let map = self.semantic_map.as_mut()?;
         if !self.semantic_map_initialized {
             self.semantic_map_initialized = true;
-            Some(map.initialize_root_with_source(self.cursor.current.green, &self.text))
+            if commands.is_empty() {
+                Some(map.initialize_root_with_source(self.cursor.current.green, &self.text))
+            } else {
+                Some(map.apply_parse_delta_with_source(commands, &self.text))
+            }
         } else {
             Some(map.apply_parse_delta_with_source(commands, &self.text))
         }

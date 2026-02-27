@@ -4,8 +4,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use crate::utils::Span;
-
+/// Error types that can occur during parsing, used for error reporting and recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ParsecError {
     Incomplete,
@@ -15,8 +14,10 @@ pub enum ParsecError {
     LRError, // Added for LR parser
 }
 
+/// A type alias for the identifier of a green node in the syntax tree. This is used to reference nodes in the tree allocator.
 pub type GreenId = usize;
 
+/// Tags indicating the type of a syntax tree node, such as whether it's a rule, token, field, or an error.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Tag {
     Rule { rule_ix: usize },
@@ -44,6 +45,8 @@ impl Tag {
     }
 }
 
+/// Red nodes are the nodes in the "red" syntax tree,
+/// which includes parent references and offsets for easier traversal and error reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct RedNode {
     pub parent: Option<Rc<RedNode>>,
@@ -52,14 +55,8 @@ pub struct RedNode {
 }
 
 impl RedNode {
-    pub fn new_root(alloc: &TreeAllocRef, text: &str) -> Self {
-        Self {
-            parent: None,
-            offset: 0,
-            green: alloc.new_placeholder(text.len()),
-        }
-    }
-
+    /// Creates a root red node with the given green node ID.
+    /// Its parent is None and offset is 0.
     pub fn root(green: GreenId) -> Self {
         Self {
             parent: None,
@@ -67,16 +64,10 @@ impl RedNode {
             green,
         }
     }
-
-    pub fn root_with_span(green: GreenId, span: Span) -> Self {
-        Self {
-            parent: None,
-            offset: span.start,
-            green,
-        }
-    }
 }
 
+/// Green nodes are the nodes in the "green" syntax tree, which are immutable and can be shared.
+/// They contain the tag, width, and children references, and are interned for memory efficiency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct GreenNode {
     pub tag: Tag,
@@ -84,18 +75,26 @@ pub struct GreenNode {
     pub children: Vec<GreenId>,
 }
 
+/// The tree allocator is responsible for managing the allocation and deduplication of green nodes.
 pub struct TreeAlloc {
     nodes: Vec<GreenNode>,
     dedup: FxHashMap<u64, Vec<usize>>,
 }
 
+/// A shared reference to the tree allocator.
 pub type TreeAllocRef = Rc<RefCell<TreeAlloc>>;
 
+/// A trait that extends the functionality of the tree allocator reference, providing methods for creating and managing green nodes.
 pub trait TreeAllocRefExt {
+    /// Creates a new tree allocator reference.
     fn create() -> Self;
+    /// Retrieves a reference to a green node by its ID.
     fn get_node(&self, id: GreenId) -> cell::Ref<'_, GreenNode>;
+    /// Allocates a new token node with the given tag and width, returning its ID.
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId;
+    /// Allocates a new node with the given tag, children, and width, returning its ID.
     fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId;
+    /// Creates a new placeholder node with the given width, used for error recovery.
     fn new_placeholder(&self, width: usize) -> GreenId;
 }
 

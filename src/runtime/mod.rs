@@ -271,7 +271,7 @@ pub trait Source {
     fn run(inst: InteractiveInstance);
 }
 pub struct Interactive<T = (), M = ()> {
-    grammar: Grammar,
+    grammar: &'static Grammar,
     runtime_config: RuntimeConfig,
     runtime_listener: Option<RuntimeListener<T>>,
     parser_listener: Option<ParserListener>,
@@ -281,7 +281,7 @@ pub struct Interactive<T = (), M = ()> {
 }
 
 impl Interactive<(), ()> {
-    pub fn new(grammar: Grammar) -> Interactive<(), ()> {
+    pub fn new(grammar: &'static Grammar) -> Interactive<(), ()> {
         Interactive {
             grammar,
             runtime_config: RuntimeConfig::default(),
@@ -393,7 +393,7 @@ pub struct InteractiveInstance {
 
 impl InteractiveInstance {
     pub(crate) fn init<T, M>(
-        grammar: Grammar,
+        grammar: &'static Grammar,
         runtime_config: RuntimeConfig,
         runtime_listener: RuntimeListener<T>,
         parser_listener: ParserListener,
@@ -416,8 +416,8 @@ impl InteractiveInstance {
             );
             let alloc = parser.alloc.clone();
             let parsec::Result { root: cursor, .. } = parser.parse_text("");
-            let semantic_map = semantic_map
-                .map(|map| IncrementalLowerer::new(alloc.clone(), parser.grammar.clone(), map));
+            let semantic_map =
+                semantic_map.map(|map| IncrementalLowerer::new(alloc.clone(), parser.grammar, map));
 
             let mut runtime = Runtime {
                 text: String::new(),

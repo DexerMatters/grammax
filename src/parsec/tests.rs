@@ -15,7 +15,7 @@ fn test_simple_arithmetic_precedence() {
         primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
 
-    let mut parser = Parser::new(grammar.clone());
+    let mut parser = Parser::new(grammar);
 
     println!("Grammar:\n{}", parser.grammar.table);
 
@@ -56,7 +56,7 @@ fn test_json() {
         null    -> tt("null")
     );
 
-    let mut parser = Parser::new(grammar.clone());
+    let mut parser = Parser::new(grammar);
 
     println!("Grammar:\n{}", parser.grammar.table);
 

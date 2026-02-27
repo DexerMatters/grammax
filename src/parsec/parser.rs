@@ -6,7 +6,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::grammar::Grammar;
 use crate::grammar::analysis::{Action, EOF_TOKEN, GrammarStateAnalysis};
-use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
+use crate::grammar::ir::Symbol;
 use crate::grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs};
 use crate::parsec::msg::{ParserMessage, ParserMessages};
 use crate::parsec::recovery::{RecoveryCache, RecoveryConfig, RepairOp, recover};
@@ -85,7 +85,7 @@ struct ParseRuleCacheEntry {
 }
 
 pub struct Parser {
-    pub grammar: Grammar,
+    pub grammar: &'static Grammar,
     pub alloc: TreeAllocRef,
     pub messages: ParserMessages,
     pub newly_computed_nodes: Vec<Span>,
@@ -110,8 +110,8 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(grammar: Grammar) -> Self {
-        let recovery_profile = Self::build_recovery_profile(&grammar);
+    pub fn new(grammar: &'static Grammar) -> Self {
+        let recovery_profile = Self::build_recovery_profile(grammar);
         Self {
             grammar,
             alloc: TreeAllocRef::create(),

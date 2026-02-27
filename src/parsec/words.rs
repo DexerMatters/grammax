@@ -4,14 +4,29 @@ use std::{
     sync::Arc,
 };
 
+/// A trait representing a matcher that lexically matches a portion of the input string.
 pub trait Matcher: Debug {
+    /// Attempts to match the input string starting from the given position.
+    ///
+    /// Returns `Some(length)` if the match is successful, where `length` is the number of characters matched, and advances the position by that length.
+    /// Returns `None` if the match fails, and does not modify the position.
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize>;
+
+    /// Provides a human-readable description of the matcher, which can be used in error messages or debugging output.
     fn display(&self) -> String;
+
+    /// Indicates whether this matcher may match an empty string (may not consume anything).
     fn is_nullable(&self) -> bool;
+
+    /// Indicates whether this matcher always consumes at least one character when it succeeds.
     fn is_consuming(&self) -> bool;
+
+    /// Provides a preview string that represents the expected input for this matcher, if available. This can be used for error recovery.
     fn preview(&self) -> Option<&str> {
         None
     }
+
+    /// Combines this matcher with another matcher in a sequence, meaning that both must match in order.
     fn then<U>(self, other: U) -> Sequence<Self, U>
     where
         Self: Sized,
@@ -20,6 +35,7 @@ pub trait Matcher: Debug {
         Sequence(self, other)
     }
 
+    /// Combines this matcher with another matcher in an alternative, meaning that either can match.
     fn or<U>(self, other: U) -> Alternative<Self, U>
     where
         Self: Sized,
@@ -28,6 +44,7 @@ pub trait Matcher: Debug {
         Alternative(self, other)
     }
 
+    /// Repeats this matcher according to the specified range.
     fn times<R>(self, range: R) -> Repeat<Self, R>
     where
         Self: Sized,
@@ -37,41 +54,52 @@ pub trait Matcher: Debug {
     }
 }
 
+/// A convenient type alias for a reference-counted matcher, allowing for shared ownership and dynamic dispatch.
 pub type MatcherRef = Arc<dyn Matcher + Send + Sync + 'static>;
 
+/// A matcher that matches the end of the input string.
 #[derive(Debug, Clone, Copy)]
 pub struct EndOfInput;
 
+/// A matcher that matches the start of the input string.
 #[derive(Debug, Clone, Copy)]
 pub struct StartOfInput;
 
+/// A matcher that represents an alternative between two matchers, meaning that either can match.
 #[derive(Debug, Clone, Copy)]
 pub struct Alternative<T, U>(pub T, pub U);
 
+/// A matcher that represents a sequence of two matchers, meaning that both must match in order.
 #[derive(Debug, Clone, Copy)]
 pub struct Sequence<T, U>(pub T, pub U);
 
+/// A matcher that represents a repetition of another matcher according to a specified range.
 #[derive(Debug, Clone, Copy)]
 pub struct Repeat<T, R: ops::RangeBounds<usize>>(pub T, pub R);
 
+/// A named matcher that associates a human-readable name with another matcher, which can be useful for error messages and debugging.
 #[derive(Debug, Clone, Copy)]
 pub struct NamedMatcher<M: Matcher> {
     pub name: &'static str,
     pub matcher: M,
 }
 
-impl NamedMatcher<EndOfInput> {
-    pub const fn new<M: Matcher>(name: &'static str, matcher: M) -> NamedMatcher<M> {
+impl<M: Matcher> NamedMatcher<M> {
+    /// Creates a new named matcher with the given name and underlying matcher.
+    pub const fn new(name: &'static str, matcher: M) -> NamedMatcher<M> {
         NamedMatcher { name, matcher }
     }
 }
 
+/// A predefined matcher that matches a sequence of ASCII digits, representing a number.
 pub const NUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
     NamedMatcher::new("number", Repeat(|c: char| c.is_ascii_digit(), 1..));
 
+/// A predefined matcher that matches a sequence of ASCII alphabetic characters, representing an identifier.
 pub const ALPHAS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
     NamedMatcher::new("identifier", Repeat(|c: char| c.is_ascii_alphabetic(), 1..));
 
+/// A predefined matcher that matches a sequence of ASCII alphanumeric characters or underscores, representing an identifier that can include digits.
 pub const ALPHANUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
     NamedMatcher::new(
         "alphanum",
@@ -82,12 +110,15 @@ const fn string_char(c: char) -> bool {
     c != '"' && c != '\n' && c != '\r'
 }
 
+/// A predefined matcher that matches a JSON string literal, which is a sequence of characters enclosed in double quotes, excluding unescaped double quotes and newlines.
 pub const STRING: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
     NamedMatcher::new("json_string", Repeat(string_char, 0..));
 
+/// A predefined matcher that matches a sequence of whitespace characters, which can be used to skip irrelevant spaces in the input.
 pub const WHITESPACES: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
     NamedMatcher::new("whitespaces", Repeat(|c: char| c.is_whitespace(), 1..));
 
+/// A helper function that creates a matcher which matches the given matcher preceded by optional leading whitespace. This is useful for token matchers that should ignore leading spaces.
 pub const fn token<M: Matcher>(
     matcher: M,
 ) -> Sequence<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>, M> {

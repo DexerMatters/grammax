@@ -878,7 +878,7 @@ struct ParseMemo<T> {
 /// 3. Feed parser/reparser semantic commands into `apply_parse_delta`.
 pub struct IncrementalLowerer<T, M> {
     alloc: TreeAllocRef,
-    grammar: Grammar,
+    grammar: &'static Grammar,
     mapper: M,
     parse_nodes: FxHashMap<GreenId, ParseMemo<T>>,
     parents: FxHashMap<GreenId, FxHashSet<GreenId>>,
@@ -892,7 +892,7 @@ where
     T: Clone + PartialEq + 'static,
     M: AstMapper<T>,
 {
-    pub fn new(alloc: TreeAllocRef, grammar: Grammar, mapper: M) -> Self {
+    pub fn new(alloc: TreeAllocRef, grammar: &'static Grammar, mapper: M) -> Self {
         Self {
             alloc,
             grammar,

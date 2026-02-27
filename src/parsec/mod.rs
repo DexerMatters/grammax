@@ -1,14 +1,12 @@
-pub mod builder;
+pub(crate) mod builder;
 pub mod display;
 pub mod msg;
 pub mod parser;
-pub mod recovery;
-pub mod tree;
-pub mod words;
-
+pub(crate) mod recovery;
 #[cfg(test)]
 mod tests;
-
+pub mod tree;
+pub mod words;
 pub use msg::ParserMessage;
 pub use parser::IncrementalReuseStats;
 pub use parser::Parser;

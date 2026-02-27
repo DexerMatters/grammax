@@ -10,10 +10,20 @@ use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
 
+/// Static storage for cached grammars
+/// Maps cache key to static reference of Grammar
+static GRAMMAR_CACHE: OnceLock<Mutex<FxHashMap<u64, &'static Grammar>>> = OnceLock::new();
+
+fn grammar_cache() -> &'static Mutex<FxHashMap<u64, &'static Grammar>> {
+    GRAMMAR_CACHE.get_or_init(|| Mutex::new(FxHashMap::default()))
+}
+
+/// A macro to create a grammar rule reference in the DSL which name is the same as the function name.
+/// For example, `r!(expr)` will create a reference to a rule named "expr".
 #[macro_export]
 macro_rules! r {
     ($fn:ident) => {
@@ -21,6 +31,35 @@ macro_rules! r {
     };
 }
 
+/// A macro that introduces an embedded DSL for defining grammars in more ergonomic way than using `Grammar::new` directly.
+///
+/// # Example
+/// ```
+/// let grammar = new_grammar! {
+///     start where
+///     start -> r!(expr) + t(EndOfInput)
+///     expr -> r!(expr) "+" r!(term) | r!(term)
+///     term -> t(NUMS) | "(" r!(expr) ")"
+/// };
+/// ```
+///
+/// is equivalent to:
+///
+/// ```
+/// fn start() -> GrammarNode {
+///     r!(expr) + t(EndOfInput)
+/// }
+///
+/// fn expr() -> GrammarNode {
+///     r!(expr) + r!(term) | r!(term)
+/// }
+///
+/// fn term() -> GrammarNode {
+///     t(NUMS) | "(" + r!(expr) + ")"
+/// }
+///
+/// let grammar = Grammar::new(start(), "start");
+/// ```
 #[macro_export]
 macro_rules! new_grammar {
 	($start: ident where $($name: ident -> $node: expr)*) => {
@@ -33,17 +72,9 @@ macro_rules! new_grammar {
 	};
 }
 
-#[derive(Debug, Clone)]
-pub enum GrammarError {
-    InfiniteConsumption(usize),
-}
-
-#[derive(Debug, Clone)]
-pub enum GrammarInfo {
-    RecursionDetected(usize),
-    DirectReference(usize),
-}
-
+/// The grammar structure, which contains the normalized rule table and analyses for parsing and error recovery.
+///
+/// The grammar instance is always a static reference.
 #[derive(Clone)]
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
@@ -52,19 +83,35 @@ pub struct Grammar {
 }
 
 impl Grammar {
-    pub fn new(node: dsl::GrammarNode, start_rule: &'static str) -> Self {
+    /// Create a new grammar from a DSL grammar node and a start rule name.
+    ///
+    /// The grammar is cached and returned as a static reference. If it has not changed since
+    /// the last time it was created, it will be loaded from the cache instead of being reprocessed.
+    pub fn new(node: dsl::GrammarNode, start_rule: &'static str) -> &'static Self {
         let cache_key = Self::cache_key_from_dsl(&node, start_rule);
-        if let Some(grammar) = cache::load(cache_key) {
+
+        let cache = grammar_cache().lock().unwrap();
+        if let Some(grammar) = cache.get(&cache_key) {
             return grammar;
         }
+        drop(cache);
 
-        let grammar = Self::new_uncached(node, start_rule);
+        // Check on-disk cache
+        let grammar = if let Some(grammar) = cache::load(cache_key) {
+            Box::leak(Box::new(grammar))
+        } else {
+            let grammar = Self::new_uncached(node, start_rule);
+            let _ = cache::store(cache_key, grammar);
+            grammar
+        };
 
-        let _ = cache::store(cache_key, &grammar);
+        grammar_cache().lock().unwrap().insert(cache_key, grammar);
+
         grammar
     }
 
-    pub fn new_uncached(node: dsl::GrammarNode, start_rule: &'static str) -> Self {
+    /// Create a new grammar without using the cache.
+    pub fn new_uncached(node: dsl::GrammarNode, start_rule: &'static str) -> &'static Self {
         let table = norm::RuleTable::normalize(node, start_rule);
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
@@ -72,11 +119,13 @@ impl Grammar {
         ));
         let rule_analyses = Self::build_rule_analyses(&table);
 
-        Self {
+        let grammar = Self {
             table,
             analysis,
             rule_analyses,
-        }
+        };
+
+        Box::leak(Box::new(grammar))
     }
 
     /// Build incremental LR analyses for every non-start rule.
@@ -185,6 +234,7 @@ impl Grammar {
         }
     }
 
+    /// Get the name of a rule by its index. If the rule has no name, return a generated name based on its index.
     pub fn name(&self, rule_idx: usize) -> &'static str {
         self.table
             .rules
@@ -194,6 +244,9 @@ impl Grammar {
             .unwrap_or_else(|| format!("@{}", rule_idx).leak())
     }
 
+    /// Add metadata to a rule by its name.
+    ///
+    /// When the meta is a string, it will be used as the rule's description, which can be displayed in error messages.
     pub fn in_which(mut self, rule_name: &'static str, meta: impl RuleMeta) -> Self {
         if let Some(idx) = self.table.rules.iter().position(|r| r.name == rule_name) {
             meta.apply(&mut self, idx);
@@ -204,9 +257,10 @@ impl Grammar {
     }
 
     /// Load a grammar from a .gmx file.
-    pub fn load_from(path: &Path) -> io::Result<Self> {
+    pub fn load_from(path: &Path) -> io::Result<&'static Self> {
         let bytes = fs::read(path)?;
-        cache::deserialize_grammar_file(&bytes)
+        let grammar = cache::deserialize_grammar_file(&bytes)?;
+        Ok(Box::leak(Box::new(grammar)))
     }
 
     /// Save this grammar to a .gmx file.

@@ -1,46 +1,47 @@
+use crate::parsec::tree::Tag;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct NodePath(pub Vec<usize>);
+
+impl NodePath {
+    pub fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn parent(&self) -> Option<Self> {
+        if self.0.is_empty() {
+            None
+        } else {
+            let mut path = self.0.clone();
+            path.pop();
+            Some(Self(path))
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
-    /// Self-contained incremental tree delta.
+    /// Creates a node template identified by a command-local id.
     ///
-    /// - `changed_green`: the deepest replaced green (incremental reparse result)
-    /// - `changed_offset`: absolute source offset of `changed_green`
-    /// - `lineage`: immediate-parent-to-root chain as `(parent_green, child_index)`
-    /// - `new_root`: resulting parse root after this edit
-    TreeChanged {
-        changed_green: usize,
-        changed_offset: usize,
-        lineage: Vec<(usize, usize)>,
-        new_root: usize,
+    /// Nodes are assembled bottom-up, so children should be created before
+    /// their parent references them.
+    CreateNode {
+        node_id: u64,
+        tag: Tag,
+        width: usize,
+        token_text: Option<String>,
+        children: Vec<u64>,
     },
 
-    /// Declare a newly introduced green node (and its structural metadata)
-    CreateGreen { green: usize },
+    /// Deletes the node currently located at a path.
+    DeleteNodeAtPath { path: NodePath },
 
-    /// Replace a green child under a parent position.
-    /// parent_green is None when the root green changes.
-    ReplaceGreen {
-        parent_green: Option<usize>,
-        child_index: usize,
-        new_green: usize,
+    /// Inserts a previously created node at a stable path.
+    ///
+    /// For replacement updates, emit a `DeleteNodeAtPath` followed by this.
+    InsertNodeAtPath {
+        path: NodePath,
+        node_id: u64,
+        cascade_to_root: bool,
     },
-
-    /// Insert a green child at an index under a parent green.
-    InsertGreen {
-        parent_green: usize,
-        child_index: usize,
-        green: usize,
-    },
-
-    /// Delete a green child at an index under a parent green.
-    DeleteGreen {
-        parent_green: usize,
-        child_index: usize,
-        green: usize,
-    },
-
-    /// Update an entire zipper path (leaf to root) efficiently.
-    /// Encodes multiple parent updates as a compact path.
-    /// Each step is (parent_green: Option, child_index, new_child_green).
-    /// The last step has parent_green=None (root update).
-    PathUpdate { path: Vec<(Option<usize>, usize, usize)> },
 }

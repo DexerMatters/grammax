@@ -79,7 +79,10 @@ fn test_expr_example() {
         println!("==== Updated source: {}", result.source_text);
         println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
         println!("> Duration: {}µs", result.metrics.total_duration_us);
-        println!("> Commands: {:?}", result.semantic_commands);
+        println!("> Commands: \n");
+        for cmd in &result.semantic_commands {
+            println!("  {:?}", cmd);
+        }
         println!("> Metrics: {:#?}", result.metrics);
     });
 
@@ -110,7 +113,7 @@ fn test_expr_example() {
         )
         .unwrap();
     runtime.insert(1, r#" "good" : 123, "#).unwrap();
-    runtime.insert(2, r#" "bad": [true, false, 44], "#).unwrap();
+    runtime.insert(1, r#" "bad": [true, false, 44], "#).unwrap();
     runtime.exit().unwrap();
     runtime.join().unwrap();
 }
@@ -166,8 +169,11 @@ fn test_semantic_commands() {
     let listener = RuntimeListener::new().after_update(move |result| {
         println!("> Updated source: {}", result.source_text);
         println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
+        println!("> Commands: \n");
+        for cmd in &result.semantic_commands {
+            println!("  {:?}", cmd);
+        }
         println!("> Duration: {}µs", result.metrics.total_duration_us);
-        println!("> Commands: {:?}", result.semantic_commands);
         println!("> Metrics: {:#?}", result.metrics);
     });
 

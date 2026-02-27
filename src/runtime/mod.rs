@@ -15,6 +15,7 @@ use crate::{
     utils::Span,
 };
 
+mod delta;
 mod metrics;
 mod reparser;
 mod strategy;
@@ -416,8 +417,7 @@ impl InteractiveInstance {
             );
             let alloc = parser.alloc.clone();
             let parsec::Result { root: cursor, .. } = parser.parse_text("");
-            let semantic_map =
-                semantic_map.map(|map| IncrementalLowerer::new(alloc.clone(), parser.grammar, map));
+            let semantic_map = semantic_map.map(|map| IncrementalLowerer::new(parser.grammar, map));
 
             let mut runtime = Runtime {
                 text: String::new(),
@@ -589,11 +589,7 @@ where
         let map = self.semantic_map.as_mut()?;
         if !self.semantic_map_initialized {
             self.semantic_map_initialized = true;
-            if commands.is_empty() {
-                Some(map.initialize_root_with_source(self.cursor.current.green, &self.text))
-            } else {
-                Some(map.apply_parse_delta_with_source(commands, &self.text))
-            }
+            Some(map.apply_parse_delta_with_source(commands, &self.text))
         } else {
             Some(map.apply_parse_delta_with_source(commands, &self.text))
         }

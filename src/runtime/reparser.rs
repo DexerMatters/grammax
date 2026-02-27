@@ -7,6 +7,7 @@ use crate::{
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
     runtime::{
+        delta,
         metrics::EditMetrics,
         strategy::{EditKind, StrategyCandidate, StrategyContext, pick_candidate},
     },
@@ -45,6 +46,8 @@ pub struct ReparserConfig {
     /// Minimum zipper level (depth) required to consider a candidate.
     /// Higher values force narrower (deeper) reparses.
     pub min_level: usize,
+    /// When false, no ancestor span cascade propagation is performed.
+    pub span_cascade: bool,
 }
 
 impl Default for ReparserConfig {
@@ -53,6 +56,7 @@ impl Default for ReparserConfig {
             enforce_region_end: true,
             enforce_sync_bound: true,
             min_level: 0,
+            span_cascade: false,
         }
     }
 }
@@ -159,7 +163,7 @@ impl Reparser {
         let specs = parser.recovery_specs().cloned();
         let strategy = parser.recovery_strategy().cloned();
 
-        let seRch_span = span;
+        let search_span = span;
         let edit_span = if span.len() == 0 {
             Span::new(span.start, span.start + new_len)
         } else {
@@ -175,7 +179,7 @@ impl Reparser {
         let mut zippers = Vec::new();
         collect_from(
             focus_node,
-            seRch_span,
+            search_span,
             &self.alloc,
             &mut steps,
             level,
@@ -194,7 +198,7 @@ impl Reparser {
             // Fallback: If focus node based seRch failed (rare), try from root
             self.ascend_to_root();
             zippers =
-                collect_affected_zippers(self.current.clone(), seRch_span, &self.alloc, parser);
+                collect_affected_zippers(self.current.clone(), search_span, &self.alloc, parser);
 
             if let Some(m) = &mut metrics {
                 m.candidates_collected = zippers.len();
@@ -242,6 +246,7 @@ impl Reparser {
                 enforce_sync_bound: false,
                 enforce_region_end: false,
                 min_level: self.config.min_level,
+                span_cascade: self.config.span_cascade,
             };
             if let Some(m) = ctx.metrics.as_deref_mut() {
                 m.message = "strict candidate filters rejected all zippers; retried with relaxed incremental bounds".to_string();
@@ -360,10 +365,18 @@ impl Reparser {
             None
         };
 
-        let semantic_commands = self.generate_commands_incremental(
-            &candidate.zipper,
+        let path = crate::semantic::command::NodePath(
+            candidate.zipper.steps.iter().map(|s| s.child_idx).collect(),
+        );
+        let semantic_commands = delta::generate_commands_incremental(
+            &self.alloc,
+            &path,
+            candidate.zipper.node.green,
             candidate.green,
-            &replaced.ancestor_greens,
+            candidate.zipper.offset,
+            new_source_text,
+            self.config.span_cascade,
+            self.current.parent.is_none(),
         );
 
         if let Some(m) = &mut metrics {
@@ -628,36 +641,6 @@ impl Reparser {
             .filter(|span| span.start < changed.end && span.end > changed.start)
             .collect()
     }
-
-    fn generate_commands_incremental(
-        &self,
-        zipper: &Zipper,
-        replacement_green: usize,
-        ancestor_greens: &[usize],
-    ) -> Vec<Command> {
-        if zipper.steps.is_empty() {
-            return vec![Command::TreeChanged {
-                changed_green: replacement_green,
-                changed_offset: zipper.offset,
-                lineage: Vec::new(),
-                new_root: replacement_green,
-            }];
-        }
-
-        let mut lineage = Vec::with_capacity(zipper.steps.len());
-        for step_ix in (0..zipper.steps.len()).rev() {
-            let step = &zipper.steps[step_ix];
-            let parent_green = ancestor_greens[step_ix];
-            lineage.push((parent_green, step.child_idx));
-        }
-
-        vec![Command::TreeChanged {
-            changed_green: replacement_green,
-            changed_offset: zipper.offset,
-            lineage,
-            new_root: ancestor_greens[0],
-        }]
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -684,10 +667,7 @@ impl Zipper {
                 offset: self.offset,
                 green: new_green,
             });
-            return ReplaceResult {
-                root: updated_root,
-                ancestor_greens: Vec::new(),
-            };
+            return ReplaceResult { root: updated_root };
         }
 
         let mut ancestor_greens = vec![0usize; self.steps.len()];
@@ -721,16 +701,12 @@ impl Zipper {
             chain_parent = next;
         }
 
-        ReplaceResult {
-            root,
-            ancestor_greens,
-        }
+        ReplaceResult { root }
     }
 }
 
-struct ReplaceResult {
+pub(crate) struct ReplaceResult {
     root: Rc<RedNode>,
-    ancestor_greens: Vec<usize>,
 }
 
 pub fn collect_affected_zippers(

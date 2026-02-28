@@ -71,7 +71,6 @@ struct CachedRuleInfo {
     name: String,
     description: String,
     node: CachedNode,
-    is_expression: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -216,7 +215,6 @@ fn encode_rule_table(table: &RuleTable) -> Result<CachedRuleTable, String> {
                 name: rule.name.to_string(),
                 description: rule.description.to_string(),
                 node: encode_node(&rule.node, &matcher_idx, &terminals)?,
-                is_expression: rule.is_expression,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -259,7 +257,6 @@ fn decode_rule_table(table: CachedRuleTable) -> Result<RuleTable, String> {
                 name: leak_str(rule.name),
                 description: leak_str(rule.description),
                 node: decode_node(rule.node, &terminals)?,
-                is_expression: rule.is_expression,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;

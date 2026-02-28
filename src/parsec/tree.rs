@@ -6,11 +6,11 @@ use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 /// Error types that can occur during parsing, used for error reporting and recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum ParsecError {
     Incomplete,
-    UnexpectedToken,
-    MissingToken,
+    UnexpectedToken { expected: Vec<usize> },
+    MissingToken { expected: Vec<usize> },
     Placeholder,
     LRError, // Added for LR parser
 }

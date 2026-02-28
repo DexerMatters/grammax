@@ -66,7 +66,6 @@ pub struct RuleInfo {
     pub name: &'static str,
     pub description: &'static str,
     pub node: NormalizedNode,
-    pub is_expression: bool, // Marked for Pratt parsing
 }
 
 /// Production rule for LR parsing

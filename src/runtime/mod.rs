@@ -24,12 +24,11 @@ mod strategy;
 
 pub use metrics::EditMetrics;
 pub use reparser::ReparserConfig;
-use serde::{Deserialize, Serialize};
 
 #[cfg(test)]
 mod tests;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Action {
     Insert { offset: usize, text: String },
     Delete { span: Span },
@@ -38,6 +37,58 @@ pub enum Action {
     Pause,
     Resume,
     Exit,
+}
+
+impl<'de> serde::Deserialize<'de> for Action {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        #[serde(tag = "type", content = "data")]
+        enum ActionHelper {
+            #[serde(rename = "insert")]
+            Insert { offset: usize, text: String },
+
+            #[serde(rename = "delete")]
+            Delete { start: usize, end: usize },
+
+            #[serde(rename = "update")]
+            Update {
+                start: usize,
+                end: usize,
+                text: String,
+            },
+
+            #[serde(rename = "run")]
+            Run,
+
+            #[serde(rename = "pause")]
+            Pause,
+
+            #[serde(rename = "resume")]
+            Resume,
+
+            #[serde(rename = "exit")]
+            Exit,
+        }
+
+        let helper = ActionHelper::deserialize(deserializer)?;
+        Ok(match helper {
+            ActionHelper::Insert { offset, text } => Action::Insert { offset, text },
+            ActionHelper::Delete { start, end } => Action::Delete {
+                span: Span::new(start, end),
+            },
+            ActionHelper::Update { start, end, text } => Action::Update {
+                span: Span::new(start, end),
+                text,
+            },
+            ActionHelper::Run => Action::Run,
+            ActionHelper::Pause => Action::Pause,
+            ActionHelper::Resume => Action::Resume,
+            ActionHelper::Exit => Action::Exit,
+        })
+    }
 }
 
 impl Action {
@@ -373,9 +424,9 @@ pub struct RuntimeRequest {
     pub(crate) reply: channel::Sender<RuntimeResult>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct RuntimeResponse {
-    pub commands: Vec<String>,
+    pub commands: Vec<crate::semantic::Command>,
 }
 
 pub struct InteractiveInstance<I> {
@@ -432,7 +483,7 @@ impl<I: Interface> InteractiveInstance<I> {
 
         Self {
             thread_handle,
-            api: I::new(sender),
+            api: I::new(sender, grammar),
         }
     }
 
@@ -647,11 +698,7 @@ where
         let semantic_ir_delta = self.semantic_delta(&result.semantic_commands);
         let (semantic_ir_root_cell, semantic_ir_arena, semantic_ir_root) = self.semantic_root();
 
-        let commands = result
-            .semantic_commands
-            .iter()
-            .map(|cmd| serde_json::to_string(cmd).unwrap_or_default())
-            .collect::<Vec<_>>();
+        let commands = result.semantic_commands.clone();
 
         let update = UpdateResult::new(
             result.messages,

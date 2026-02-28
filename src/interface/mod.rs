@@ -1,6 +1,6 @@
 use crossbeam::channel;
 
-use crate::{runtime, utils};
+use crate::{grammar, runtime, utils};
 
 #[cfg(feature = "webui")]
 pub mod webui;
@@ -9,7 +9,10 @@ pub mod webui;
 pub mod vsclsp;
 
 pub trait Interface {
-    fn new(sender: channel::Sender<runtime::RuntimeRequest>) -> Self
+    fn new(
+        sender: channel::Sender<runtime::RuntimeRequest>,
+        grammar: &'static grammar::Grammar,
+    ) -> Self
     where
         Self: Sized;
     fn sender(&self) -> &channel::Sender<runtime::RuntimeRequest>;
@@ -36,7 +39,7 @@ pub struct BasicInterface {
 }
 
 impl Interface for BasicInterface {
-    fn new(sender: channel::Sender<runtime::RuntimeRequest>) -> Self {
+    fn new(sender: channel::Sender<runtime::RuntimeRequest>, _: &'static grammar::Grammar) -> Self {
         Self { sender }
     }
 

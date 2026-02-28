@@ -40,7 +40,6 @@ impl RuleTable {
             name: root_name,
             description: root_name,
             node: root_node,
-            is_expression: false,
         };
         rules.push(root_rule);
         let start_ix = rules.len() - 1;
@@ -64,10 +63,7 @@ impl RuleTable {
     fn optimize_for_lr(mut rules: Vec<RuleInfo>) -> Vec<RuleInfo> {
         // Factor common prefixes for better LR state sharing
         for rule in &mut rules {
-            if !rule.is_expression {
-                // Don't optimize expression rules
-                rule.node = Self::factor_prefixes(rule.node.clone());
-            }
+            rule.node = Self::factor_prefixes(rule.node.clone());
         }
 
         rules
@@ -306,7 +302,6 @@ impl Normalizer {
             name,
             description: "",
             node: NormalizedNode::Reference(ix), // Temporary
-            is_expression: false,
         });
 
         // Normalize the node
@@ -378,7 +373,6 @@ impl Normalizer {
                         name: helper_name,
                         description: "",
                         node: NormalizedNode::Sequence(vec![]), // Placeholder
-                        is_expression: false,
                     });
 
                     self.pending_drops.insert((target_ix, count), helper_ix);
@@ -482,7 +476,6 @@ impl Normalizer {
             name,
             description: "",
             node,
-            is_expression: false,
         });
         self.rule_map.insert(name.to_string(), ix);
 
@@ -504,7 +497,6 @@ impl Normalizer {
             name,
             description: "",
             node,
-            is_expression: false,
         });
         self.rule_map.insert(name.to_string(), ix);
 
@@ -580,7 +572,6 @@ impl Normalizer {
             name,
             description: "",
             node,
-            is_expression: false,
         });
 
         // Recursively extract in the new rule (it will be picked up by the main loop)
@@ -601,11 +592,6 @@ impl Normalizer {
                 other => Self::drop_alternatives(other, count),
             };
             self.rules[helper_ix].node = dropped_node;
-
-            // Mark helper as expression if target is expression
-            if self.rules[target_ix].is_expression {
-                self.rules[helper_ix].is_expression = true;
-            }
         }
     }
 

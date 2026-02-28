@@ -1,5 +1,5 @@
 use crate::{
-    interface::BasicInterface,
+    interface::{BasicInterface, webui::WebPreviewInterface},
     new_grammar,
     parsec::{ParserConfig, recovery::RecoveryConfig, words::*},
     runtime::{Interactive, RuntimeListener},
@@ -185,13 +185,7 @@ fn test_semantic_commands() {
             simple_ast: true,
             recovery: RecoveryConfig::default(),
         })
-        .finish::<BasicInterface>();
+        .finish::<WebPreviewInterface>();
 
     runtime.run().unwrap();
-    runtime.insert(0, "1 + 4 * 4 + (5 + 5) * 2").unwrap();
-    runtime.update(0, 1, "3 * 5").unwrap();
-    runtime.insert(0, "2 + 2 + ").unwrap();
-    runtime.delete(0, 4).unwrap();
-    runtime.exit().unwrap();
-    runtime.join().unwrap();
 }

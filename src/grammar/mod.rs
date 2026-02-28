@@ -147,7 +147,6 @@ impl Grammar {
                 name: "$inc_root",
                 description: "$inc_root",
                 node: NormalizedNode::Reference(rule_ix),
-                is_expression: false,
             });
             wrapped.productions.push(Production {
                 lhs: wrapper_ix,

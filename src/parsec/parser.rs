@@ -237,17 +237,18 @@ impl Parser {
                                 .closing_tokens
                                 .contains(&next_raw_term)
                             {
+                                let expected = self.expected_ids_for_analysis(
+                                    &self.grammar.analysis,
+                                    current_state_idx,
+                                    true,
+                                );
                                 self.push_unexpected_trimmed(
                                     self.pos,
                                     self.pos + token_len,
-                                    self.expected_ids_for_analysis(
-                                        &self.grammar.analysis,
-                                        current_state_idx,
-                                        true,
-                                    ),
+                                    expected.clone(),
                                 );
                                 let deleted_node = self.alloc.alloc(
-                                    Tag::new_error(ParsecError::UnexpectedToken),
+                                    Tag::new_error(ParsecError::UnexpectedToken { expected }),
                                     vec![],
                                     token_len,
                                 );
@@ -296,7 +297,9 @@ impl Parser {
                             let trailing_end = self.text.len();
                             self.push_unexpected_trimmed(trailing_start, trailing_end, Vec::new());
                             let trailing_error = self.alloc.alloc(
-                                Tag::new_error(ParsecError::UnexpectedToken),
+                                Tag::new_error(ParsecError::UnexpectedToken {
+                                    expected: Vec::new(),
+                                }),
                                 vec![],
                                 trailing_end - trailing_start,
                             );
@@ -452,7 +455,9 @@ impl Parser {
                     {
                         let start_pos = self.pos;
                         let err_node = self.alloc.alloc(
-                            Tag::new_error(ParsecError::UnexpectedToken),
+                            Tag::new_error(ParsecError::UnexpectedToken {
+                                expected: expected.clone(),
+                            }),
                             vec![],
                             raw_len,
                         );
@@ -519,7 +524,9 @@ impl Parser {
                             .min()
                         {
                             let missing = self.alloc.alloc(
-                                Tag::new_error(ParsecError::MissingToken),
+                                Tag::new_error(ParsecError::MissingToken {
+                                    expected: vec![term_ix],
+                                }),
                                 vec![],
                                 0,
                             );
@@ -548,9 +555,12 @@ impl Parser {
                         }
                     }
 
+                    let error_expected = expected.clone();
                     self.push_unexpected_trimmed(self.pos, self.pos + raw_len, expected);
                     let deleted_node = self.alloc.alloc(
-                        Tag::new_error(ParsecError::UnexpectedToken),
+                        Tag::new_error(ParsecError::UnexpectedToken {
+                            expected: error_expected,
+                        }),
                         vec![],
                         raw_len,
                     );
@@ -570,9 +580,13 @@ impl Parser {
                         .copied()
                         .find(|term_ix| *term_ix != EOF_TOKEN)
                     {
-                        let missing =
-                            self.alloc
-                                .alloc(Tag::new_error(ParsecError::MissingToken), vec![], 0);
+                        let missing = self.alloc.alloc(
+                            Tag::new_error(ParsecError::MissingToken {
+                                expected: vec![term_ix],
+                            }),
+                            vec![],
+                            0,
+                        );
                         if self.apply_terminal_with_analysis(
                             term_ix,
                             0,
@@ -918,9 +932,13 @@ impl Parser {
             }
 
             let len = self.unknown_span_len(self.pos, bounded_end);
-            let node = self
-                .alloc
-                .alloc(Tag::new_error(ParsecError::UnexpectedToken), vec![], len);
+            let node = self.alloc.alloc(
+                Tag::new_error(ParsecError::UnexpectedToken {
+                    expected: expected.map(|items| items.to_vec()).unwrap_or_default(),
+                }),
+                vec![],
+                len,
+            );
             (UNKNOWN_TOKEN, len, node)
         }
     }
@@ -989,9 +1007,13 @@ impl Parser {
                         Span::new(self.pos, self.pos),
                         vec![term_ix],
                     ));
-                    let token_node =
-                        self.alloc
-                            .alloc(Tag::new_error(ParsecError::MissingToken), vec![], 0);
+                    let token_node = self.alloc.alloc(
+                        Tag::new_error(ParsecError::MissingToken {
+                            expected: vec![term_ix],
+                        }),
+                        vec![],
+                        0,
+                    );
                     if !self.apply_terminal(term_ix, 0, token_node, false, state_stack, node_stack)
                     {
                         return false;
@@ -1003,10 +1025,16 @@ impl Parser {
                     if len == 0 {
                         return false;
                     }
+                    let error_expected = expected.clone();
                     self.push_unexpected_trimmed(self.pos, self.pos + len, expected);
                     let deleted_node =
-                        self.alloc
-                            .alloc(Tag::new_error(ParsecError::UnexpectedToken), vec![], len);
+                        self.alloc.alloc(
+                            Tag::new_error(ParsecError::UnexpectedToken {
+                                expected: error_expected,
+                            }),
+                            vec![],
+                            len,
+                        );
                     node_stack.push(StackEntry {
                         node: deleted_node,
                         binds_state: false,
@@ -1094,7 +1122,9 @@ impl Parser {
             {
                 let start_pos = self.pos;
                 let err_node = self.alloc.alloc(
-                    Tag::new_error(ParsecError::UnexpectedToken),
+                    Tag::new_error(ParsecError::UnexpectedToken {
+                        expected: last_expected.clone(),
+                    }),
                     vec![],
                     raw_len,
                 );
@@ -1157,8 +1187,13 @@ impl Parser {
                     .min()
                 {
                     let token_node =
-                        self.alloc
-                            .alloc(Tag::new_error(ParsecError::MissingToken), vec![], 0);
+                        self.alloc.alloc(
+                            Tag::new_error(ParsecError::MissingToken {
+                                expected: vec![term_ix],
+                            }),
+                            vec![],
+                            0,
+                        );
                     let mut trial_states = state_stack.clone();
                     let mut trial_nodes = node_stack.clone();
                     if self.apply_terminal(
@@ -1218,7 +1253,9 @@ impl Parser {
             }
 
             let deleted_node = self.alloc.alloc(
-                Tag::new_error(ParsecError::UnexpectedToken),
+                Tag::new_error(ParsecError::UnexpectedToken {
+                    expected: last_expected.clone(),
+                }),
                 vec![],
                 raw_len,
             );
@@ -1283,8 +1320,13 @@ impl Parser {
             let token_node = if silent_opener {
                 self.alloc.alloc_token(Tag::new_token(term_ix), 0)
             } else {
-                self.alloc
-                    .alloc(Tag::new_error(ParsecError::MissingToken), vec![], 0)
+                self.alloc.alloc(
+                    Tag::new_error(ParsecError::MissingToken {
+                        expected: vec![term_ix],
+                    }),
+                    vec![],
+                    0,
+                )
             };
             let mut trial_states = state_stack.clone();
             let mut trial_nodes = node_stack.clone();
@@ -1501,7 +1543,7 @@ impl Parser {
             && children.len() == 1
             && matches!(
                 &self.alloc.get_node(children[0]).tag,
-                Tag::Error(ParsecError::UnexpectedToken)
+                Tag::Error(ParsecError::UnexpectedToken { .. })
             );
 
         let new_node = if passthrough_unexpected {

@@ -266,17 +266,9 @@ fn format_label(
         }
         Tag::Field { name, .. } => (format!("{}{}:{}", YELLOW, name, RESET), String::new()),
         Tag::Error(errors) => {
-            let err_desc = errors
-                .iter()
-                .map(|e| format!("{:?}", e))
-                .collect::<Vec<_>>()
-                .join(", ");
-            (
-                format!("{}error:[{}]{}", RED, err_desc, RESET),
-                String::new(),
-            )
+            let err_desc = format!("{:?}", errors);
+            (format!("{}[{}]{}", RED, err_desc, RESET), String::new())
         }
-        Tag::Root => ("ROOT".to_string(), String::new()),
     }
 }
 

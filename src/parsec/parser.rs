@@ -833,7 +833,7 @@ impl Parser {
         let node = self.alloc.get_node(green);
         match &node.tag {
             Tag::Rule { rule_ix: current } if *current == rule_ix => Some(green),
-            Tag::Root | Tag::Error(_) => {
+            Tag::Error(_) => {
                 if node.children.len() == 1 {
                     let child = node.children[0];
                     let child_node = self.alloc.get_node(child);
@@ -918,9 +918,9 @@ impl Parser {
             }
 
             let len = self.unknown_span_len(self.pos, bounded_end);
-            let node =
-                self.alloc
-                    .alloc(Tag::Error(vec![ParsecError::UnexpectedToken]), vec![], len);
+            let node = self
+                .alloc
+                .alloc(Tag::new_error(ParsecError::UnexpectedToken), vec![], len);
             (UNKNOWN_TOKEN, len, node)
         }
     }
@@ -1418,7 +1418,8 @@ impl Parser {
             .iter()
             .map(|id| self.alloc.get_node(*id).width)
             .sum();
-        self.alloc.alloc(Tag::Root, children, width)
+        self.alloc
+            .alloc(Tag::Error(ParsecError::Placeholder), children, width)
     }
 
     fn pop_reduce_entries(
@@ -1500,7 +1501,7 @@ impl Parser {
             && children.len() == 1
             && matches!(
                 &self.alloc.get_node(children[0]).tag,
-                Tag::Error(errs) if errs.iter().any(|e| matches!(e, ParsecError::UnexpectedToken))
+                Tag::Error(ParsecError::UnexpectedToken)
             );
 
         let new_node = if passthrough_unexpected {

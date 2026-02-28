@@ -846,7 +846,6 @@ impl<T> AstMapper<T> for RuleMap<T> {
                 .as_ref()
                 .map(|f| (f)(node))
                 .unwrap_or_else(|| self.fallback()),
-            Tag::Root => self.fallback(),
         }
     }
 }
@@ -1004,12 +1003,61 @@ where
         ops: &mut Vec<AstDeltaOp<T>>,
     ) -> Option<RecomputeStart> {
         match command {
+            Command::CreateToken {
+                node_id,
+                tag,
+                text,
+                field: _,
+            } => {
+                let green = self.next_green_id;
+                self.next_green_id = self.next_green_id.saturating_add(1);
+
+                let width = text.len();
+                self.parse_nodes.insert(
+                    green,
+                    ParseMemo {
+                        children: Vec::new(),
+                        offset: 0,
+                        width,
+                        token_text: Some(text.clone()),
+                        tag: tag.clone(),
+                        binding: AstBinding::None,
+                    },
+                );
+
+                self.command_nodes.insert(*node_id, green);
+                None
+            }
+            Command::CreateError {
+                node_id,
+                kind,
+                text,
+                field: _,
+            } => {
+                let green = self.next_green_id;
+                self.next_green_id = self.next_green_id.saturating_add(1);
+
+                let width = text.len();
+                self.parse_nodes.insert(
+                    green,
+                    ParseMemo {
+                        children: Vec::new(),
+                        offset: 0,
+                        width,
+                        token_text: Some(text.clone()),
+                        tag: crate::parsec::tree::Tag::new_error(kind.clone()),
+                        binding: AstBinding::None,
+                    },
+                );
+
+                self.command_nodes.insert(*node_id, green);
+                None
+            }
             Command::CreateNode {
                 node_id,
                 tag,
-                width,
-                token_text,
                 children,
+                field: _,
             } => {
                 let green = self.next_green_id;
                 self.next_green_id = self.next_green_id.saturating_add(1);
@@ -1019,13 +1067,16 @@ where
                     .filter_map(|id| self.command_nodes.get(id).copied())
                     .collect();
 
+                // Calculate width from children
+                let width: usize = child_greens.iter().map(|&cg| self.memo(cg).width).sum();
+
                 self.parse_nodes.insert(
                     green,
                     ParseMemo {
                         children: child_greens.clone(),
                         offset: 0,
-                        width: *width,
-                        token_text: token_text.clone(),
+                        width,
+                        token_text: None,
                         tag: tag.clone(),
                         binding: AstBinding::None,
                     },
@@ -1291,10 +1342,14 @@ where
     }
 
     fn reset_command_nodes_if_needed(&mut self, commands: &[Command]) {
-        if commands
-            .iter()
-            .any(|cmd| matches!(cmd, Command::CreateNode { .. }))
-        {
+        if commands.iter().any(|cmd| {
+            matches!(
+                cmd,
+                Command::CreateNode { .. }
+                    | Command::CreateToken { .. }
+                    | Command::CreateError { .. }
+            )
+        }) {
             self.command_nodes.clear();
         }
     }

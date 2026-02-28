@@ -12,7 +12,6 @@ pub(crate) fn generate_commands_incremental(
     new_green: usize,
     new_green_offset: usize,
     source_text: &str,
-    span_cascade: bool,
     current_is_root: bool,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
@@ -27,7 +26,6 @@ pub(crate) fn generate_commands_incremental(
         new_green_offset,
         source_text,
         path,
-        span_cascade,
         current_is_root,
         &mut commands,
         &mut next_node_id,
@@ -45,7 +43,6 @@ fn emit_commands_for_delta(
     new_green_offset: usize,
     source_text: &str,
     path: &NodePath,
-    span_cascade: bool,
     current_is_root: bool,
     out: &mut Vec<Command>,
     next_node_id: &mut u64,
@@ -63,7 +60,6 @@ fn emit_commands_for_delta(
             new_green,
             new_green_offset,
             source_text,
-            span_cascade,
             current_is_root,
             out,
             next_node_id,
@@ -81,7 +77,6 @@ fn emit_commands_for_delta(
             new_green,
             new_green_offset,
             source_text,
-            span_cascade,
             current_is_root,
             out,
             next_node_id,
@@ -99,7 +94,6 @@ fn emit_commands_for_delta(
             new_green,
             new_green_offset,
             source_text,
-            span_cascade,
             current_is_root,
             out,
             next_node_id,
@@ -143,7 +137,7 @@ fn emit_commands_for_delta(
             out.push(Command::InsertNodeAtPath {
                 path: insert_path.clone(),
                 node_id,
-                cascade_to_root: should_cascade(span_cascade, &insert_path),
+                cascade_to_root: false,
             });
         }
         return;
@@ -169,7 +163,6 @@ fn emit_commands_for_delta(
         new_mid_end,
         new_green_offset,
         source_text,
-        span_cascade,
         current_is_root,
         out,
         next_node_id,
@@ -190,7 +183,6 @@ fn emit_commands_for_delta(
         new_mid_end,
         new_green_offset,
         source_text,
-        span_cascade,
         current_is_root,
         out,
         next_node_id,
@@ -206,7 +198,6 @@ fn emit_commands_for_delta(
         new_green,
         new_green_offset,
         source_text,
-        span_cascade,
         current_is_root,
         out,
         next_node_id,
@@ -219,7 +210,6 @@ fn emit_replace_at_path(
     new_green: usize,
     new_green_offset: usize,
     source_text: &str,
-    span_cascade: bool,
     current_is_root: bool,
     out: &mut Vec<Command>,
     next_node_id: &mut u64,
@@ -240,7 +230,7 @@ fn emit_replace_at_path(
     out.push(Command::InsertNodeAtPath {
         path: path.clone(),
         node_id,
-        cascade_to_root: should_cascade(span_cascade, path),
+        cascade_to_root: false,
     });
 }
 
@@ -250,7 +240,6 @@ fn emit_insert_at_path(
     new_green: usize,
     new_green_offset: usize,
     source_text: &str,
-    span_cascade: bool,
     out: &mut Vec<Command>,
     next_node_id: &mut u64,
 ) {
@@ -265,11 +254,10 @@ fn emit_insert_at_path(
     out.push(Command::InsertNodeAtPath {
         path: path.clone(),
         node_id,
-        cascade_to_root: should_cascade(span_cascade, path),
+        cascade_to_root: false,
     });
 }
 
-#[allow(clippy::too_many_arguments)]
 fn try_emit_insertions_as_subsequence_aligned(
     alloc: &TreeAllocRef,
     path: &NodePath,
@@ -281,7 +269,6 @@ fn try_emit_insertions_as_subsequence_aligned(
     new_mid_end: usize,
     new_green_offset: usize,
     source_text: &str,
-    span_cascade: bool,
     current_is_root: bool,
     out: &mut Vec<Command>,
     next_node_id: &mut u64,
@@ -325,7 +312,6 @@ fn try_emit_insertions_as_subsequence_aligned(
             insert_child,
             insert_offset,
             source_text,
-            span_cascade,
             out,
             next_node_id,
         );
@@ -347,7 +333,6 @@ fn try_emit_insertions_as_subsequence_aligned(
             child_offset,
             source_text,
             &child_path,
-            span_cascade,
             current_is_root,
             out,
             next_node_id,
@@ -371,7 +356,6 @@ fn try_emit_deletions_as_subsequence_aligned(
     new_mid_end: usize,
     new_green_offset: usize,
     source_text: &str,
-    span_cascade: bool,
     current_is_root: bool,
     out: &mut Vec<Command>,
     next_node_id: &mut u64,
@@ -399,7 +383,6 @@ fn try_emit_deletions_as_subsequence_aligned(
                 child_offset,
                 source_text,
                 &child_path,
-                span_cascade,
                 current_is_root,
                 out,
                 next_node_id,
@@ -416,10 +399,6 @@ fn try_emit_deletions_as_subsequence_aligned(
     }
 
     new_ix == new_mid.len()
-}
-
-fn should_cascade(span_cascade: bool, path: &NodePath) -> bool {
-    span_cascade && !path.0.is_empty()
 }
 
 fn common_prefix_len(
@@ -542,13 +521,45 @@ fn emit_create_commands_from_green(
     let node_id = *next_node_id;
     *next_node_id = next_node_id.saturating_add(1);
 
-    out.push(Command::CreateNode {
-        node_id,
-        tag: node.tag.clone(),
-        width: node.width,
-        token_text: token_text_for_node(&node.tag, node_offset, node.width, source_text),
-        children: child_ids,
-    });
+    // Emit different command types based on tag
+    match &node.tag {
+        crate::parsec::tree::Tag::Token { .. } => {
+            let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
+                .unwrap_or_default();
+            out.push(Command::CreateToken {
+                node_id,
+                tag: node.tag.clone(),
+                text,
+                field: String::new(),
+            });
+        }
+        crate::parsec::tree::Tag::Error(err) => {
+            let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
+                .unwrap_or_default();
+            out.push(Command::CreateError {
+                node_id,
+                kind: err.clone(),
+                text,
+                field: String::new(),
+            });
+        }
+        crate::parsec::tree::Tag::Field { name, .. } => {
+            out.push(Command::CreateNode {
+                node_id,
+                tag: node.tag.clone(),
+                children: child_ids,
+                field: name.to_string(),
+            });
+        }
+        crate::parsec::tree::Tag::Rule { .. } => {
+            out.push(Command::CreateNode {
+                node_id,
+                tag: node.tag.clone(),
+                children: child_ids,
+                field: String::new(),
+            });
+        }
+    }
 
     node_id
 }

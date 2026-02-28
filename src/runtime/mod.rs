@@ -1,10 +1,12 @@
 use std::{
+    error,
     marker::PhantomData,
-    ops,
+    ops::{self, Deref},
     panic::{AssertUnwindSafe, catch_unwind},
-    sync::mpsc,
     thread::{self, JoinHandle},
 };
+
+use crossbeam::channel;
 
 use crate::{
     grammar::Grammar,
@@ -32,7 +34,6 @@ pub enum Action {
     Insert { offset: usize, text: String },
     Delete { span: Span },
     Update { span: Span, text: String },
-
     Run,
     Pause,
     Resume,
@@ -40,7 +41,7 @@ pub enum Action {
 }
 
 impl Action {
-    fn kind(&self) -> RuntimeAction {
+    pub fn kind(&self) -> RuntimeAction {
         match self {
             Action::Insert { .. } => RuntimeAction::Insert,
             Action::Delete { .. } => RuntimeAction::Delete,
@@ -82,11 +83,12 @@ pub enum ListenerHook {
     OnError,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug)]
 pub enum RuntimeError {
     QueueFull,
     ChannelClosed,
     WorkerPanicked,
+    GeneralError(Box<dyn error::Error + Send + Sync>),
     InvalidOffset {
         offset: usize,
         text_len: usize,
@@ -125,10 +127,6 @@ impl From<ReparseError> for RuntimeError {
         }
     }
 }
-
-pub enum RuntimeResultKind {}
-
-pub type RuntimeResult<T> = Result<T, RuntimeError>;
 
 pub struct RuntimeListener<T = ()> {
     before_update: Option<Box<dyn Fn() + Send>>,
@@ -268,16 +266,12 @@ impl Default for RuntimeConfig {
     }
 }
 
-pub trait Source {
-    fn run(inst: InteractiveInstance);
-}
 pub struct Interactive<T = (), M = ()> {
     grammar: &'static Grammar,
     runtime_config: RuntimeConfig,
     runtime_listener: Option<RuntimeListener<T>>,
     parser_listener: Option<ParserListener>,
     semantic_map: Option<M>,
-    interface: Option<Box<dyn Interface>>,
     _semantic_ty: PhantomData<T>,
 }
 
@@ -289,7 +283,6 @@ impl Interactive<(), ()> {
             runtime_listener: None,
             parser_listener: None,
             semantic_map: None,
-            interface: None,
             _semantic_ty: PhantomData,
         }
     }
@@ -309,7 +302,6 @@ impl Interactive<(), ()> {
             runtime_listener: None,
             parser_listener: self.parser_listener,
             semantic_map: Some(map),
-            interface: self.interface,
             _semantic_ty: PhantomData,
         }
     }
@@ -362,50 +354,56 @@ where
         self
     }
 
-    pub fn with_interface<I: Interface + 'static>(mut self, interface: I) -> Self
-    where
-        I: Source,
-    {
-        self.interface = Some(Box::new(interface));
-        self
-    }
-
-    pub fn finish(self) -> InteractiveInstance {
+    pub fn finish<I: Interface>(self) -> InteractiveInstance<I> {
         InteractiveInstance::init(
             self.grammar,
             self.runtime_config,
             self.runtime_listener.unwrap_or_default(),
             self.parser_listener.unwrap_or_default(),
             self.semantic_map,
-            self.interface,
         )
     }
 }
 
+pub type RuntimeResult<T = Option<RuntimeResponse>> = Result<T, RuntimeError>;
+
+#[derive(Debug, Clone)]
 pub struct RuntimeRequest {
-    action: Action,
-    reply: mpsc::Sender<RuntimeResult<()>>,
+    pub(crate) action: Action,
+    pub(crate) reply: channel::Sender<RuntimeResult>,
 }
 
-pub struct InteractiveInstance {
-    sender: mpsc::SyncSender<RuntimeRequest>,
+#[derive(Debug, Clone)]
+pub struct RuntimeResponse {
+    pub commands: Vec<String>,
+}
+
+pub struct InteractiveInstance<I> {
     thread_handle: JoinHandle<()>,
+    api: I,
 }
 
-impl InteractiveInstance {
+impl<I: Interface> Deref for InteractiveInstance<I> {
+    type Target = I;
+
+    fn deref(&self) -> &Self::Target {
+        &self.api
+    }
+}
+
+impl<I: Interface> InteractiveInstance<I> {
     pub(crate) fn init<T, M>(
         grammar: &'static Grammar,
         runtime_config: RuntimeConfig,
         runtime_listener: RuntimeListener<T>,
         parser_listener: ParserListener,
         semantic_map: Option<M>,
-        interface: Option<Box<dyn Interface>>,
     ) -> Self
     where
         T: Clone + PartialEq + 'static,
         M: AstMapper<T> + Send + 'static,
     {
-        let (sender, receiver) = mpsc::sync_channel(runtime_config.action_queue_capacity.max(1));
+        let (sender, receiver) = channel::bounded(runtime_config.action_queue_capacity.max(1));
         let thread_handle = thread::spawn(move || {
             let mut parser = Parser::new(grammar)
                 .with_config(runtime_config.parser)
@@ -432,75 +430,18 @@ impl InteractiveInstance {
             runtime.run_event_loop();
         });
 
-        if let Some(mut interface) = interface {
-            interface.start(sender.clone());
-        }
-
         Self {
-            sender,
             thread_handle,
+            api: I::new(sender),
         }
     }
 
-    fn request(&self, action: Action) -> RuntimeResult<()> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let request = RuntimeRequest {
-            action,
-            reply: reply_tx,
-        };
-        match self.sender.try_send(request) {
-            Ok(()) => reply_rx.recv().map_err(|_| RuntimeError::ChannelClosed)?,
-            Err(mpsc::TrySendError::Full(_)) => Err(RuntimeError::QueueFull),
-            Err(mpsc::TrySendError::Disconnected(_)) => Err(RuntimeError::ChannelClosed),
-        }
+    pub fn api(&self) -> &I {
+        &self.api
     }
 
-    pub fn receive_from<S: Source>(self) -> () {
-        S::run(self);
-    }
-
-    pub fn update(&self, start: usize, end: usize, text: &str) -> RuntimeResult<()> {
-        self.request(Action::Update {
-            span: Span::new(start, end),
-            text: text.to_string(),
-        })
-    }
-
-    pub fn insert(&self, offset: usize, text: &str) -> RuntimeResult<()> {
-        self.request(Action::Insert {
-            offset,
-            text: text.to_string(),
-        })
-    }
-
-    pub fn delete(&self, start: usize, end: usize) -> RuntimeResult<()> {
-        self.request(Action::Delete {
-            span: Span::new(start, end),
-        })
-    }
-
-    pub fn pause(&self) -> RuntimeResult<()> {
-        self.request(Action::Pause)
-    }
-
-    pub fn resume(&self) -> RuntimeResult<()> {
-        self.request(Action::Resume)
-    }
-
-    pub fn run(&self) -> RuntimeResult<()> {
-        self.request(Action::Run)
-    }
-
-    pub fn exit(&self) -> RuntimeResult<()> {
-        self.request(Action::Exit)
-    }
-
-    pub fn join(self) -> RuntimeResult<()> {
-        drop(self.sender);
-        self.thread_handle
-            .join()
-            .map_err(|_| RuntimeError::WorkerPanicked)?;
-        Ok(())
+    pub fn join(self) -> thread::Result<()> {
+        self.thread_handle.join()
     }
 }
 
@@ -517,7 +458,7 @@ pub struct Runtime<T, M> {
     cursor: Reparser,
     semantic_map: Option<IncrementalLowerer<T, M>>,
     semantic_map_initialized: bool,
-    receiver: mpsc::Receiver<RuntimeRequest>,
+    receiver: channel::Receiver<RuntimeRequest>,
     mode: RuntimeMode,
 }
 
@@ -541,7 +482,7 @@ where
         }
     }
 
-    fn emit_error(&self, error: &RuntimeError) -> RuntimeResult<()> {
+    fn emit_error(&self, error: &RuntimeError) -> RuntimeResult {
         if let Some(listener) = self.runtime_listener.on_error.as_ref() {
             catch_unwind(AssertUnwindSafe(|| (listener)(error))).map_err(|_| {
                 RuntimeError::ListenerPanic {
@@ -549,35 +490,36 @@ where
                 }
             })?;
         }
-        Ok(())
+        Ok(None)
     }
 
     fn call_simple_listener(
         &self,
         hook: ListenerHook,
         callback: Option<&Box<dyn Fn() + Send>>,
-    ) -> RuntimeResult<()> {
+    ) -> RuntimeResult {
         let Some(callback) = callback else {
-            return Ok(());
+            return Ok(None);
         };
         catch_unwind(AssertUnwindSafe(|| (callback)()))
+            .map(|_| None)
             .map_err(|_| RuntimeError::ListenerPanic { hook })
     }
 
-    fn call_after_update_listener(&self, result: UpdateResult<T>) -> RuntimeResult<()> {
+    fn call_after_update_listener(&self, result: UpdateResult<T>) -> RuntimeResult {
         let Some(listener) = self.runtime_listener.after_update.as_ref() else {
-            return Ok(());
+            return Ok(None);
         };
-        catch_unwind(AssertUnwindSafe(|| (listener)(result))).map_err(|_| {
-            RuntimeError::ListenerPanic {
+        catch_unwind(AssertUnwindSafe(|| (listener)(result)))
+            .map(|_| None)
+            .map_err(|_| RuntimeError::ListenerPanic {
                 hook: ListenerHook::AfterUpdate,
-            }
-        })
+            })
     }
 
-    fn ensure_mode(&self, expected: RuntimeMode, action: RuntimeAction) -> RuntimeResult<()> {
+    fn ensure_mode(&self, expected: RuntimeMode, action: RuntimeAction) -> RuntimeResult {
         if self.mode == expected {
-            return Ok(());
+            return Ok(None);
         }
         Err(RuntimeError::InvalidMode {
             mode: self.mode,
@@ -605,9 +547,9 @@ where
         (root, Some(arena), node)
     }
 
-    fn validate_offset(&self, offset: usize) -> RuntimeResult<()> {
+    fn validate_offset(&self, offset: usize) -> RuntimeResult {
         if offset <= self.text.len() {
-            return Ok(());
+            return Ok(None);
         }
         Err(RuntimeError::InvalidOffset {
             offset,
@@ -615,9 +557,9 @@ where
         })
     }
 
-    fn validate_span(&self, span: Span) -> RuntimeResult<()> {
+    fn validate_span(&self, span: Span) -> RuntimeResult {
         if span.start <= span.end && span.end <= self.text.len() {
-            return Ok(());
+            return Ok(None);
         }
         Err(RuntimeError::InvalidRange {
             start: span.start,
@@ -667,7 +609,7 @@ where
         }
     }
 
-    fn handle_edit_request(&mut self, action: Action) -> RuntimeResult<()> {
+    fn handle_edit_request(&mut self, action: Action) -> RuntimeResult {
         let staged = self.stage_edit(&action)?;
 
         self.call_simple_listener(
@@ -705,6 +647,12 @@ where
         let semantic_ir_delta = self.semantic_delta(&result.semantic_commands);
         let (semantic_ir_root_cell, semantic_ir_arena, semantic_ir_root) = self.semantic_root();
 
+        let commands = result
+            .semantic_commands
+            .iter()
+            .map(|cmd| serde_json::to_string(cmd).unwrap_or_default())
+            .collect::<Vec<_>>();
+
         let update = UpdateResult::new(
             result.messages,
             &self.cursor.current,
@@ -721,15 +669,17 @@ where
             metrics,
         );
 
-        self.call_after_update_listener(update)
+        self.call_after_update_listener(update)?;
+
+        Ok(Some(RuntimeResponse { commands }))
     }
 
-    fn handle_action(&mut self, action: Action) -> RuntimeResult<()> {
+    fn handle_action(&mut self, action: Action) -> RuntimeResult {
         match action {
             Action::Run => {
                 self.ensure_mode(RuntimeMode::Ready, RuntimeAction::Run)?;
                 self.mode = RuntimeMode::Running;
-                Ok(())
+                Ok(None)
             }
             Action::Pause => {
                 self.ensure_mode(RuntimeMode::Running, RuntimeAction::Pause)?;
@@ -756,7 +706,7 @@ where
                         self.runtime_listener.on_interrupt.as_ref(),
                     )?;
                 }
-                Ok(())
+                Ok(None)
             }
             edit @ Action::Insert { .. }
             | edit @ Action::Delete { .. }

@@ -1,4 +1,5 @@
 use crate::{
+    interface::BasicInterface,
     new_grammar,
     parsec::{ParserConfig, recovery::RecoveryConfig, words::*},
     runtime::{Interactive, RuntimeListener},
@@ -93,7 +94,7 @@ fn test_expr_example() {
             simple_ast: true,
             recovery: RecoveryConfig::default(),
         })
-        .finish();
+        .finish::<BasicInterface>();
 
     runtime.run().unwrap();
     runtime
@@ -184,7 +185,7 @@ fn test_semantic_commands() {
             simple_ast: true,
             recovery: RecoveryConfig::default(),
         })
-        .finish();
+        .finish::<BasicInterface>();
 
     runtime.run().unwrap();
     runtime.insert(0, "1 + 4 * 4 + (5 + 5) * 2").unwrap();

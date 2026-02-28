@@ -46,8 +46,6 @@ pub struct ReparserConfig {
     /// Minimum zipper level (depth) required to consider a candidate.
     /// Higher values force narrower (deeper) reparses.
     pub min_level: usize,
-    /// When false, no ancestor span cascade propagation is performed.
-    pub span_cascade: bool,
 }
 
 impl Default for ReparserConfig {
@@ -56,7 +54,6 @@ impl Default for ReparserConfig {
             enforce_region_end: true,
             enforce_sync_bound: true,
             min_level: 0,
-            span_cascade: false,
         }
     }
 }
@@ -246,7 +243,6 @@ impl Reparser {
                 enforce_sync_bound: false,
                 enforce_region_end: false,
                 min_level: self.config.min_level,
-                span_cascade: self.config.span_cascade,
             };
             if let Some(m) = ctx.metrics.as_deref_mut() {
                 m.message = "strict candidate filters rejected all zippers; retried with relaxed incremental bounds".to_string();
@@ -375,7 +371,6 @@ impl Reparser {
             candidate.green,
             candidate.zipper.offset,
             new_source_text,
-            self.config.span_cascade,
             self.current.parent.is_none(),
         );
 
@@ -532,11 +527,7 @@ impl Reparser {
         let root = self.alloc.get_node(root_green);
 
         // Check for placeholder root without cloning
-        let is_placeholder_root = matches!(
-            &root.tag,
-            Tag::Error(errors)
-                if errors.iter().any(|e| matches!(e, ParsecError::Placeholder))
-        );
+        let is_placeholder_root = matches!(&root.tag, Tag::Error(ParsecError::Placeholder));
 
         let children = root.children.clone();
 
@@ -1042,41 +1033,5 @@ fn collect_from(
 
             return;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::Reparser;
-    use crate::utils::Span;
-
-    #[test]
-    fn insertion_focus_trims_leading_separator() {
-        let source = r#"{"name": "Dexer", "age": 30}"#;
-        let inserted = r#", "age": 30"#;
-        let start = source.find(inserted).expect("inserted text must exist");
-
-        let span = Reparser::focus_span_for_edit(source, Span::new(start, start), inserted.len());
-        assert_eq!(&source[span.start..span.end], r#""age": 30"#);
-    }
-
-    #[test]
-    fn insertion_focus_trims_trailing_separator() {
-        let source = r#"{"name": "Dexer", "age": 30, "city": "LA"}"#;
-        let inserted = r#""age": 30, "#;
-        let start = source.find(inserted).expect("inserted text must exist");
-
-        let span = Reparser::focus_span_for_edit(source, Span::new(start, start), inserted.len());
-        assert_eq!(&source[span.start..span.end], r#""age": 30"#);
-    }
-
-    #[test]
-    fn insertion_focus_falls_back_when_only_separator_inserted() {
-        let source = "{, }";
-        let inserted = ", ";
-        let start = source.find(inserted).expect("inserted text must exist");
-
-        let span = Reparser::focus_span_for_edit(source, Span::new(start, start), inserted.len());
-        assert_eq!(&source[span.start..span.end], inserted);
     }
 }

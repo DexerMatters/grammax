@@ -1,11 +1,12 @@
 use rustc_hash::FxHashMap;
+use serde::Serialize;
 use std::cell::{self, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 /// Error types that can occur during parsing, used for error reporting and recovery.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum ParsecError {
     Incomplete,
     UnexpectedToken,
@@ -18,13 +19,12 @@ pub enum ParsecError {
 pub type GreenId = usize;
 
 /// Tags indicating the type of a syntax tree node, such as whether it's a rule, token, field, or an error.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub enum Tag {
     Rule { rule_ix: usize },
     Token { rule_ix: usize }, // Usually terminal_idx
     Field { rule_ix: usize, name: &'static str },
-    Error(Vec<ParsecError>),
-    Root,
+    Error(ParsecError),
 }
 
 impl Tag {
@@ -38,7 +38,7 @@ impl Tag {
         Tag::Field { rule_ix, name }
     }
     pub fn new_error(err: ParsecError) -> Self {
-        Tag::Error(vec![err])
+        Tag::Error(err)
     }
     pub fn is_error(&self) -> bool {
         matches!(self, Tag::Error(_))
@@ -154,6 +154,6 @@ impl TreeAllocRefExt for TreeAllocRef {
     }
 
     fn new_placeholder(&self, width: usize) -> GreenId {
-        self.alloc(Tag::Error(vec![ParsecError::Placeholder]), vec![], width)
+        self.alloc(Tag::Error(ParsecError::Placeholder), vec![], width)
     }
 }

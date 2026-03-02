@@ -674,7 +674,7 @@ fn lex_at_stream(tokens: &TokenStream, pos: usize) -> (usize, usize) {
 
 fn build_insert_candidates(
     analysis: &GrammarStateAnalysis,
-    _terminals: &[MatcherRef],
+    terminals: &[MatcherRef],
 ) -> Vec<Vec<usize>> {
     analysis
         .states
@@ -684,7 +684,11 @@ fn build_insert_candidates(
                 .actions
                 .keys()
                 .copied()
-                .filter(|term_ix| *term_ix != EOF_TOKEN && *term_ix != UNKNOWN_TOKEN)
+                .filter(|term_ix| {
+                    *term_ix != EOF_TOKEN
+                        && *term_ix != UNKNOWN_TOKEN
+                        && terminals.get(*term_ix).is_some_and(|m| m.is_consuming())
+                })
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -787,21 +791,31 @@ fn lex_at_text(
     pos: usize,
     string_opened: bool,
 ) -> (usize, usize) {
-    if pos >= text.len() {
-        return (EOF_TOKEN, 0);
-    }
-
-    let rest = &text[pos..];
+    let bounded_pos = pos.min(text.len());
+    let rest = &text[bounded_pos..];
+    let at_boundary = bounded_pos >= text.len();
     let mut best_match: Option<(usize, usize)> = None;
 
     for (idx, matcher) in terminals.iter().enumerate() {
         if !string_opened && matcher.display().contains("json_string") {
             continue;
         }
+        // Inside a string, skip "opening-quote" style terminals (those with a
+        // whitespace-consuming prefix, like `char_predicate* "`).  They are
+        // designed for starting a string value and should not consume the
+        // closing quote inside an already-open string. The exact closing-quote
+        // terminal (without a whitespace prefix) will be selected instead.
+        if string_opened
+            && matcher.preview() == Some("\"")
+            && matcher.display().contains("char_predicate")
+        {
+            continue;
+        }
         let mut test_pos = 0;
         if let Some(len) = matcher.matches(rest, &mut test_pos) {
-            // Skip zero-length matches except for quote terminals
-            if len == 0 && !rest.starts_with('"') {
+            // Allow zero-length matches only at boundary, except json-string
+            // body handling which uses quote-start behaviour.
+            if len == 0 && !(at_boundary || rest.starts_with('"')) {
                 continue;
             }
             // Keep longest match
@@ -813,6 +827,8 @@ fn lex_at_text(
 
     if let Some((idx, len)) = best_match {
         (idx, len)
+    } else if at_boundary || rest.trim().is_empty() {
+        (EOF_TOKEN, 0)
     } else {
         // Unknown token
         let len = unknown_token_len(terminals, text, pos, string_opened);

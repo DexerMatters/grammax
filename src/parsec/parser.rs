@@ -304,22 +304,46 @@ impl Parser {
             } else {
                 // Scope recovery (Nilsson-Nyman 2009 §4): before falling back to
                 // CPCT+, try to skip to the nearest matching close delimiter.
-                let scope_result = scope_recover(
-                    &self.grammar.bridge_specs,
-                    &self.grammar.recovery_delimiters,
-                    &self.grammar.table.terminals,
-                    &self.text,
-                    self.pos,
-                    &open_scope_stack,
-                );
+                //
+                // However, do NOT attempt scope recovery when we are in a
+                // "reduce-only" LR state (a state whose action table contains
+                // only Reduce actions and no Shift actions).  In such states the
+                // parser has already fully matched a construct and simply needs
+                // the right lookahead token to trigger the reduction.  Scope
+                // recovery in this situation tends to skip over valid content
+                // (e.g. the next key string), burying the skipped text inside
+                // the just-matched construct.  CPCT+ can instead insert the
+                // missing FOLLOW token at cost 1, which triggers the correct
+                // reduction chain and allows the subsequent valid input to be
+                // parsed normally.
+                let has_shift_in_current_state = {
+                    let cur = *state_stack.last().unwrap();
+                    self.grammar.analysis.states[cur]
+                        .actions
+                        .values()
+                        .any(|a| matches!(a, Action::Shift(_)))
+                };
+                let scope_result = if has_shift_in_current_state {
+                    scope_recover(
+                        &self.grammar.bridge_specs,
+                        &self.grammar.recovery_delimiters,
+                        &self.grammar.table.terminals,
+                        &self.text,
+                        self.pos,
+                        &open_scope_stack,
+                    )
+                } else {
+                    None
+                };
                 if let Some(sr) = scope_result {
                     let skip_len = sr.skip_to - self.pos;
                     if skip_len > 0 {
-                        self.push_unexpected_trimmed(self.pos, sr.skip_to, Vec::new());
+                        // Use actual expected terminals (from current state) so the
+                        // UnexpectedToken node carries meaningful diagnostic information.
+                        let expected = self.expected_ids(*state_stack.last().unwrap());
+                        self.push_unexpected_trimmed(self.pos, sr.skip_to, expected.clone());
                         let error_node = self.alloc.alloc(
-                            Tag::new_error(ParsecError::UnexpectedToken {
-                                expected: Vec::new(),
-                            }),
+                            Tag::new_error(ParsecError::UnexpectedToken { expected }),
                             vec![],
                             skip_len,
                         );
@@ -380,6 +404,13 @@ impl Parser {
                 }
             }
         }
+
+        // Force-accept phase: if the main loop exited before reaching the
+        // Accept action, drive the parser the rest of the way by processing
+        // EOF-lookahead actions (Reduce / Accept) and inserting MissingToken
+        // nodes for any remaining expected terminals.  This avoids wrapping
+        // the partial result in an [Incomplete] root node.
+        self.force_accept(&mut state_stack, &mut node_stack);
 
         let root_green = self.finalize_root(&mut node_stack);
         self.prime_reuse_from_tree(root_green, 0);
@@ -864,34 +895,98 @@ impl Parser {
                     if self.is_json_string_terminal(term_ix) && !at_boundary {
                         return false;
                     }
-                    self.messages.push(ParserMessage::new_missing(
-                        Span::new(self.pos, self.pos),
-                        vec![term_ix],
-                    ));
-                    let token_node = self.alloc.alloc(
-                        Tag::new_error(ParsecError::MissingToken {
-                            expected: vec![term_ix],
-                        }),
-                        vec![],
-                        0,
-                    );
+                    // If the terminal actually matches at the current position
+                    // with zero width (e.g. EndOfInput terminal when pos is at
+                    // end of source), treat it as a real token, not a MissingToken.
+                    // This prevents phantom MissingToken(EndOfInput) nodes when
+                    // CPCT+ inserts the EOF terminal as a repair at true EOF.
+                    let actually_present = term_ix != EOF_TOKEN && {
+                        let matcher = self.grammar.table.terminals.get(term_ix);
+                        let mut probe = self.pos;
+                        matches!(
+                            matcher.and_then(|m| m.matches(&self.text, &mut probe)),
+                            Some(_) if probe == self.pos
+                        )
+                    };
+                    let token_node = if term_ix == EOF_TOKEN || actually_present {
+                        self.alloc.alloc_token(Tag::new_token(term_ix), 0)
+                    } else {
+                        self.messages.push(ParserMessage::new_missing(
+                            Span::new(self.pos, self.pos),
+                            vec![term_ix],
+                        ));
+                        self.alloc.alloc(
+                            Tag::new_error(ParsecError::MissingToken {
+                                expected: vec![term_ix],
+                            }),
+                            vec![],
+                            0,
+                        )
+                    };
                     if !self.apply_terminal(term_ix, 0, token_node, false, state_stack, node_stack)
                     {
                         return false;
                     }
                 }
                 RepairOp::Delete => {
+                    // Peek ahead: if the following op is an Insert of a keyword
+                    // terminal (one with a fixed preview string like "true",
+                    // "{", etc.), combine Delete+Insert into a single
+                    // UnexpectedToken that is shifted as that terminal.  The
+                    // existing passthrough_unexpected logic in perform_reduce then
+                    // threads it through the grammar reductions, so the node
+                    // becomes the value child rather than an unbound sibling next
+                    // to a zero-width phantom MissingToken.
+                    if i + 1 < ops.len() {
+                        if let RepairOp::Insert(next_term_ix) = ops[i + 1] {
+                            let is_keyword = next_term_ix != EOF_TOKEN
+                                && self
+                                    .grammar
+                                    .table
+                                    .terminals
+                                    .get(next_term_ix)
+                                    .and_then(|m| m.preview())
+                                    .is_some();
+                            if is_keyword {
+                                let expected = self.expected_ids(*state_stack.last().unwrap());
+                                let (_term, len, _node) = self.lex(None);
+                                if len > 0 {
+                                    self.push_unexpected_trimmed(
+                                        self.pos,
+                                        self.pos + len,
+                                        expected.clone(),
+                                    );
+                                    let error_node = self.alloc.alloc(
+                                        Tag::new_error(ParsecError::UnexpectedToken { expected }),
+                                        vec![],
+                                        len,
+                                    );
+                                    self.consume(len);
+                                    if !self.apply_terminal(
+                                        next_term_ix,
+                                        0,
+                                        error_node,
+                                        false,
+                                        state_stack,
+                                        node_stack,
+                                    ) {
+                                        return false;
+                                    }
+                                    i += 2;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    // Normal Delete: push as an unbound error node.
                     let expected = self.expected_ids(*state_stack.last().unwrap());
                     let (_term, len, _node) = self.lex(None);
                     if len == 0 {
                         return false;
                     }
-                    let error_expected = expected.clone();
-                    self.push_unexpected_trimmed(self.pos, self.pos + len, expected);
+                    self.push_unexpected_trimmed(self.pos, self.pos + len, expected.clone());
                     let deleted_node = self.alloc.alloc(
-                        Tag::new_error(ParsecError::UnexpectedToken {
-                            expected: error_expected,
-                        }),
+                        Tag::new_error(ParsecError::UnexpectedToken { expected }),
                         vec![],
                         len,
                     );
@@ -968,6 +1063,135 @@ impl Parser {
         }
     }
 
+    /// Drive the parser to Accept by repeatedly following EOF-lookahead
+    /// Reduce actions and inserting zero-width MissingToken nodes for any
+    /// terminals required by Shift actions before we can reduce/accept.
+    fn force_accept(&mut self, state_stack: &mut Vec<usize>, node_stack: &mut Vec<StackEntry>) {
+        const MAX_ITERS: usize = 1024;
+        for _ in 0..MAX_ITERS {
+            let current_state_idx = *state_stack.last().unwrap();
+
+            // 1+2. Handle EOF-lookahead action.
+            match self.grammar.analysis.states[current_state_idx]
+                .actions
+                .get(&EOF_TOKEN)
+                .cloned()
+            {
+                Some(Action::Accept) => break,
+                Some(Action::Reduce(prod_idx)) => {
+                    if !self.perform_reduce(prod_idx, state_stack, node_stack) {
+                        break;
+                    }
+                    continue;
+                }
+                _ => {}
+            }
+
+            // 3. No EOF action — reduce if possible (prefer ε-productions), so we
+            // can drain nullable rules like @sep_tail → ε and reduce-only states
+            // like @extract → pair @sep_tail that don't respond to EOF.
+            let any_reduce: Option<usize> = {
+                let state = &self.grammar.analysis.states[current_state_idx];
+                let has_shift = state
+                    .actions
+                    .iter()
+                    .any(|(&t, a)| t != EOF_TOKEN && matches!(a, Action::Shift(_)));
+                let reduces: Vec<usize> = state
+                    .actions
+                    .values()
+                    .filter_map(|a| {
+                        if let Action::Reduce(p) = a {
+                            Some(*p)
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+                let eps = reduces
+                    .iter()
+                    .copied()
+                    .find(|&p| self.grammar.table.productions[p].rhs.is_empty());
+                if eps.is_some() {
+                    eps
+                } else if !has_shift {
+                    reduces
+                        .into_iter()
+                        .min_by_key(|&p| self.grammar.table.productions[p].rhs.len())
+                } else {
+                    None
+                }
+            };
+            if let Some(prod_idx) = any_reduce {
+                if !self.perform_reduce(prod_idx, state_stack, node_stack) {
+                    break;
+                }
+                continue;
+            }
+
+            // 4. Must shift something — pick the terminal whose destination state
+            // has an EOF-lookahead action (closer to Accept).
+            let cur_state = &self.grammar.analysis.states[current_state_idx];
+            let term_ix_opt = cur_state
+                .actions
+                .iter()
+                .filter_map(|(&t, a)| {
+                    if t != EOF_TOKEN {
+                        if let Action::Shift(dest) = a {
+                            Some((t, *dest))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                })
+                .min_by_key(|&(_, dest)| {
+                    // 0 = dest has EOF action (closer to Accept), 1 = needs more input
+                    if self.grammar.analysis.states[dest]
+                        .actions
+                        .contains_key(&EOF_TOKEN)
+                    {
+                        0usize
+                    } else {
+                        1
+                    }
+                })
+                .map(|(t, _)| t);
+            let Some(term_ix) = term_ix_opt else { break };
+            if term_ix == EOF_TOKEN {
+                break;
+            }
+            // If the terminal actually matches at current position with zero width
+            // (e.g. EndOfInput terminal when at EOF), emit a real token, not MissingToken.
+            let actually_present = {
+                let matcher = self.grammar.table.terminals.get(term_ix);
+                let mut probe = self.pos;
+                matches!(
+                    matcher.and_then(|m| m.matches(&self.text, &mut probe)),
+                    Some(_) if probe == self.pos
+                )
+            };
+            let token_node = if actually_present {
+                self.alloc.alloc_token(Tag::new_token(term_ix), 0)
+            } else {
+                self.messages.push(ParserMessage::new_missing(
+                    Span::new(self.pos, self.pos),
+                    vec![term_ix],
+                ));
+                self.alloc.alloc(
+                    Tag::new_error(ParsecError::MissingToken {
+                        expected: vec![term_ix],
+                    }),
+                    vec![],
+                    0,
+                )
+            };
+            if !self.apply_terminal(term_ix, 0, token_node, false, state_stack, node_stack) {
+                break;
+            }
+        }
+    }
+
     fn finalize_root(&self, node_stack: &mut Vec<StackEntry>) -> GreenId {
         if node_stack.is_empty() {
             return self
@@ -981,7 +1205,42 @@ impl Parser {
             });
         }
 
-        let children: Vec<GreenId> = node_stack.drain(..).map(|e| e.node).collect();
+        // If there is exactly one bound (grammar) node on the stack, return it
+        // directly.  The remaining unbound entries are error/recovery nodes that
+        // were pushed outside the normal LR reduce chain (e.g. from scope
+        // recovery or CPCT+ Delete ops).  Their text spans are already covered
+        // by parser messages so they need not appear as an Incomplete wrapper.
+        let bound_count = node_stack.iter().filter(|e| e.binds_state).count();
+        if bound_count == 1 {
+            // Find and extract the single bound node, preserving order of unbound ones.
+            let bound_pos = node_stack.iter().rposition(|e| e.binds_state).unwrap();
+            let root_entry = node_stack.remove(bound_pos);
+            // The remaining unbound nodes are discarded (their content is in messages).
+            node_stack.clear();
+            return root_entry.node;
+        }
+
+        // Filter out zero-width grammar (non-error) nodes — these are phantom
+        // force_accept artifacts (e.g. a `start [width:0]` built entirely from
+        // MissingToken children) that carry no real text and would only clutter
+        // the [Incomplete] wrapper alongside genuine error/content nodes.
+        let children: Vec<GreenId> = node_stack
+            .drain(..)
+            .map(|e| e.node)
+            .filter(|&id| {
+                let n = self.alloc.get_node(id);
+                let is_phantom_grammar = n.width == 0 && !matches!(n.tag, Tag::Error(_));
+                !is_phantom_grammar
+            })
+            .collect();
+        if children.is_empty() {
+            return self
+                .alloc
+                .alloc(Tag::new_error(ParsecError::Incomplete), vec![], 0);
+        }
+        if children.len() == 1 {
+            return children[0];
+        }
         let width: usize = children
             .iter()
             .map(|id| self.alloc.get_node(*id).width)
@@ -1072,12 +1331,31 @@ impl Parser {
             }
         }
 
-        let passthrough_unexpected = is_single_terminal_prod
-            && children.len() == 1
-            && matches!(
-                &self.alloc.get_node(children[0]).tag,
-                Tag::Error(ParsecError::UnexpectedToken { .. })
-            );
+        // Pass through the error node directly (without creating a rule wrapper) when:
+        //   (a) UnexpectedToken — already handled for all single-terminal productions.
+        //   (b) MissingToken — but ONLY when the terminal is a keyword/literal (has a
+        //       non-None preview, e.g. "true", "false", "null", "{", …).  Pattern
+        //       terminals like `tt(NUMS)` or `tt(STRING)` have preview = None because
+        //       their matched text carries semantic value (the number's digits, the
+        //       string content, etc.), so we keep the rule wrapper (e.g. `primary`,
+        //       `number`) to give the semantic pass something meaningful to hang
+        //       on.  For keyword terminals the wrapper only names an arbitrary grammar
+        //       alternative chosen by the repair engine (e.g. `boolean` chosen just
+        //       because "true" happened to be the first insert candidate), so
+        //       suppressing it produces a cleaner error representation.
+        let passthrough_unexpected = is_single_terminal_prod && children.len() == 1 && {
+            let child_tag = &self.alloc.get_node(children[0]).tag;
+            matches!(child_tag, Tag::Error(ParsecError::UnexpectedToken { .. }))
+                || (matches!(child_tag, Tag::Error(ParsecError::MissingToken { .. })) && {
+                    // Terminal is a keyword/literal iff it has a non-None preview.
+                    let prod = &self.grammar.table.productions[prod_idx];
+                    matches!(prod.rhs.first(), Some(Symbol::Terminal(t))
+                                if self.grammar.table.terminals
+                                    .get(*t)
+                                    .and_then(|m| m.preview())
+                                    .is_some())
+                })
+        };
 
         let new_node = if passthrough_unexpected {
             children[0]

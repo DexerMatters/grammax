@@ -531,7 +531,15 @@ impl Reparser {
             None
         };
 
-        let path = NodePath(candidate.zipper.steps.iter().map(|s| s.child_idx).collect());
+        // Skip zipper steps where the parent is a transparent Field wrapper,
+        // because single-child Field nodes are not emitted as separate nodes in
+        // the command stream (they are merged into their child's field attribute).
+        let path = NodePath(
+            candidate.zipper.steps.iter()
+                .filter(|s| !matches!(self.alloc.get_node(s.parent.green).tag, Tag::Field { .. }))
+                .map(|s| s.child_idx)
+                .collect(),
+        );
         let semantic_commands = delta::generate_commands_incremental(
             &self.alloc,
             &path,

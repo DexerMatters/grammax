@@ -10,7 +10,10 @@ use std::{
 use crate::{
     grammar::Grammar,
     parsec::tree::{GreenId, Tag},
-    semantic::{Command, command::NodePath},
+    semantic::{
+        Command,
+        command::{NodePath, PathTargetKind},
+    },
 };
 
 pub struct ASTCell<T> {
@@ -1024,6 +1027,11 @@ where
                 field,
             } => self.create_rule_or_field_node(*node_id, *rule_ix, children, field),
             Command::DeleteNodeAtPath { path } => self.delete_node_at_path(path, ops),
+            Command::ReplaceNodeAtPath {
+                path,
+                node_id,
+                target_kind,
+            } => self.replace_node_at_path(path, *node_id, *target_kind, ops),
             Command::InsertNodeAtPath {
                 path,
                 node_id,
@@ -1215,6 +1223,60 @@ where
                 cascade_to_root: false,
             })
         }
+    }
+
+    fn replace_node_at_path(
+        &mut self,
+        path: &NodePath,
+        node_id: u64,
+        target_kind: PathTargetKind,
+        ops: &mut Vec<AstDeltaOp<T>>,
+    ) -> Option<RecomputeStart> {
+        let new_green = self.command_nodes.get(&node_id).copied()?;
+
+        if path.0.is_empty() {
+            if let Some(old_root) = self.root_green.replace(new_green) {
+                if old_root != new_green {
+                    self.prune_unreachable(old_root, ops);
+                }
+            }
+            self.refresh_offsets_from(new_green, 0);
+            return Some(RecomputeStart {
+                green: new_green,
+                cascade_to_root: false,
+            });
+        }
+
+        let parent_path = path.parent()?;
+        let &child_index = path.0.last()?;
+        let parent_green = self.green_at_path(&parent_path)?;
+
+        if child_index >= self.memo(parent_green).children.len() {
+            return None;
+        }
+
+        let old_green = self.memo(parent_green).children[child_index];
+        let old_is_leaf = matches!(self.memo(old_green).tag, Tag::Token { .. } | Tag::Error(_));
+        if matches!(target_kind, PathTargetKind::Leaf) && !old_is_leaf {
+            return None;
+        }
+        if matches!(target_kind, PathTargetKind::Node) && old_is_leaf {
+            return None;
+        }
+
+        self.memo_mut(parent_green).children[child_index] = new_green;
+        self.remove_parent(old_green, parent_green);
+        self.add_parent(new_green, parent_green);
+
+        if self.parent_count(old_green) == 0 && self.root_green != Some(old_green) {
+            self.prune_unreachable(old_green, ops);
+        }
+
+        self.refresh_offsets(parent_green);
+        Some(RecomputeStart {
+            green: parent_green,
+            cascade_to_root: true,
+        })
     }
 
     fn wrap_in_field_if_needed(

@@ -21,6 +21,13 @@ impl NodePath {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum PathTargetKind {
+    Node,
+    Leaf,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "camelCase")]
@@ -59,6 +66,16 @@ pub enum Command {
 
     /// Deletes the node currently located at a path.
     DeleteNodeAtPath { path: NodePath },
+
+    /// Replaces the node currently located at a path with a previously created node.
+    ///
+    /// This is used for direct substitutions (including leaf token/error replacement)
+    /// where delete+insert pairs would be ambiguous for downstream consumers.
+    ReplaceNodeAtPath {
+        path: NodePath,
+        node_id: u64,
+        target_kind: PathTargetKind,
+    },
 
     /// Inserts a previously created node at a stable path.
     ///

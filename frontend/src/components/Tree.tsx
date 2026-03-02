@@ -1,11 +1,13 @@
 import React, { useState, useReducer } from 'react';
-import type { CreateTokenCommand, CreateNodeCommand, CreateErrorCommand, DeleteNodeAtPathCommand, InsertNodeAtPathCommand, Command, RuleInfo } from '../Fetch';
+import { motion, AnimatePresence } from 'framer-motion';
+import type { CreateTokenCommand, CreateNodeCommand, CreateErrorCommand, DeleteNodeAtPathCommand, ReplaceNodeAtPathCommand, InsertNodeAtPathCommand, Command, RuleInfo } from '../Fetch';
 
 // ============ Runtime Tree Node Model ============
 
 type TreeNode = TokenNode | InternalNode | ErrorNode;
 
 interface TokenNode {
+  id: number;
   type: 'token';
   text: string;
   field: string;
@@ -14,6 +16,7 @@ interface TokenNode {
 }
 
 interface InternalNode {
+  id: number;
   type: 'node';
   field: string;
   ruleIx: number;
@@ -22,6 +25,7 @@ interface InternalNode {
 }
 
 interface ErrorNode {
+  id: number;
   type: 'error';
   field: string;
   text: string;
@@ -47,6 +51,7 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
     if (cmd.type === 'createToken') {
       const c = cmd as CreateTokenCommand;
       nodeMap.set(c.node_id, {
+        id: c.node_id,
         type: 'token',
         text: c.text,
         field: c.field,
@@ -60,6 +65,7 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
         continue;
       }
       nodeMap.set(c.node_id, {
+        id: c.node_id,
         type: 'node',
         field: c.field,
         ruleIx: c.rule_ix,
@@ -73,6 +79,7 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
           c.kind.type === 'missingToken' ? 'missing' :
             'incomplete';
       nodeMap.set(c.node_id, {
+        id: c.node_id,
         type: 'error',
         field: c.field,
         text: c.text,
@@ -88,6 +95,12 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
     if (cmd.type === 'deleteNodeAtPath') {
       const c = cmd as DeleteNodeAtPathCommand;
       currentTree = deleteAtPath(currentTree, c.path);
+    } else if (cmd.type === 'replaceNodeAtPath') {
+      const c = cmd as ReplaceNodeAtPathCommand;
+      const nodeToReplaceWith = nodeMap.get(c.node_id);
+      if (nodeToReplaceWith) {
+        currentTree = replaceAtPath(currentTree, c.path, nodeToReplaceWith);
+      }
     } else if (cmd.type === 'insertNodeAtPath') {
       const c = cmd as InsertNodeAtPathCommand;
       const nodeToInsert = nodeMap.get(c.node_id);
@@ -151,6 +164,29 @@ function insertAtPath(node: TreeNode | null, path: number[], newNode: TreeNode):
   };
 }
 
+function replaceAtPath(node: TreeNode | null, path: number[], newNode: TreeNode): TreeNode | null {
+  if (!node) return null;
+  if (path.length === 0) return newNode;
+  if (node.type !== 'node') return node;
+
+  const [head, ...rest] = path;
+  if (head < 0 || head >= node.children.length) return node;
+
+  const newChildren = [...node.children];
+  if (rest.length === 0) {
+    newChildren[head] = newNode;
+  } else {
+    const replacedChild = replaceAtPath(newChildren[head], rest, newNode);
+    if (replacedChild === null) return node;
+    newChildren[head] = replacedChild;
+  }
+
+  return {
+    ...node,
+    children: newChildren,
+  };
+}
+
 // ============ Tree Rendering Components ============
 
 interface TreeDisplayProps {
@@ -162,15 +198,47 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
   // All hooks must be called unconditionally at the top
   const [isExpanded, setIsExpanded] = useState(true);
   const [showDetails, setShowDetails] = useState(false);
+  const [isUpdating, setIsUpdating] = useState(false);
+
+  React.useEffect(() => {
+    if (isUpdating) {
+      const timer = setTimeout(() => setIsUpdating(false), 600);
+      return () => clearTimeout(timer);
+    }
+  }, [isUpdating]);
+
+  // Signal updates on text/token changes
+  React.useEffect(() => {
+    if (node.type === 'token') {
+      setIsUpdating(true);
+    }
+  }, [node.type === 'token' ? (node as TokenNode).text : undefined]);
+
+  // Signal updates on error state changes
+  React.useEffect(() => {
+    if (node.type === 'error') {
+      setIsUpdating(true);
+    }
+  }, [node.type === 'error' ? (node as ErrorNode).text : undefined, node.type === 'error' ? (node as ErrorNode).errorKind : undefined]);
 
   // Token rendering
   if (node.type === 'token') {
     return (
-      <div className="flex items-center gap-1 px-1.5 py-0.25">
-        <span className="px-2 py-0.5 rounded-lg border border-[#d8a878]/40 text-[#d8a878] font-mono text-xs break-all">
+      <motion.div
+        className="flex items-center"
+        initial={{ opacity: 0, scale: 0.95 }}
+        animate={{ opacity: 1, scale: 1 }}
+        exit={{ opacity: 0, scale: 0.95 }}
+        transition={{ duration: 0.2 }}
+      >
+        <motion.span
+          className="px-2 py-0.5 rounded-lg border-2 border-[#d8a878]/50 text-[#d8a878] font-mono text-xs break-all shadow-[0_0_8px_rgba(216,168,120,0.1)]"
+          animate={isUpdating ? { backgroundColor: ['rgba(216,168,120,0)', 'rgba(216,168,120,0.15)', 'rgba(216,168,120,0)'] } : {}}
+          transition={{ duration: 0.6, ease: 'easeInOut' }}
+        >
           {node.text}
-        </span>
-      </div>
+        </motion.span>
+      </motion.div>
     );
   }
 
@@ -195,17 +263,31 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
     }
 
     return (
-      <div>
-        <div
-          className={`flex items-center gap-3 px-1.5 py-0.25 font-mono text-xs cursor-pointer hover:opacity-80 transition-opacity`}
+      <motion.div
+        className="flex flex-col items-start"
+        initial={{ opacity: 0, x: -10 }}
+        animate={{ opacity: 1, x: 0 }}
+        exit={{ opacity: 0, x: -10 }}
+        transition={{ duration: 0.2 }}
+      >
+        <motion.div
+          className={`flex items-center gap-3 rounded-lg border-2 border-[#ff8899]/30 hover:border-[#ff8899]/60 px-1.5 py-0.25 font-mono text-xs cursor-pointer hover:bg-[#1a1a1a]/50 transition-all shadow-[0_0_8px_rgba(255,136,153,0.05)]`}
+          animate={isUpdating ? { boxShadow: ['0 0 8px rgba(255,136,153,0.05)', '0 0 16px rgba(255,136,153,0.3)', '0 0 8px rgba(255,136,153,0.05)'] } : {}}
+          transition={{ duration: 0.6, ease: 'easeInOut' }}
           onClick={() => setShowDetails(!showDetails)}
         >
-          <span className={`${color} font-bold whitespace-nowrap min-w-max`}>{label}</span>
+          <span className={`${color} font-black uppercase tracking-tighter min-w-max`}>{label}</span>
           {displayContent}
-        </div>
+        </motion.div>
 
         {showDetails && (
-          <div className="ml-3 mt-0.5 px-1.5 py-1 bg-[#1a1a1a] border-l border-[#8bdb8b]/30 font-mono text-xs">
+          <motion.div
+            initial={{ opacity: 0, height: 0 }}
+            animate={{ opacity: 1, height: 'auto' }}
+            exit={{ opacity: 0, height: 0 }}
+            transition={{ duration: 0.2 }}
+            className="ml-3 mt-0.5 px-1.5 py-1 bg-[#1a1a1a] border-l border-[#8bdb8b]/30 font-mono text-xs"
+          >
             <div className="flex flex-wrap gap-1">
               {node.expectedRuleIx.map((ix) => {
                 const rule = rules.get(ix);
@@ -220,9 +302,9 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
                 );
               })}
             </div>
-          </div>
+          </motion.div>
         )}
-      </div>
+      </motion.div>
     );
   }
 
@@ -231,24 +313,74 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
   const hasChildren = node.children.length > 0;
 
   return (
-    <div className="select-none">
-      <div
-        className="flex items-center gap-1.5 px-1.5 py-0.25 hover:bg-[#1a1a1a]/50 cursor-pointer transition-colors"
-        onClick={() => setIsExpanded(!isExpanded)}
-      >
-        <span className="font-semibold text-[#66ddff] text-xs tracking-wide">{node.field}</span>
-        <span className="text-[#666] text-xs font-mono">
-          <span className="text-[#8bdb8b]">{ruleName}</span>
-        </span>
+    <div className="select-none inline-flex flex-row items-stretch">
+      <div className="flex flex-col">
+        <div className="flex items-center group/header">
+          <div
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-lg border-2 border-[#8bdb8b]/60 hover:bg-[#1a1a1a]/50 cursor-pointer transition-colors shadow-[0_0_8px_rgba(139,219,139,0.1)]"
+            onClick={() => setIsExpanded(!isExpanded)}
+          >
+            <span className="text-[#999] text-xs font-mono">
+              <span className="text-[#8bdb8b] font-bold">{ruleName}</span>
+            </span>
+          </div>
+        </div>
+
+        {isExpanded && hasChildren && (
+          <AnimatePresence>
+            <motion.div
+              className="ml-[13px]"
+              initial={{ opacity: 0, height: 0 }}
+              animate={{ opacity: 1, height: 'auto' }}
+              exit={{ opacity: 0, height: 0 }}
+              transition={{ duration: 0.2 }}
+            >
+              {node.children.map((child, idx) => {
+                const isLast = idx === node.children.length - 1;
+                return (
+                  <motion.div
+                    key={child.id}
+                    className="flex"
+                    initial={{ opacity: 0, height: 0 }}
+                    animate={{ opacity: 1, height: 'auto' }}
+                    exit={{ opacity: 0, height: 0 }}
+                    transition={{ duration: 0.2 }}
+                  >
+                    {/* Branch line container - centered vertically with the node header */}
+                    <div className="flex flex-col flex-shrink-0 w-3 relative">
+                      {/* Vertical line connecting up - bolder stroke */}
+                      {isLast ? (
+                        // Rounded corner for the last child
+                        <div className="absolute top-0 left-0 w-3 h-[14.5px] border-l-2 border-b-2 border-[#8bdb8b]/30 rounded-bl-lg" />
+                      ) : (
+                        <>
+                          {/* Straight vertical line for non-last children */}
+                          <div className="w-[2px] absolute top-0 bottom-0 left-0 border-l-2 border-[#8bdb8b]/30" />
+                          {/* Straight horizontal branch line */}
+                          <div className="absolute top-[13.5px] left-0 w-3 h-[2px] border-t-2 border-[#8bdb8b]/30" />
+                        </>
+                      )}
+                    </div>
+
+                    <div className="flex-1 py-1">
+                      <TreeNodeDisplay node={child} rules={rules} />
+                    </div>
+                  </motion.div>
+                );
+              })}
+            </motion.div>
+          </AnimatePresence>
+        )}
       </div>
 
-      {isExpanded && hasChildren && (
-        <div className="ml-3 border-l border-[#8bdb8b]/20">
-          {node.children.map((child, idx) => (
-            <div key={idx} className="pl-2">
-              <TreeNodeDisplay node={child} rules={rules} />
-            </div>
-          ))}
+      {node.field && (
+        <div className="ml-1 flex items-stretch self-stretch flex-shrink-0">
+          <div className="w-1.5 self-stretch border-r-2 border-t-2 border-b-2 border-[#66ddff]/30 rounded-tr-lg rounded-br-lg" />
+          <div className="self-center flex items-center justify-center px-0.5 py-2 border-2 border-l-0 border-[#66ddff]/30 rounded-r-lg bg-[#1a1a1a]/40">
+            <span className="text-[#66ddff] text-xs font-mono font-bold [writing-mode:vertical-rl] [text-orientation:mixed]">
+              {node.field}
+            </span>
+          </div>
         </div>
       )}
     </div>

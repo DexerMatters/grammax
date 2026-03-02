@@ -40,7 +40,7 @@ export type Response = Command[] | String;
 
 
 export interface Command {
-  type: 'createToken' | 'createNode' | 'createError' | 'deleteNodeAtPath' | 'insertNodeAtPath';
+  type: 'createToken' | 'createNode' | 'createError' | 'deleteNodeAtPath' | 'replaceNodeAtPath' | 'insertNodeAtPath';
 }
 
 export interface CreateTokenCommand extends Command {
@@ -70,6 +70,15 @@ export interface CreateErrorCommand extends Command {
 export interface DeleteNodeAtPathCommand extends Command {
   type: 'deleteNodeAtPath';
   path: number[];
+}
+
+export type PathTargetKind = 'node' | 'leaf';
+
+export interface ReplaceNodeAtPathCommand extends Command {
+  type: 'replaceNodeAtPath';
+  path: number[];
+  node_id: number;
+  target_kind: PathTargetKind;
 }
 
 export interface InsertNodeAtPathCommand extends Command {

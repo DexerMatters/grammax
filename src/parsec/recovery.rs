@@ -1,4 +1,5 @@
 use crate::grammar::analysis::{Action, EOF_TOKEN, GrammarStateAnalysis};
+use crate::grammar::bridge::BridgeSpec;
 use crate::grammar::ir::Production;
 use crate::parsec::words::MatcherRef;
 use rustc_hash::FxHashMap;
@@ -673,7 +674,7 @@ fn lex_at_stream(tokens: &TokenStream, pos: usize) -> (usize, usize) {
 
 fn build_insert_candidates(
     analysis: &GrammarStateAnalysis,
-    terminals: &[MatcherRef],
+    _terminals: &[MatcherRef],
 ) -> Vec<Vec<usize>> {
     analysis
         .states
@@ -683,12 +684,7 @@ fn build_insert_candidates(
                 .actions
                 .keys()
                 .copied()
-                .filter(|term_ix| {
-                    *term_ix != EOF_TOKEN
-                        && *term_ix != UNKNOWN_TOKEN
-                        && !is_quote_terminal(terminals, *term_ix)
-                        && !is_json_string_terminal(terminals, *term_ix)
-                })
+                .filter(|term_ix| *term_ix != EOF_TOKEN && *term_ix != UNKNOWN_TOKEN)
                 .collect::<Vec<_>>()
         })
         .collect()
@@ -702,10 +698,16 @@ fn can_accept(
 ) -> bool {
     let mut cur = Rc::clone(stack);
     let mut seen = HashSet::new();
+    let mut steps = 0usize;
 
     loop {
+        steps += 1;
+        if steps > 512 {
+            return false;
+        }
+
         let state = cur.state;
-        if !seen.insert(state) {
+        if !seen.insert(cur.hash) {
             return false; // Cycle detected
         }
 
@@ -743,7 +745,7 @@ fn simulate_shift(
         }
 
         let state = cur.state;
-        if !seen.insert(state) {
+        if !seen.insert(cur.hash) {
             return None; // Cycle detected
         }
 
@@ -825,13 +827,6 @@ fn is_quote_terminal(terminals: &[MatcherRef], term_ix: usize) -> bool {
         .is_some_and(|preview| preview == "\"")
 }
 
-fn is_json_string_terminal(terminals: &[MatcherRef], term_ix: usize) -> bool {
-    terminals
-        .get(term_ix)
-        .map(|m| m.display().contains("json_string"))
-        .unwrap_or(false)
-}
-
 // Calculate length of unknown token
 fn unknown_token_len(
     terminals: &[MatcherRef],
@@ -892,4 +887,165 @@ fn hash_stack_slice(stack: &[usize]) -> u64 {
         cur = Some(next);
     }
     cur.unwrap_or_else(|| hash_stack(None, 0))
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct OpenScopeToken {
+    pub term_idx: usize,
+    #[allow(dead_code)]
+    pub start: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ScopeRecovery {
+    pub bridge: BridgeSpec,
+    pub stop: ScopeStop,
+    pub skip_to: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScopeStop {
+    Close,
+    Delimiter(usize),
+}
+
+/// Attempt *scope recovery* by bridge parsing (Nilsson-Nyman 2009 §4).
+pub fn scope_recover(
+    bridge_specs: &[BridgeSpec],
+    recovery_delimiters: &[usize],
+    terminals: &[MatcherRef],
+    text: &str,
+    error_pos: usize,
+    open_scope_stack: &[OpenScopeToken],
+) -> Option<ScopeRecovery> {
+    // Maximum bytes to scan ahead before giving up.
+    const MAX_SCAN_BYTES: usize = 65536;
+
+    // Walk the open-scope stack from top (innermost) to bottom.
+    for &open_tok in open_scope_stack.iter().rev() {
+        let Some(bridge) = bridge_specs.iter().find(|b| b.open == open_tok.term_idx) else {
+            continue;
+        };
+        let bridge = bridge.clone();
+
+        // Try to scan forward from error_pos to find the close.
+        if let Some((skip_to, stop)) = scan_for_close(
+            bridge_specs,
+            recovery_delimiters,
+            terminals,
+            text,
+            error_pos,
+            &bridge,
+            MAX_SCAN_BYTES,
+            true,
+        ) {
+            return Some(ScopeRecovery {
+                bridge,
+                stop,
+                skip_to,
+            });
+        }
+        // This open has no reachable close; try the next outer scope.
+    }
+
+    None
+}
+
+/// Scan `text` forward from `start_pos` to find `bridge.close`, honouring
+/// nesting of the same `(open, close)` pair.  Returns the exclusive end
+/// position (i.e., `pos_after_close_token`) or `None` if not found within
+/// `max_scan` bytes.
+fn scan_for_close(
+    bridge_specs: &[BridgeSpec],
+    recovery_delimiters: &[usize],
+    terminals: &[MatcherRef],
+    text: &str,
+    start_pos: usize,
+    bridge: &BridgeSpec,
+    max_scan: usize,
+    stop_on_delimiter: bool,
+) -> Option<(usize, ScopeStop)> {
+    let open_preview = terminals[bridge.open].preview()?;
+    let close_preview = terminals[bridge.close].preview()?;
+
+    // Depth 0 means we're looking for the matching close (not nested).
+    let mut depth: usize = 0;
+    let mut pos = start_pos;
+    let limit = (start_pos + max_scan).min(text.len());
+
+    while pos < limit {
+        // Skip whitespace quickly.
+        let rest = &text[pos..];
+        if rest.starts_with(open_preview) {
+            depth += 1;
+            pos += open_preview.len();
+            continue;
+        }
+        if rest.starts_with(close_preview) {
+            if depth == 0 {
+                // Stop *before* the close delimiter so the LR parser can shift
+                // it normally and use it to close the enclosing grammar rule.
+                return Some((pos, ScopeStop::Close));
+            }
+            depth -= 1;
+            pos += close_preview.len();
+            continue;
+        }
+
+        if depth == 0 && stop_on_delimiter {
+            for &delim_idx in recovery_delimiters {
+                if delim_idx == bridge.open || delim_idx == bridge.close {
+                    continue;
+                }
+                if let Some(delim) = terminals.get(delim_idx).and_then(|m| m.preview()) {
+                    if rest.starts_with(delim) {
+                        return Some((pos, ScopeStop::Delimiter(delim_idx)));
+                    }
+                }
+            }
+        }
+
+        // Check all other bridge opens/closes to track nesting of *other*
+        // pairs inside — we deliberately skip over them so we don't
+        // accidentally consume a close meant for an inner scope.
+        let mut advanced = false;
+        for other in bridge_specs {
+            if other.open == bridge.open {
+                continue; // already handled above
+            }
+            if let Some(op) = terminals.get(other.open).and_then(|m| m.preview()) {
+                if rest.starts_with(op) {
+                    // Enter a nested scope of a *different* kind; skip it
+                    // entirely by scanning for its matching close.
+                    if let Some(after) = scan_for_close(
+                        bridge_specs,
+                        recovery_delimiters,
+                        terminals,
+                        text,
+                        pos + op.len(),
+                        other,
+                        max_scan,
+                        false,
+                    ) {
+                        let nested_close = terminals[other.close].preview().unwrap_or_default();
+                        pos = after.0 + nested_close.len();
+                        advanced = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if advanced {
+            continue;
+        }
+
+        // Advance by one byte to avoid getting stuck.
+        pos += text[pos..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+    }
+
+    None
 }

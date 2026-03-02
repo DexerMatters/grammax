@@ -901,6 +901,7 @@ pub struct IncrementalLowerer<T, M> {
     mapper: M,
     parse_nodes: FxHashMap<GreenId, ParseMemo<T>>,
     parents: FxHashMap<GreenId, FxHashSet<GreenId>>,
+    field_symbols: FxHashMap<String, &'static str>,
     command_nodes: FxHashMap<u64, GreenId>,
     arena: AstArena<T>,
     root_green: Option<GreenId>,
@@ -919,6 +920,7 @@ where
             mapper,
             parse_nodes: FxHashMap::default(),
             parents: FxHashMap::default(),
+            field_symbols: FxHashMap::default(),
             command_nodes: FxHashMap::default(),
             arena: AstArena::new(),
             root_green: None,
@@ -1005,176 +1007,254 @@ where
         match command {
             Command::CreateToken {
                 node_id,
-                tag,
+                rule_ix,
                 text,
-                field: _,
-            } => {
-                let green = self.next_green_id;
-                self.next_green_id = self.next_green_id.saturating_add(1);
-
-                let width = text.len();
-                self.parse_nodes.insert(
-                    green,
-                    ParseMemo {
-                        children: Vec::new(),
-                        offset: 0,
-                        width,
-                        token_text: Some(text.clone()),
-                        tag: tag.clone(),
-                        binding: AstBinding::None,
-                    },
-                );
-
-                self.command_nodes.insert(*node_id, green);
-                None
-            }
+                field,
+            } => self.create_token_node(*node_id, *rule_ix, text, field),
             Command::CreateError {
                 node_id,
                 kind,
                 text,
-                field: _,
-            } => {
-                let green = self.next_green_id;
-                self.next_green_id = self.next_green_id.saturating_add(1);
-
-                let width = text.len();
-                self.parse_nodes.insert(
-                    green,
-                    ParseMemo {
-                        children: Vec::new(),
-                        offset: 0,
-                        width,
-                        token_text: Some(text.clone()),
-                        tag: crate::parsec::tree::Tag::new_error(kind.clone()),
-                        binding: AstBinding::None,
-                    },
-                );
-
-                self.command_nodes.insert(*node_id, green);
-                None
-            }
+                field,
+            } => self.create_error_node(*node_id, kind, text, field),
             Command::CreateNode {
                 node_id,
-                tag,
+                rule_ix,
                 children,
-                field: _,
-            } => {
-                let green = self.next_green_id;
-                self.next_green_id = self.next_green_id.saturating_add(1);
-
-                let child_greens: Vec<GreenId> = children
-                    .iter()
-                    .filter_map(|id| self.command_nodes.get(id).copied())
-                    .collect();
-
-                // Calculate width from children
-                let width: usize = child_greens.iter().map(|&cg| self.memo(cg).width).sum();
-
-                self.parse_nodes.insert(
-                    green,
-                    ParseMemo {
-                        children: child_greens.clone(),
-                        offset: 0,
-                        width,
-                        token_text: None,
-                        tag: tag.clone(),
-                        binding: AstBinding::None,
-                    },
-                );
-
-                for &child in &child_greens {
-                    self.add_parent(child, green);
-                }
-
-                self.command_nodes.insert(*node_id, green);
-                None
-            }
-            Command::DeleteNodeAtPath { path } => {
-                if path.0.is_empty() {
-                    if let Some(old_root) = self.root_green.take() {
-                        self.prune_unreachable(old_root, ops);
-                    }
-                    return None;
-                }
-
-                let Some(parent_path) = path.parent() else {
-                    return None;
-                };
-                let Some(&child_index) = path.0.last() else {
-                    return None;
-                };
-                let Some(parent_green) = self.green_at_path(&parent_path) else {
-                    return None;
-                };
-
-                if child_index >= self.memo(parent_green).children.len() {
-                    return None;
-                }
-
-                let removed = self.memo_mut(parent_green).children.remove(child_index);
-                self.remove_parent(removed, parent_green);
-                if self.parent_count(removed) == 0 && self.root_green != Some(removed) {
-                    self.prune_unreachable(removed, ops);
-                }
-                None
-            }
+                field,
+            } => self.create_rule_or_field_node(*node_id, *rule_ix, children, field),
+            Command::DeleteNodeAtPath { path } => self.delete_node_at_path(path, ops),
             Command::InsertNodeAtPath {
                 path,
                 node_id,
                 cascade_to_root,
-            } => {
-                let Some(new_green) = self.command_nodes.get(node_id).copied() else {
-                    return None;
-                };
+            } => self.insert_node_at_path(path, *node_id, *cascade_to_root, ops),
+        }
+    }
 
-                if path.0.is_empty() {
-                    if let Some(old_root) = self.root_green.replace(new_green) {
-                        if old_root != new_green {
-                            self.prune_unreachable(old_root, ops);
-                        }
-                    }
-                    self.refresh_offsets_from(new_green, 0);
-                    return Some(RecomputeStart {
-                        green: new_green,
-                        cascade_to_root: false,
-                    });
-                }
+    fn alloc_green_id(&mut self) -> GreenId {
+        let green = self.next_green_id;
+        self.next_green_id = self.next_green_id.saturating_add(1);
+        green
+    }
 
-                let Some(parent_path) = path.parent() else {
-                    return None;
-                };
-                let Some(&child_index) = path.0.last() else {
-                    return None;
-                };
-                let Some(parent_green) = self.green_at_path(&parent_path) else {
-                    return None;
-                };
+    fn create_leaf_node(&mut self, tag: Tag, text: &str) -> GreenId {
+        let green = self.alloc_green_id();
+        self.parse_nodes.insert(
+            green,
+            ParseMemo {
+                children: Vec::new(),
+                offset: 0,
+                width: text.len(),
+                token_text: Some(text.to_string()),
+                tag,
+                binding: AstBinding::None,
+            },
+        );
+        green
+    }
 
-                let child_offset = self.child_offset(parent_green, child_index);
-                if child_index <= self.memo(parent_green).children.len() {
-                    self.memo_mut(parent_green)
-                        .children
-                        .insert(child_index, new_green);
-                } else {
-                    return None;
-                }
-                self.add_parent(new_green, parent_green);
-                self.refresh_offsets_from(new_green, child_offset);
+    fn create_parent_node(&mut self, tag: Tag, child_greens: Vec<GreenId>) -> GreenId {
+        let green = self.alloc_green_id();
+        let width: usize = child_greens.iter().map(|&cg| self.memo(cg).width).sum();
 
-                if *cascade_to_root {
-                    self.refresh_offsets(parent_green);
-                    Some(RecomputeStart {
-                        green: parent_green,
-                        cascade_to_root: true,
-                    })
-                } else {
-                    Some(RecomputeStart {
-                        green: new_green,
-                        cascade_to_root: false,
-                    })
+        self.parse_nodes.insert(
+            green,
+            ParseMemo {
+                children: child_greens.clone(),
+                offset: 0,
+                width,
+                token_text: None,
+                tag,
+                binding: AstBinding::None,
+            },
+        );
+
+        for &child in &child_greens {
+            self.add_parent(child, green);
+        }
+
+        green
+    }
+
+    fn create_token_node(
+        &mut self,
+        node_id: u64,
+        rule_ix: usize,
+        text: &str,
+        field: &str,
+    ) -> Option<RecomputeStart> {
+        let green = self.create_leaf_node(Tag::Token { rule_ix }, text);
+        let command_green = self.wrap_in_field_if_needed(green, rule_ix, field);
+        self.command_nodes.insert(node_id, command_green);
+        None
+    }
+
+    fn create_error_node(
+        &mut self,
+        node_id: u64,
+        kind: &crate::parsec::tree::ParsecError,
+        text: &str,
+        field: &str,
+    ) -> Option<RecomputeStart> {
+        let green = self.create_leaf_node(Tag::new_error(kind.clone()), text);
+        let fallback_rule_ix = self.grammar.table.start_rule;
+        let command_green = self.wrap_in_field_if_needed(green, fallback_rule_ix, field);
+        self.command_nodes.insert(node_id, command_green);
+        None
+    }
+
+    fn create_rule_or_field_node(
+        &mut self,
+        node_id: u64,
+        rule_ix: usize,
+        children: &[u64],
+        field: &str,
+    ) -> Option<RecomputeStart> {
+        let child_greens: Vec<GreenId> = children
+            .iter()
+            .filter_map(|id| self.command_nodes.get(id).copied())
+            .collect();
+
+        let tag = if field.is_empty() {
+            Tag::Rule { rule_ix }
+        } else {
+            let name = self.intern_field_name(field);
+            Tag::Field { rule_ix, name }
+        };
+
+        let green = self.create_parent_node(tag, child_greens);
+        self.command_nodes.insert(node_id, green);
+        None
+    }
+
+    fn delete_node_at_path(
+        &mut self,
+        path: &NodePath,
+        ops: &mut Vec<AstDeltaOp<T>>,
+    ) -> Option<RecomputeStart> {
+        if path.0.is_empty() {
+            if let Some(old_root) = self.root_green.take() {
+                self.prune_unreachable(old_root, ops);
+            }
+            return None;
+        }
+
+        let Some(parent_path) = path.parent() else {
+            return None;
+        };
+        let Some(&child_index) = path.0.last() else {
+            return None;
+        };
+        let Some(parent_green) = self.green_at_path(&parent_path) else {
+            return None;
+        };
+
+        if child_index >= self.memo(parent_green).children.len() {
+            return None;
+        }
+
+        let removed = self.memo_mut(parent_green).children.remove(child_index);
+        self.remove_parent(removed, parent_green);
+        if self.parent_count(removed) == 0 && self.root_green != Some(removed) {
+            self.prune_unreachable(removed, ops);
+        }
+        Some(RecomputeStart {
+            green: parent_green,
+            cascade_to_root: true,
+        })
+    }
+
+    fn insert_node_at_path(
+        &mut self,
+        path: &NodePath,
+        node_id: u64,
+        cascade_to_root: bool,
+        ops: &mut Vec<AstDeltaOp<T>>,
+    ) -> Option<RecomputeStart> {
+        let new_green = self.command_nodes.get(&node_id).copied()?;
+
+        if path.0.is_empty() {
+            if let Some(old_root) = self.root_green.replace(new_green) {
+                if old_root != new_green {
+                    self.prune_unreachable(old_root, ops);
                 }
             }
+            self.refresh_offsets_from(new_green, 0);
+            return Some(RecomputeStart {
+                green: new_green,
+                cascade_to_root: false,
+            });
         }
+
+        let parent_path = path.parent()?;
+        let &child_index = path.0.last()?;
+        let parent_green = self.green_at_path(&parent_path)?;
+
+        let child_offset = self.child_offset(parent_green, child_index);
+        if child_index <= self.memo(parent_green).children.len() {
+            self.memo_mut(parent_green)
+                .children
+                .insert(child_index, new_green);
+        } else {
+            return None;
+        }
+
+        self.add_parent(new_green, parent_green);
+        self.refresh_offsets_from(new_green, child_offset);
+
+        if cascade_to_root || !path.0.is_empty() {
+            self.refresh_offsets(parent_green);
+            Some(RecomputeStart {
+                green: parent_green,
+                cascade_to_root: true,
+            })
+        } else {
+            Some(RecomputeStart {
+                green: new_green,
+                cascade_to_root: false,
+            })
+        }
+    }
+
+    fn wrap_in_field_if_needed(
+        &mut self,
+        green: GreenId,
+        rule_ix: usize,
+        field_name: &str,
+    ) -> GreenId {
+        if field_name.is_empty() {
+            return green;
+        }
+
+        let field_green = self.next_green_id;
+        self.next_green_id = self.next_green_id.saturating_add(1);
+        let width = self.memo(green).width;
+        let name = self.intern_field_name(field_name);
+
+        self.parse_nodes.insert(
+            field_green,
+            ParseMemo {
+                children: vec![green],
+                offset: 0,
+                width,
+                token_text: None,
+                tag: Tag::Field { rule_ix, name },
+                binding: AstBinding::None,
+            },
+        );
+        self.add_parent(green, field_green);
+
+        field_green
+    }
+
+    fn intern_field_name(&mut self, field_name: &str) -> &'static str {
+        if let Some(name) = self.field_symbols.get(field_name) {
+            return name;
+        }
+        let leaked: &'static str = Box::leak(field_name.to_string().into_boxed_str());
+        self.field_symbols.insert(field_name.to_string(), leaked);
+        leaked
     }
 
     fn green_at_path(&self, path: &NodePath) -> Option<GreenId> {

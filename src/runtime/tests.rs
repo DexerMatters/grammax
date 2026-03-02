@@ -1,7 +1,7 @@
 use crate::{
     interface::{BasicInterface, webui::WebPreviewInterface},
     new_grammar,
-    parsec::{ParserConfig, recovery::RecoveryConfig, words::*},
+    parsec::{ParserConfig, display::format_ast, recovery::RecoveryConfig, words::*},
     runtime::{Interactive, RuntimeListener},
     semantic::{ASTCell, MapOutput, RuleMap},
 };
@@ -9,7 +9,8 @@ use crate::{
 #[test]
 fn test_expr_example() {
     let grammar = new_grammar!(
-        json where
+        start where
+        start   -> r!(json) + tt(EndOfInput)
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
@@ -78,7 +79,6 @@ fn test_expr_example() {
 
     let listener = RuntimeListener::new().after_update(move |result| {
         println!("==== Updated source: {}", result.source_text);
-        println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
         println!("> Duration: {}µs", result.metrics.total_duration_us);
         println!("> Commands: \n");
         for cmd in &result.semantic_commands {
@@ -94,29 +94,9 @@ fn test_expr_example() {
             simple_ast: true,
             recovery: RecoveryConfig::default(),
         })
-        .finish::<BasicInterface>();
+        .finish::<WebPreviewInterface>();
 
     runtime.run().unwrap();
-    runtime
-        .insert(
-            0,
-            r#"{
-                "name": "Alice",
-                "age": 30,
-                "isStudent": false,
-                "courses": ["Math", "Science"],
-                "address": {
-                    "street": "123 Main St",
-                    "city": "Anytown"
-                },
-                "nullValue": null
-            }"#,
-        )
-        .unwrap();
-    runtime.insert(1, r#" "good" : 123, "#).unwrap();
-    runtime.insert(1, r#" "bad": [true, false, 44], "#).unwrap();
-    runtime.exit().unwrap();
-    runtime.join().unwrap();
 }
 
 #[test]
@@ -174,6 +154,15 @@ fn test_semantic_commands() {
         for cmd in &result.semantic_commands {
             println!("  {:?}", cmd);
         }
+        println!(
+            "> AST {}",
+            format_ast(
+                &result.current_parser.grammar,
+                result.current_tree,
+                &result.current_parser.alloc,
+                result.source_text
+            )
+        );
         println!("> Duration: {}µs", result.metrics.total_duration_us);
         println!("> Metrics: {:#?}", result.metrics);
     });
@@ -186,6 +175,5 @@ fn test_semantic_commands() {
             recovery: RecoveryConfig::default(),
         })
         .finish::<WebPreviewInterface>();
-
     runtime.run().unwrap();
 }

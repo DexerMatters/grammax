@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 use crate::{
     parsec::{
@@ -9,9 +9,9 @@ use crate::{
     runtime::{
         delta,
         metrics::EditMetrics,
-        strategy::{EditKind, StrategyCandidate, StrategyContext, pick_candidate},
+        strategy::{CandidateScore, EditKind, StrategyCandidate, StrategyContext, pick_candidate},
     },
-    semantic::Command,
+    semantic::{Command, command::NodePath},
     utils::Span,
 };
 
@@ -203,6 +203,31 @@ impl Reparser {
         }
 
         if zippers.is_empty() {
+            if let Some(root_candidate) = self.try_root_rule_candidate(parser, source_text) {
+                let result = self.apply_candidate(
+                    parser,
+                    root_candidate,
+                    &old_messages,
+                    delta,
+                    focus_span,
+                    &old_text,
+                    source_text,
+                    metrics.as_deref_mut(),
+                );
+                if let Some(m) = &mut metrics {
+                    m.used_incremental_path = true;
+                    m.fell_back_to_full_diff = false;
+                    if m.message.is_empty() {
+                        m.message =
+                            "used root-level incremental candidate after zipper collection found none"
+                                .to_string();
+                    }
+                    if let Some(start) = total_start {
+                        m.total_duration_us = start.elapsed().as_micros();
+                    }
+                }
+                return Ok(result);
+            }
             if let Some(m) = &mut metrics {
                 if let Some(start) = total_start {
                     m.total_duration_us = start.elapsed().as_micros();
@@ -250,6 +275,81 @@ impl Reparser {
             best = pick_candidate(&mut ctx, edit_span, kind);
         }
 
+        if best.is_none() {
+            self.ascend_to_root();
+            let root_span = Span::new(0, source_text.len());
+            let root_zippers =
+                collect_affected_zippers(self.current.clone(), root_span, &self.alloc, parser);
+
+            if !root_zippers.is_empty() {
+                let mut root_ctx = StrategyContext {
+                    parser,
+                    span,
+                    delta,
+                    specs: specs.as_ref(),
+                    recovery_strategy: strategy.as_ref(),
+                    zippers: &root_zippers,
+                    config: ReparserConfig {
+                        enforce_sync_bound: false,
+                        enforce_region_end: false,
+                        min_level: 0,
+                    },
+                    metrics: metrics.as_deref_mut(),
+                };
+
+                best = pick_candidate(&mut root_ctx, edit_span, kind);
+
+                if best.is_some() {
+                    if let Some(m) = metrics.as_deref_mut() {
+                        m.message =
+                            "primary incremental candidates failed; using relaxed root-level incremental candidate"
+                                .to_string();
+                    }
+                }
+            }
+        }
+
+        if best.is_none() {
+            best = self.try_root_rule_candidate(parser, source_text);
+            if best.is_some() {
+                if let Some(m) = metrics.as_deref_mut() {
+                    m.message =
+                        "primary incremental candidates failed; using direct start-rule incremental parse"
+                            .to_string();
+                }
+            }
+        }
+
+        // If the best zipper candidate still has internal errors or parse messages,
+        // attempt a full root-rule reparse and prefer it when it produces a cleaner result.
+        if let Some(ref candidate) = best {
+            let candidate_is_errorful =
+                !candidate.score.is_error_free() || !candidate.messages.is_empty();
+            if candidate_is_errorful {
+                if let Some(root_candidate) = self.try_root_rule_candidate(parser, source_text) {
+                    // Always prefer root when the zipper green was an Incomplete node (parse_rule
+                    // gave up entirely), or when root genuinely has fewer parse messages.
+                    let zipper_green_is_incomplete = matches!(
+                        self.alloc.get_node(candidate.green).tag,
+                        crate::parsec::tree::Tag::Error(
+                            crate::parsec::tree::ParsecError::Incomplete
+                        )
+                    );
+                    let root_is_cleaner = zipper_green_is_incomplete
+                        || root_candidate.messages.is_empty()
+                        || root_candidate.messages.len() < candidate.messages.len();
+                    if root_is_cleaner {
+                        if let Some(m) = metrics.as_deref_mut() {
+                            m.message =
+                                "incremental candidate had errors; replaced with cleaner root reparse"
+                                    .to_string();
+                        }
+                        best = Some(root_candidate);
+                    }
+                }
+            }
+        }
+
         let reuse_after = parser.reuse_stats();
         if let Some(m) = &mut metrics {
             m.parse_rule_calls = reuse_after.lookups.saturating_sub(reuse_before.lookups);
@@ -286,6 +386,76 @@ impl Reparser {
             span,
             delta,
             candidates_collected: zippers.len(),
+        })
+    }
+
+    fn try_root_rule_candidate(
+        &mut self,
+        parser: &mut Parser,
+        source_text: &str,
+    ) -> Option<StrategyCandidate> {
+        self.ascend_to_root();
+
+        let root_node = self.current.clone();
+        let old_width = self.alloc.get_node(root_node.green).width;
+        let start_rule = parser.grammar.table.start_rule;
+        let expected_width = source_text.len();
+
+        parser.messages.clear();
+        parser.newly_computed_nodes.clear();
+        parser.newly_computed_tokens.clear();
+        parser.set_insert_pos(None);
+
+        let mut green = parser.parse_rule(start_rule, 0, expected_width);
+
+        let needs_recovery = match green {
+            Some(g) if self.alloc.get_node(g).width == expected_width => {
+                matches!(self.alloc.get_node(g).tag, Tag::Error(_)) || !parser.messages.is_empty()
+            }
+            _ => true,
+        };
+
+        if needs_recovery {
+            parser.clear_reuse_cache();
+            parser.messages.clear();
+            parser.newly_computed_nodes.clear();
+            parser.newly_computed_tokens.clear();
+            parser.set_insert_pos(None);
+
+            green = parser.parse_rule(start_rule, 0, expected_width);
+        }
+
+        let needs_full_recovery = match green {
+            Some(g) if self.alloc.get_node(g).width == expected_width => {
+                matches!(self.alloc.get_node(g).tag, Tag::Error(_)) || !parser.messages.is_empty()
+            }
+            _ => true,
+        };
+
+        let green = if needs_full_recovery {
+            parser.messages.clear();
+            parser.newly_computed_nodes.clear();
+            parser.newly_computed_tokens.clear();
+            parser.set_insert_pos(None);
+            parser.parse_text(source_text).root.green
+        } else {
+            green?
+        };
+
+        Some(StrategyCandidate {
+            score: CandidateScore::new(0, 0, 0),
+            green,
+            messages: Arc::new(parser.messages.clone()),
+            newly_computed_nodes: parser.newly_computed_nodes(),
+            newly_computed_tokens: parser.newly_computed_tokens(),
+            zipper: Zipper {
+                node: root_node,
+                rule_ix: start_rule,
+                offset: 0,
+                old_width,
+                level: 0,
+                steps: Vec::new(),
+            },
         })
     }
 
@@ -361,9 +531,7 @@ impl Reparser {
             None
         };
 
-        let path = crate::semantic::command::NodePath(
-            candidate.zipper.steps.iter().map(|s| s.child_idx).collect(),
-        );
+        let path = NodePath(candidate.zipper.steps.iter().map(|s| s.child_idx).collect());
         let semantic_commands = delta::generate_commands_incremental(
             &self.alloc,
             &path,

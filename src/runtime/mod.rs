@@ -7,13 +7,14 @@ use std::{
 };
 
 use crossbeam::channel;
+use serde::Serialize;
 
 use crate::{
     grammar::Grammar,
     interface::Interface,
     parsec::{self, Parser, ParserConfig, ParserListener, msg::ParserMessages, tree::RedNode},
     runtime::reparser::{ReparseError, Reparser},
-    semantic::{ASTCell, AstArena, AstDelta, AstMapper, IncrementalLowerer},
+    semantic::{ASTCell, AstArena, AstDelta, AstMapper, Command, IncrementalLowerer},
     utils::Span,
 };
 
@@ -33,6 +34,9 @@ pub enum Action {
     Insert { offset: usize, text: String },
     Delete { span: Span },
     Update { span: Span, text: String },
+
+    GetSource,
+
     Run,
     Pause,
     Resume,
@@ -45,31 +49,26 @@ impl<'de> serde::Deserialize<'de> for Action {
         D: serde::Deserializer<'de>,
     {
         #[derive(serde::Deserialize)]
-        #[serde(tag = "type", content = "data")]
+        #[serde(tag = "type")]
+        #[serde(rename_all = "camelCase")]
         enum ActionHelper {
-            #[serde(rename = "insert")]
-            Insert { offset: usize, text: String },
-
-            #[serde(rename = "delete")]
-            Delete { start: usize, end: usize },
-
-            #[serde(rename = "update")]
+            Insert {
+                offset: usize,
+                text: String,
+            },
+            Delete {
+                start: usize,
+                end: usize,
+            },
             Update {
                 start: usize,
                 end: usize,
                 text: String,
             },
-
-            #[serde(rename = "run")]
+            GetSource,
             Run,
-
-            #[serde(rename = "pause")]
             Pause,
-
-            #[serde(rename = "resume")]
             Resume,
-
-            #[serde(rename = "exit")]
             Exit,
         }
 
@@ -83,6 +82,7 @@ impl<'de> serde::Deserialize<'de> for Action {
                 span: Span::new(start, end),
                 text,
             },
+            ActionHelper::GetSource => Action::GetSource,
             ActionHelper::Run => Action::Run,
             ActionHelper::Pause => Action::Pause,
             ActionHelper::Resume => Action::Resume,
@@ -101,11 +101,12 @@ impl Action {
             Action::Pause => RuntimeAction::Pause,
             Action::Resume => RuntimeAction::Resume,
             Action::Exit => RuntimeAction::Exit,
+            Action::GetSource => RuntimeAction::Get,
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeAction {
     Insert,
     Delete,
@@ -114,9 +115,10 @@ pub enum RuntimeAction {
     Pause,
     Resume,
     Exit,
+    Get,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum RuntimeMode {
     Ready,
     Running,
@@ -124,7 +126,7 @@ pub enum RuntimeMode {
     Interrupted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum ListenerHook {
     BeforeUpdate,
     AfterUpdate,
@@ -134,12 +136,13 @@ pub enum ListenerHook {
     OnError,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
 pub enum RuntimeError {
     QueueFull,
     ChannelClosed,
     WorkerPanicked,
-    GeneralError(Box<dyn error::Error + Send + Sync>),
+    GeneralError(#[serde(skip_serializing)] Box<dyn error::Error + Send + Sync>),
     InvalidOffset {
         offset: usize,
         text_len: usize,
@@ -245,7 +248,7 @@ pub struct UpdateResult<'a, T = ()> {
     pub source_text: &'a str,
     pub newly_computed_nodes: Vec<Span>,
     pub newly_computed_tokens: Vec<Span>,
-    pub semantic_commands: Vec<crate::semantic::Command>,
+    pub semantic_commands: Vec<Command>,
     pub semantic_ir_delta: Option<AstDelta<T>>,
     pub semantic_ir_root: Option<&'a T>,
     pub semantic_ir_root_cell: Option<ASTCell<T>>,
@@ -263,7 +266,7 @@ impl<'a, T> UpdateResult<'a, T> {
         source_text: &'a str,
         newly_computed_nodes: Vec<Span>,
         newly_computed_tokens: Vec<Span>,
-        semantic_commands: Vec<crate::semantic::Command>,
+        semantic_commands: Vec<Command>,
         semantic_ir_delta: Option<AstDelta<T>>,
         semantic_ir_root: Option<&'a T>,
         semantic_ir_root_cell: Option<ASTCell<T>>,
@@ -425,8 +428,10 @@ pub struct RuntimeRequest {
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
-pub struct RuntimeResponse {
-    pub commands: Vec<crate::semantic::Command>,
+#[serde(untagged)]
+pub enum RuntimeResponse {
+    Commands(Vec<Command>),
+    String(String),
 }
 
 pub struct InteractiveInstance<I> {
@@ -578,7 +583,7 @@ where
         })
     }
 
-    fn semantic_delta(&mut self, commands: &[crate::semantic::Command]) -> Option<AstDelta<T>> {
+    fn semantic_delta(&mut self, commands: &[Command]) -> Option<AstDelta<T>> {
         let map = self.semantic_map.as_mut()?;
         if !self.semantic_map_initialized {
             self.semantic_map_initialized = true;
@@ -651,12 +656,10 @@ where
                     text: next,
                 })
             }
-            Action::Run | Action::Pause | Action::Resume | Action::Exit => {
-                Err(RuntimeError::InvalidMode {
-                    mode: self.mode,
-                    action: action.kind(),
-                })
-            }
+            _ => Err(RuntimeError::InvalidMode {
+                mode: self.mode,
+                action: action.kind(),
+            }),
         }
     }
 
@@ -718,7 +721,7 @@ where
 
         self.call_after_update_listener(update)?;
 
-        Ok(Some(RuntimeResponse { commands }))
+        Ok(Some(RuntimeResponse::Commands(commands)))
     }
 
     fn handle_action(&mut self, action: Action) -> RuntimeResult {
@@ -754,6 +757,12 @@ where
                     )?;
                 }
                 Ok(None)
+            }
+            Action::GetSource => {
+                self.ensure_mode(RuntimeMode::Running, RuntimeAction::Get)?;
+                Ok(Some(RuntimeResponse::String(
+                    self.parser.text().to_string(),
+                )))
             }
             edit @ Action::Insert { .. }
             | edit @ Action::Delete { .. }

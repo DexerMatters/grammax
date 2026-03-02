@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 /// Error types that can occur during parsing, used for error reporting and recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
 pub enum ParsecError {
     Incomplete,
     UnexpectedToken { expected: Vec<usize> },
@@ -154,6 +155,6 @@ impl TreeAllocRefExt for TreeAllocRef {
     }
 
     fn new_placeholder(&self, width: usize) -> GreenId {
-        self.alloc(Tag::Error(ParsecError::Placeholder), vec![], width)
+        self.alloc(Tag::Error(ParsecError::Incomplete), vec![], width)
     }
 }

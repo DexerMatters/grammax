@@ -1,6 +1,6 @@
 use serde::Serialize;
 
-use crate::parsec::tree::{ParsecError, Tag};
+use crate::parsec::tree::ParsecError;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize)]
 pub struct NodePath(pub Vec<usize>);
@@ -22,6 +22,8 @@ impl NodePath {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "camelCase")]
 pub enum Command {
     /// Creates a token leaf node with text content.
     ///
@@ -29,7 +31,7 @@ pub enum Command {
     /// Field name can be empty string for direct tokens, or contain the field identifier.
     CreateToken {
         node_id: u64,
-        tag: Tag,
+        rule_ix: usize,
         text: String,
         field: String,
     },
@@ -50,7 +52,7 @@ pub enum Command {
     /// their parent references them.
     CreateNode {
         node_id: u64,
-        tag: Tag,
+        rule_ix: usize,
         children: Vec<u64>,
         field: String,
     },

@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::{
-    parsec::tree::{TreeAllocRef, TreeAllocRefExt},
+    parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
     semantic::{Command, command::NodePath},
 };
 
@@ -523,17 +523,17 @@ fn emit_create_commands_from_green(
 
     // Emit different command types based on tag
     match &node.tag {
-        crate::parsec::tree::Tag::Token { .. } => {
+        Tag::Token { rule_ix } => {
             let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
                 .unwrap_or_default();
             out.push(Command::CreateToken {
                 node_id,
-                tag: node.tag.clone(),
+                rule_ix: *rule_ix,
                 text,
                 field: String::new(),
             });
         }
-        crate::parsec::tree::Tag::Error(err) => {
+        Tag::Error(err) => {
             let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
                 .unwrap_or_default();
             out.push(Command::CreateError {
@@ -543,18 +543,18 @@ fn emit_create_commands_from_green(
                 field: String::new(),
             });
         }
-        crate::parsec::tree::Tag::Field { name, .. } => {
+        Tag::Field { name, rule_ix, .. } => {
             out.push(Command::CreateNode {
                 node_id,
-                tag: node.tag.clone(),
+                rule_ix: *rule_ix,
                 children: child_ids,
                 field: name.to_string(),
             });
         }
-        crate::parsec::tree::Tag::Rule { .. } => {
+        Tag::Rule { rule_ix, .. } => {
             out.push(Command::CreateNode {
                 node_id,
-                tag: node.tag.clone(),
+                rule_ix: *rule_ix,
                 children: child_ids,
                 field: String::new(),
             });
@@ -577,12 +577,12 @@ fn child_offset_at(
 }
 
 fn token_text_for_node(
-    tag: &crate::parsec::tree::Tag,
+    tag: &Tag,
     offset: usize,
     width: usize,
     source_text: &str,
 ) -> Option<String> {
-    if !matches!(tag, crate::parsec::tree::Tag::Token { .. }) {
+    if !matches!(tag, Tag::Token { .. } | Tag::Error(_)) {
         return None;
     }
 

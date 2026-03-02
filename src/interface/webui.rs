@@ -5,7 +5,7 @@ use rust_embed::Embed;
 use crate::{grammar, interface::Interface, runtime};
 
 #[derive(Embed)]
-#[folder = "frontend/static/"]
+#[folder = "frontend/dist/"]
 #[include = "**/*"]
 struct Asset;
 
@@ -119,15 +119,12 @@ fn resolve_api_request(
 ) -> rouille::Response {
     match path {
         /* POST */
-        "api/update" => {
+        "api/action" => {
             let body: runtime::Action = rouille::try_or_400!(rouille::input::json_input(request));
             match this.request(body) {
                 Ok(Some(response)) => rouille::Response::json(&response),
                 Ok(None) => rouille::Response::empty_204(),
-                Err(e) => {
-                    eprintln!("Error processing API request: {:?}", e);
-                    rouille::Response::text(format!("Error: {:?}", e)).with_status_code(500)
-                }
+                Err(e) => rouille::Response::json(&e).with_status_code(500),
             }
         }
 

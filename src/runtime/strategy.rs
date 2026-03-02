@@ -4,7 +4,11 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs},
-    parsec::{Parser, msg::ParserMessages, tree::TreeAllocRefExt},
+    parsec::{
+        Parser,
+        msg::ParserMessages,
+        tree::{ParsecError, Tag, TreeAllocRefExt},
+    },
     runtime::{
         metrics::EditMetrics,
         reparser::{ReparserConfig, Zipper},
@@ -21,6 +25,21 @@ pub(crate) struct CandidateScore {
     /// Zipper level wrapped in Reverse: deeper zippers (higher level) sort lower,
     /// naturally preferring narrow reparses over shallow ones.
     level: std::cmp::Reverse<usize>,
+}
+
+impl CandidateScore {
+    pub(crate) fn new(errors_outside: usize, errors_inside: usize, level: usize) -> Self {
+        Self {
+            errors_outside,
+            errors_inside,
+            level: std::cmp::Reverse(level),
+        }
+    }
+
+    /// Returns `true` when neither inside nor outside the edit region has errors.
+    pub(crate) fn is_error_free(&self) -> bool {
+        self.errors_outside == 0 && self.errors_inside == 0
+    }
 }
 
 pub(crate) struct StrategyCandidate {
@@ -195,6 +214,12 @@ fn evaluate_candidate(
 
     let new_width = {
         let new_node = ctx.parser.alloc.get_node(new_green);
+        // Reject Incomplete: parse_rule gave up completely — never a valid candidate.
+        // UnexpectedToken/MissingToken roots are valid error-recovery outputs; Incomplete is not.
+        if matches!(new_node.tag, Tag::Error(ParsecError::Incomplete)) {
+            memo.insert(memo_key, None);
+            return None;
+        }
         new_node.width
     };
 
@@ -233,13 +258,7 @@ fn evaluate_candidate(
         errors_outside = 0;
     }
 
-    let level = std::cmp::Reverse(zipper.level);
-
-    let score = CandidateScore {
-        errors_outside,
-        errors_inside,
-        level,
-    };
+    let score = CandidateScore::new(errors_outside, errors_inside, zipper.level);
 
     let messages = Arc::new(ctx.parser.messages.clone());
     let newly_computed_nodes = ctx.parser.newly_computed_nodes();

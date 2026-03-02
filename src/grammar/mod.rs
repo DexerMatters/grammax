@@ -1,4 +1,5 @@
 pub(crate) mod analysis;
+pub(crate) mod bridge;
 pub(crate) mod cache;
 pub mod display;
 pub mod dsl;
@@ -80,6 +81,12 @@ pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,
     pub(crate) rule_analyses: FxHashMap<usize, Arc<analysis::GrammarStateAnalysis>>,
+    /// Bracket pairs derived at grammar-analysis time (§3 of Nilsson-Nyman 2009).
+    /// Used by the scope-recovery layer to skip malformed scope bodies.
+    pub(crate) bridge_specs: Vec<bridge::BridgeSpec>,
+    /// Delimiter terminals (e.g. `,`, `;`, `:`) derived at grammar-analysis time.
+    /// Scope recovery may stop at these terminals to resume parsing earlier.
+    pub(crate) recovery_delimiters: Vec<usize>,
 }
 
 impl Grammar {
@@ -118,11 +125,15 @@ impl Grammar {
             table.start_rule,
         ));
         let rule_analyses = Self::build_rule_analyses(&table);
+        let bridge_specs = bridge::derive_bridge_specs(&table);
+        let recovery_delimiters = bridge::derive_recovery_delimiters(&table);
 
         let grammar = Self {
             table,
             analysis,
             rule_analyses,
+            bridge_specs,
+            recovery_delimiters,
         };
 
         Box::leak(Box::new(grammar))

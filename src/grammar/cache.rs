@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::grammar::Grammar;
 use crate::grammar::analysis::GrammarStateAnalysis;
+use crate::grammar::bridge;
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::grammar::norm::RuleTable;
 use crate::parsec::words::{self, EndOfInput, Matcher, MatcherRef, StartOfInput, token};
@@ -43,7 +44,7 @@ pub(crate) mod serde_fxhashmap {
     }
 }
 
-const CACHE_FORMAT_VERSION: u32 = 2;
+const CACHE_FORMAT_VERSION: u32 = 4;
 
 static CACHE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
@@ -101,6 +102,10 @@ struct GrammarCacheFile {
     analysis: GrammarStateAnalysis,
     #[serde(with = "crate::grammar::cache::serde_fxhashmap")]
     rule_analyses: FxHashMap<usize, GrammarStateAnalysis>,
+    /// Bridge specs derived from productions (Nilsson-Nyman 2009 §3).
+    bridge_specs: Vec<bridge::BridgeSpec>,
+    /// Delimiter terminals used as stop points by scope recovery.
+    recovery_delimiters: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -165,6 +170,8 @@ pub(crate) fn load(cache_key: u64) -> Option<Grammar> {
             .into_iter()
             .map(|(rule_ix, state)| (rule_ix, Arc::new(state)))
             .collect(),
+        bridge_specs: cache.bridge_specs,
+        recovery_delimiters: cache.recovery_delimiters,
     })
 }
 
@@ -188,6 +195,8 @@ pub(crate) fn store(cache_key: u64, grammar: &Grammar) -> io::Result<()> {
             .iter()
             .map(|(rule_ix, state)| (*rule_ix, (**state).clone()))
             .collect(),
+        bridge_specs: grammar.bridge_specs.clone(),
+        recovery_delimiters: grammar.recovery_delimiters.clone(),
     };
 
     let bytes = bincode::serialize(&cache)
@@ -434,6 +443,8 @@ pub(crate) fn serialize_grammar_file(grammar: &Grammar) -> Result<Vec<u8>, io::E
             .iter()
             .map(|(rule_ix, state)| (*rule_ix, (**state).clone()))
             .collect(),
+        bridge_specs: grammar.bridge_specs.clone(),
+        recovery_delimiters: grammar.recovery_delimiters.clone(),
     };
 
     bincode::serialize(&file)
@@ -455,6 +466,8 @@ pub(crate) fn deserialize_grammar_file(bytes: &[u8]) -> Result<Grammar, io::Erro
             .into_iter()
             .map(|(rule_ix, state)| (rule_ix, Arc::new(state)))
             .collect(),
+        bridge_specs: cache.bridge_specs,
+        recovery_delimiters: cache.recovery_delimiters,
     })
 }
 

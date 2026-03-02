@@ -2,14 +2,14 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use rustc_hash::{FxHashMap, FxHashSet};
-
 use crate::grammar::Grammar;
 use crate::grammar::analysis::{Action, EOF_TOKEN, GrammarStateAnalysis};
 use crate::grammar::ir::Symbol;
 use crate::grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs};
 use crate::parsec::msg::{ParserMessage, ParserMessages};
-use crate::parsec::recovery::{RecoveryCache, RecoveryConfig, RepairOp, recover};
+use crate::parsec::recovery::{
+    OpenScopeToken, RecoveryCache, RecoveryConfig, RepairOp, ScopeStop, recover, scope_recover,
+};
 use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
 use crate::utils::{LruCache, Span};
 
@@ -55,18 +55,10 @@ pub struct IncrementalReuseStats {
     pub inserts: usize,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StackEntry {
     node: GreenId,
     binds_state: bool,
-}
-
-#[derive(Debug, Clone, Default)]
-struct RecoveryProfile {
-    sync_tokens: FxHashSet<usize>,
-    opening_tokens: FxHashSet<usize>,
-    closing_tokens: FxHashSet<usize>,
-    closing_to_opening: FxHashMap<usize, FxHashSet<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -100,8 +92,6 @@ pub struct Parser {
     // For incremental/reparsing (stubs)
     inc_insert_pos: Option<usize>,
     string_opened: bool,
-    // rule_analyses is pre-warmed on Grammar; no per-parser cache needed.
-    recovery_profile: RecoveryProfile,
     reuse_enabled: bool,
     reuse_cache_failures: bool,
     reuse_cache: LruCache<ParseRuleCacheKey, ParseRuleCacheEntry>,
@@ -111,7 +101,6 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(grammar: &'static Grammar) -> Self {
-        let recovery_profile = Self::build_recovery_profile(grammar);
         Self {
             grammar,
             alloc: TreeAllocRef::create(),
@@ -124,8 +113,6 @@ impl Parser {
             pos: 0,
             inc_insert_pos: None,
             string_opened: false,
-
-            recovery_profile,
             reuse_enabled: true,
             reuse_cache_failures: true,
             reuse_cache: LruCache::new(DEFAULT_REUSE_CAPACITY),
@@ -207,8 +194,9 @@ impl Parser {
         let start_state = self.grammar.analysis.start_state;
         let mut state_stack = vec![start_state];
         let mut node_stack: Vec<StackEntry> = vec![];
-        let mut recovery_active = false;
-
+        // Track open delimiters encountered during parsing for scope recovery
+        // (Nilsson-Nyman 2009 §4).
+        let mut open_scope_stack: Vec<OpenScopeToken> = Vec::new();
         loop {
             let current_state_idx = *state_stack.last().unwrap();
             let expected_ids: Vec<usize> =
@@ -223,44 +211,6 @@ impl Parser {
             if let Some(action) = action {
                 match action {
                     Action::Shift(next_state) => {
-                        if recovery_active && self.recovery_profile.sync_tokens.contains(&term_idx)
-                        {
-                            let old_pos = self.pos;
-                            let old_string_opened = self.string_opened;
-                            self.pos = old_pos + token_len;
-                            let (next_raw_term, _next_len, _next_node) = self.lex(None);
-                            self.pos = old_pos;
-                            self.string_opened = old_string_opened;
-
-                            if self
-                                .recovery_profile
-                                .closing_tokens
-                                .contains(&next_raw_term)
-                            {
-                                let expected = self.expected_ids_for_analysis(
-                                    &self.grammar.analysis,
-                                    current_state_idx,
-                                    true,
-                                );
-                                self.push_unexpected_trimmed(
-                                    self.pos,
-                                    self.pos + token_len,
-                                    expected.clone(),
-                                );
-                                let deleted_node = self.alloc.alloc(
-                                    Tag::new_error(ParsecError::UnexpectedToken { expected }),
-                                    vec![],
-                                    token_len,
-                                );
-                                node_stack.push(StackEntry {
-                                    node: deleted_node,
-                                    binds_state: false,
-                                });
-                                self.consume(token_len);
-                                continue;
-                            }
-                        }
-
                         if self.is_quote_terminal(term_idx) {
                             self.string_opened = !self.string_opened;
                         }
@@ -274,14 +224,53 @@ impl Parser {
                                 ),
                             ));
                         }
+                        let token_start = self.pos;
                         self.consume(token_len);
                         state_stack.push(next_state);
                         node_stack.push(StackEntry {
                             node: token_node,
                             binds_state: true,
                         });
+                        // Track open/close bracket tokens for scope recovery.
+                        let bridge_specs = &self.grammar.bridge_specs;
+                        if bridge_specs.iter().any(|b| b.open == term_idx) {
+                            open_scope_stack.push(OpenScopeToken {
+                                term_idx,
+                                start: token_start,
+                            });
+                        } else if let Some(pos) = open_scope_stack.iter().rposition(|t| {
+                            bridge_specs
+                                .iter()
+                                .any(|b| b.open == t.term_idx && b.close == term_idx)
+                        }) {
+                            open_scope_stack.truncate(pos);
+                        }
+                        #[cfg(test)]
+                        if std::env::var("TRACE_PARSE").is_ok() {
+                            let name = self
+                                .grammar
+                                .table
+                                .terminals
+                                .get(term_idx)
+                                .map(|m| m.display())
+                                .unwrap_or_default();
+                            eprintln!(
+                                "[parse_text] Shift term={term_idx}({name}) len={token_len} → state={next_state}, nd={}",
+                                node_stack.len()
+                            );
+                        }
                     }
                     Action::Reduce(prod_idx) => {
+                        #[cfg(test)]
+                        if std::env::var("TRACE_PARSE").is_ok() {
+                            let prod = &self.grammar.table.productions[prod_idx];
+                            eprintln!(
+                                "[parse_text] Reduce prod={prod_idx}(lhs={},rhs={}), nd={}",
+                                prod.lhs,
+                                prod.rhs.len(),
+                                node_stack.len()
+                            );
+                        }
                         if !self.perform_reduce(prod_idx, &mut state_stack, &mut node_stack) {
                             self.messages.push(ParserMessage::new_unexpected(
                                 Span::new(self.pos, self.pos),
@@ -313,17 +302,46 @@ impl Parser {
                     }
                 }
             } else {
-                recovery_active = true;
-                // Fast-path for unknown tokens: delete and resync locally instead of running CPCT+.
-                // This keeps errors localized and avoids costly repair search on junk input.
-                let (raw_term, raw_len, _raw_node) = self.lex(None);
-                if raw_term == UNKNOWN_TOKEN && raw_len > 0 {
-                    if !self.panic_sync(&mut state_stack, &mut node_stack) {
-                        break;
+                // Scope recovery (Nilsson-Nyman 2009 §4): before falling back to
+                // CPCT+, try to skip to the nearest matching close delimiter.
+                let scope_result = scope_recover(
+                    &self.grammar.bridge_specs,
+                    &self.grammar.recovery_delimiters,
+                    &self.grammar.table.terminals,
+                    &self.text,
+                    self.pos,
+                    &open_scope_stack,
+                );
+                if let Some(sr) = scope_result {
+                    let skip_len = sr.skip_to - self.pos;
+                    if skip_len > 0 {
+                        self.push_unexpected_trimmed(self.pos, sr.skip_to, Vec::new());
+                        let error_node = self.alloc.alloc(
+                            Tag::new_error(ParsecError::UnexpectedToken {
+                                expected: Vec::new(),
+                            }),
+                            vec![],
+                            skip_len,
+                        );
+                        node_stack.push(StackEntry {
+                            node: error_node,
+                            binds_state: false,
+                        });
+                        self.consume(skip_len);
+                        if matches!(sr.stop, ScopeStop::Close) {
+                            // On close-stop, drop inner opens up to the matched scope.
+                            if let Some(stack_pos) = open_scope_stack
+                                .iter()
+                                .rposition(|t| t.term_idx == sr.bridge.open)
+                            {
+                                open_scope_stack.truncate(stack_pos);
+                            }
+                        }
+                        continue;
                     }
-                    continue;
                 }
 
+                // CPCT+ error recovery: find minimum cost repair sequences and apply the first.
                 let recovery_config = &self.config.recovery;
                 let repairs = recover(
                     &self.grammar.analysis,
@@ -337,46 +355,28 @@ impl Parser {
                     Some(&mut self.recovery_cache),
                 );
 
-                // CPCT+ returns the complete set of minimum cost repair sequences
-                // Apply the first one (they're all equally good locally)
                 if repairs.is_empty() {
-                    // No CPCT+ repair found: try delimiter/token sync fallback.
-                    if !self.panic_sync(&mut state_stack, &mut node_stack) {
-                        break;
-                    }
-                    continue;
+                    break;
                 }
 
-                let ops = &repairs[0]; //  Use first repair from top-ranked set
+                let ops = &repairs[0];
                 if ops.is_empty() {
-                    // Empty repair: try sync fallback before giving up.
-                    if !self.panic_sync(&mut state_stack, &mut node_stack) {
-                        break;
-                    }
-                    continue;
+                    break;
                 }
 
                 let old_pos = self.pos;
-                let old_state_len = state_stack.len();
-                let old_node_len = node_stack.len();
+                let old_state_stack = state_stack.clone();
+                let old_node_stack = node_stack.clone();
 
                 if !self.apply_repair_ops(ops, &mut state_stack, &mut node_stack) {
-                    // Phase 2 fallback: delimiter/token synchronisation.
-                    if !self.panic_sync(&mut state_stack, &mut node_stack) {
-                        break;
-                    }
-                    continue;
+                    break;
                 }
 
-                // Check we made progress
                 if self.pos == old_pos
-                    && state_stack.len() == old_state_len
-                    && node_stack.len() == old_node_len
+                    && state_stack == old_state_stack
+                    && node_stack == old_node_stack
                 {
-                    // No progress from replay: try sync fallback.
-                    if !self.panic_sync(&mut state_stack, &mut node_stack) {
-                        break;
-                    }
+                    break;
                 }
             }
         }
@@ -405,6 +405,7 @@ impl Parser {
         self.messages.clear();
         self.newly_computed_nodes.clear();
         self.newly_computed_tokens.clear();
+        self.recovery_cache.clear();
 
         let slice = self.text[pos..pos + expected_width].to_string();
         let cache_key = self.build_parse_rule_cache_key(rule_ix, expected_width, &slice);
@@ -422,7 +423,6 @@ impl Parser {
         let analysis = self.analysis_for_rule(rule_ix);
         let mut state_stack = vec![analysis.start_state];
         let mut node_stack: Vec<StackEntry> = vec![];
-        let mut recovery_steps = 0usize;
 
         loop {
             let current_state_idx = *state_stack.last().unwrap();
@@ -436,188 +436,14 @@ impl Parser {
                 .cloned();
 
             let Some(action) = action else {
-                let expected = self.expected_ids_for_analysis(&analysis, current_state_idx, true);
-                let (raw_term, raw_len, raw_node) = self.lex_with_end(None, parse_end);
-
-                if raw_len > 0 {
-                    if let Some(term_ix) = expected
-                        .iter()
-                        .copied()
-                        .filter(|term_ix| {
-                            !self.recovery_profile.opening_tokens.contains(term_ix)
-                                && !self.recovery_profile.closing_tokens.contains(term_ix)
-                                && !self.recovery_profile.sync_tokens.contains(term_ix)
-                                && !self.is_quote_terminal(*term_ix)
-                                && !self.is_json_string_terminal(*term_ix)
-                                && *term_ix != EOF_TOKEN
-                        })
-                        .min()
-                    {
-                        let start_pos = self.pos;
-                        let err_node = self.alloc.alloc(
-                            Tag::new_error(ParsecError::UnexpectedToken {
-                                expected: expected.clone(),
-                            }),
-                            vec![],
-                            raw_len,
-                        );
-                        if self.apply_terminal_with_analysis(
-                            term_ix,
-                            raw_len,
-                            err_node,
-                            true,
-                            &mut state_stack,
-                            &mut node_stack,
-                            analysis.as_ref(),
-                        ) {
-                            self.messages.push(ParserMessage::new_unexpected(
-                                Span::new(start_pos, start_pos + raw_len),
-                                expected.clone(),
-                            ));
-                            recovery_steps += 1;
-                            if recovery_steps <= 128 {
-                                continue;
-                            }
-                        }
-                    }
-
-                    let raw_is_beacon = self.recovery_profile.sync_tokens.contains(&raw_term)
-                        || self.recovery_profile.closing_tokens.contains(&raw_term);
-
-                    if raw_is_beacon {
-                        let old_pos = self.pos;
-                        let old_string_opened = self.string_opened;
-                        let mut trial_states = state_stack.clone();
-                        let mut trial_nodes = node_stack.clone();
-
-                        if self.apply_terminal_with_analysis(
-                            raw_term,
-                            raw_len,
-                            raw_node,
-                            true,
-                            &mut trial_states,
-                            &mut trial_nodes,
-                            analysis.as_ref(),
-                        ) {
-                            state_stack = trial_states;
-                            node_stack = trial_nodes;
-                            recovery_steps += 1;
-                            if recovery_steps <= 128 {
-                                continue;
-                            }
-                        }
-
-                        self.pos = old_pos;
-                        self.string_opened = old_string_opened;
-
-                        if let Some(term_ix) = expected
-                            .iter()
-                            .copied()
-                            .filter(|term_ix| {
-                                !self.recovery_profile.opening_tokens.contains(term_ix)
-                                    && !self.recovery_profile.closing_tokens.contains(term_ix)
-                                    && !self.recovery_profile.sync_tokens.contains(term_ix)
-                                    && !self.is_quote_terminal(*term_ix)
-                                    && !self.is_json_string_terminal(*term_ix)
-                                    && *term_ix != EOF_TOKEN
-                            })
-                            .min()
-                        {
-                            let missing = self.alloc.alloc(
-                                Tag::new_error(ParsecError::MissingToken {
-                                    expected: vec![term_ix],
-                                }),
-                                vec![],
-                                0,
-                            );
-                            let before = (self.pos, state_stack.len(), node_stack.len());
-                            if self.apply_terminal_with_analysis(
-                                term_ix,
-                                0,
-                                missing,
-                                false,
-                                &mut state_stack,
-                                &mut node_stack,
-                                analysis.as_ref(),
-                            ) {
-                                let after = (self.pos, state_stack.len(), node_stack.len());
-                                if after != before {
-                                    self.messages.push(ParserMessage::new_missing(
-                                        Span::new(self.pos, self.pos),
-                                        vec![term_ix],
-                                    ));
-                                    recovery_steps += 1;
-                                    if recovery_steps <= 128 {
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    let error_expected = expected.clone();
-                    self.push_unexpected_trimmed(self.pos, self.pos + raw_len, expected);
-                    let deleted_node = self.alloc.alloc(
-                        Tag::new_error(ParsecError::UnexpectedToken {
-                            expected: error_expected,
-                        }),
-                        vec![],
-                        raw_len,
-                    );
-                    node_stack.push(StackEntry {
-                        node: deleted_node,
-                        binds_state: false,
-                    });
-                    self.consume(raw_len);
-                    recovery_steps += 1;
-                    if recovery_steps <= 128 {
-                        continue;
-                    }
-                } else {
-                    let before = (self.pos, state_stack.len(), node_stack.len());
-                    if let Some(term_ix) = expected
-                        .iter()
-                        .copied()
-                        .find(|term_ix| *term_ix != EOF_TOKEN)
-                    {
-                        let missing = self.alloc.alloc(
-                            Tag::new_error(ParsecError::MissingToken {
-                                expected: vec![term_ix],
-                            }),
-                            vec![],
-                            0,
-                        );
-                        if self.apply_terminal_with_analysis(
-                            term_ix,
-                            0,
-                            missing,
-                            false,
-                            &mut state_stack,
-                            &mut node_stack,
-                            analysis.as_ref(),
-                        ) {
-                            let after = (self.pos, state_stack.len(), node_stack.len());
-                            if after != before {
-                                self.messages.push(ParserMessage::new_missing(
-                                    Span::new(self.pos, self.pos),
-                                    vec![term_ix],
-                                ));
-                                recovery_steps += 1;
-                                if recovery_steps <= 128 {
-                                    continue;
-                                }
-                            }
-                        }
-                    }
-                    self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(self.pos, self.pos),
-                        expected,
-                    ));
-                }
-                self.pos = old_pos;
-                self.string_opened = old_string_opened;
-                self.store_parse_rule_cache(cache_key, slice, None, self.messages.clone(), pos);
-                return None;
+                return self.finalize_parse_rule_failure(
+                    cache_key,
+                    slice,
+                    pos,
+                    old_pos,
+                    old_string_opened,
+                    expected_width,
+                );
             };
 
             match action {
@@ -651,16 +477,14 @@ impl Parser {
                             Span::new(self.pos, self.pos),
                             Vec::new(),
                         ));
-                        self.pos = old_pos;
-                        self.string_opened = old_string_opened;
-                        self.store_parse_rule_cache(
+                        return self.finalize_parse_rule_failure(
                             cache_key,
                             slice,
-                            None,
-                            self.messages.clone(),
                             pos,
+                            old_pos,
+                            old_string_opened,
+                            expected_width,
                         );
-                        return None;
                     }
                 }
                 Action::Accept => break,
@@ -670,17 +494,25 @@ impl Parser {
         let parsed_green = self.finalize_root(&mut node_stack);
         let width = self.alloc.get_node(parsed_green).width;
         let Some(parsed_rule_green) = self.extract_rule_node(parsed_green, rule_ix) else {
-            self.pos = old_pos;
-            self.string_opened = old_string_opened;
-            self.store_parse_rule_cache(cache_key, slice, None, self.messages.clone(), pos);
-            return None;
+            return self.finalize_parse_rule_failure(
+                cache_key,
+                slice,
+                pos,
+                old_pos,
+                old_string_opened,
+                expected_width,
+            );
         };
         let parsed_rule_width = self.alloc.get_node(parsed_rule_green).width;
         if width != expected_width || parsed_rule_width != expected_width {
-            self.pos = old_pos;
-            self.string_opened = old_string_opened;
-            self.store_parse_rule_cache(cache_key, slice, None, self.messages.clone(), pos);
-            return None;
+            return self.finalize_parse_rule_failure(
+                cache_key,
+                slice,
+                pos,
+                old_pos,
+                old_string_opened,
+                expected_width,
+            );
         }
 
         self.newly_computed_nodes
@@ -700,6 +532,37 @@ impl Parser {
             );
         }
         Some(parsed_rule_green)
+    }
+
+    fn finalize_parse_rule_failure(
+        &mut self,
+        cache_key: ParseRuleCacheKey,
+        slice: String,
+        pos: usize,
+        old_pos: usize,
+        old_string_opened: bool,
+        expected_width: usize,
+    ) -> Option<GreenId> {
+        self.pos = old_pos;
+        self.string_opened = old_string_opened;
+
+        if self.messages.is_empty() {
+            self.messages.push(ParserMessage::new_unexpected(
+                Span::new(pos, pos + expected_width),
+                Vec::new(),
+            ));
+        }
+
+        let error_green = self.alloc.alloc(
+            Tag::new_error(ParsecError::Incomplete),
+            vec![],
+            expected_width,
+        );
+        self.newly_computed_nodes
+            .push(Span::new(pos, pos + expected_width));
+
+        self.store_parse_rule_cache(cache_key, slice, None, self.messages.clone(), pos);
+        Some(error_green)
     }
 
     fn analysis_for_rule(&self, rule_ix: usize) -> Arc<GrammarStateAnalysis> {
@@ -761,6 +624,13 @@ impl Parser {
             .collect();
         self.newly_computed_nodes.clear();
         self.newly_computed_tokens.clear();
+
+        if let Some(green) = cached.green {
+            if matches!(self.alloc.get_node(green).tag, Tag::Error(_)) {
+                return None;
+            }
+        }
+
         Some(cached.green)
     }
 
@@ -847,23 +717,11 @@ impl Parser {
         let node = self.alloc.get_node(green);
         match &node.tag {
             Tag::Rule { rule_ix: current } if *current == rule_ix => Some(green),
-            Tag::Error(_) => {
-                if node.children.len() == 1 {
-                    let child = node.children[0];
-                    let child_node = self.alloc.get_node(child);
-                    if matches!(child_node.tag, Tag::Rule { rule_ix: current } if current == rule_ix)
-                    {
-                        return Some(child);
-                    }
-                }
-                node.children.iter().copied().find(|child| {
-                    matches!(
-                        self.alloc.get_node(*child).tag,
-                        Tag::Rule { rule_ix: current } if current == rule_ix
-                    )
-                })
-            }
-            _ => None,
+            _ => node
+                .children
+                .iter()
+                .copied()
+                .find_map(|child| self.extract_rule_node(child, rule_ix)),
         }
     }
 
@@ -999,8 +857,11 @@ impl Parser {
 
             match op {
                 RepairOp::Insert(term_ix) => {
-                    // Reject synthetic string construction; let sync fallback handle it.
-                    if self.is_quote_terminal(term_ix) || self.is_json_string_terminal(term_ix) {
+                    // Allow string-body insertion only at a true parse boundary
+                    // (EOF / trailing whitespace) for truncated-input completion.
+                    let at_boundary =
+                        self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty();
+                    if self.is_json_string_terminal(term_ix) && !at_boundary {
                         return false;
                     }
                     self.messages.push(ParserMessage::new_missing(
@@ -1027,14 +888,13 @@ impl Parser {
                     }
                     let error_expected = expected.clone();
                     self.push_unexpected_trimmed(self.pos, self.pos + len, expected);
-                    let deleted_node =
-                        self.alloc.alloc(
-                            Tag::new_error(ParsecError::UnexpectedToken {
-                                expected: error_expected,
-                            }),
-                            vec![],
-                            len,
-                        );
+                    let deleted_node = self.alloc.alloc(
+                        Tag::new_error(ParsecError::UnexpectedToken {
+                            expected: error_expected,
+                        }),
+                        vec![],
+                        len,
+                    );
                     node_stack.push(StackEntry {
                         node: deleted_node,
                         binds_state: false,
@@ -1064,294 +924,6 @@ impl Parser {
             i += 1;
         }
         true
-    }
-
-    fn panic_sync(
-        &mut self,
-        state_stack: &mut Vec<usize>,
-        node_stack: &mut Vec<StackEntry>,
-    ) -> bool {
-        let start = self.pos;
-        let mut steps = 0usize;
-        let mut last_expected = Vec::new();
-
-        while steps < 64 {
-            let state_idx = *state_stack.last().unwrap();
-            let expected_ids = self.expected_ids(state_idx);
-            last_expected = expected_ids.clone();
-
-            let (term, len, node) = self.lex(Some(&expected_ids));
-            let is_error_token = {
-                let token = self.alloc.get_node(node);
-                matches!(token.tag, Tag::Error(_))
-            };
-            let has_action = self.grammar.analysis.states[state_idx]
-                .actions
-                .get(&term)
-                .is_some();
-
-            if has_action && !is_error_token {
-                if self.pos > start {
-                    self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(start, self.pos),
-                        last_expected.clone(),
-                    ));
-                }
-                return self.apply_terminal(term, len, node, true, state_stack, node_stack);
-            }
-
-            let (raw_term, raw_len, raw_node) = self.lex(None);
-            if raw_len == 0 {
-                break;
-            }
-
-            // If we have a non-structural expected token, consume the unexpected
-            // input as that token to avoid inserting a MissingToken afterwards.
-            if let Some(term_ix) = expected_ids
-                .iter()
-                .copied()
-                .filter(|term_ix| {
-                    !self.recovery_profile.opening_tokens.contains(term_ix)
-                        && !self.recovery_profile.closing_tokens.contains(term_ix)
-                        && !self.recovery_profile.sync_tokens.contains(term_ix)
-                        && !self.is_quote_terminal(*term_ix)
-                        && !self.is_json_string_terminal(*term_ix)
-                        && *term_ix != EOF_TOKEN
-                })
-                .min()
-            {
-                let start_pos = self.pos;
-                let err_node = self.alloc.alloc(
-                    Tag::new_error(ParsecError::UnexpectedToken {
-                        expected: last_expected.clone(),
-                    }),
-                    vec![],
-                    raw_len,
-                );
-                if self.apply_terminal(term_ix, raw_len, err_node, true, state_stack, node_stack) {
-                    self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(start_pos, start_pos + raw_len),
-                        last_expected.clone(),
-                    ));
-                    return true;
-                }
-            }
-
-            // If we can legally shift a sync/closing token by reducing, prefer that
-            // over inserting synthetic openers that can swallow surrounding structure.
-            if self.recovery_profile.sync_tokens.contains(&raw_term)
-                || self.recovery_profile.closing_tokens.contains(&raw_term)
-            {
-                let old_pos = self.pos;
-                let old_string_opened = self.string_opened;
-                let mut trial_states = state_stack.clone();
-                let mut trial_nodes = node_stack.clone();
-
-                if self.apply_terminal(
-                    raw_term,
-                    raw_len,
-                    raw_node,
-                    true,
-                    &mut trial_states,
-                    &mut trial_nodes,
-                ) {
-                    if self.pos > start {
-                        self.messages.push(ParserMessage::new_unexpected(
-                            Span::new(start, self.pos),
-                            last_expected.clone(),
-                        ));
-                    }
-                    *state_stack = trial_states;
-                    *node_stack = trial_nodes;
-                    return true;
-                }
-
-                self.pos = old_pos;
-                self.string_opened = old_string_opened;
-            }
-
-            // When we see a sync token while expecting a value, prefer inserting a
-            // non-structural expected token (e.g., null/number/boolean) so the
-            // sync token can be consumed by the enclosing construct.
-            if self.recovery_profile.sync_tokens.contains(&raw_term) {
-                if let Some(term_ix) = expected_ids
-                    .iter()
-                    .copied()
-                    .filter(|term_ix| {
-                        !self.recovery_profile.opening_tokens.contains(term_ix)
-                            && !self.recovery_profile.closing_tokens.contains(term_ix)
-                            && !self.is_quote_terminal(*term_ix)
-                            && !self.is_json_string_terminal(*term_ix)
-                            && *term_ix != EOF_TOKEN
-                    })
-                    .min()
-                {
-                    let token_node =
-                        self.alloc.alloc(
-                            Tag::new_error(ParsecError::MissingToken {
-                                expected: vec![term_ix],
-                            }),
-                            vec![],
-                            0,
-                        );
-                    let mut trial_states = state_stack.clone();
-                    let mut trial_nodes = node_stack.clone();
-                    if self.apply_terminal(
-                        term_ix,
-                        0,
-                        token_node,
-                        false,
-                        &mut trial_states,
-                        &mut trial_nodes,
-                    ) {
-                        *state_stack = trial_states;
-                        *node_stack = trial_nodes;
-                        self.messages.push(ParserMessage::new_missing(
-                            Span::new(self.pos, self.pos),
-                            vec![term_ix],
-                        ));
-                        steps += 1;
-                        continue;
-                    }
-                }
-            }
-
-            // Trailing separator recovery: if we see a closing token while the last
-            // shifted terminal was a separator, drop the separator and retry.
-            if self.recovery_profile.closing_tokens.contains(&raw_term) {
-                if let Some((idx, term_ix)) =
-                    node_stack
-                        .iter()
-                        .enumerate()
-                        .rev()
-                        .find_map(|(idx, entry)| {
-                            if !entry.binds_state {
-                                return None;
-                            }
-                            let node = self.alloc.get_node(entry.node);
-                            if let Tag::Token { rule_ix } = node.tag {
-                                if self.recovery_profile.sync_tokens.contains(&rule_ix) {
-                                    return Some((idx, rule_ix));
-                                }
-                            }
-                            None
-                        })
-                {
-                    let _ = term_ix; // used for clarity
-                    node_stack.truncate(idx);
-                    state_stack.pop();
-                    steps += 1;
-                    continue;
-                }
-            }
-
-            // Bridge-style mend: at delimiter/structural beacons, try inserting
-            // expected structural tokens before deleting user input.
-            if self.try_bridge_mend(raw_term, &expected_ids, state_stack, node_stack) {
-                steps += 1;
-                continue;
-            }
-
-            let deleted_node = self.alloc.alloc(
-                Tag::new_error(ParsecError::UnexpectedToken {
-                    expected: last_expected.clone(),
-                }),
-                vec![],
-                raw_len,
-            );
-            node_stack.push(StackEntry {
-                node: deleted_node,
-                binds_state: false,
-            });
-            self.consume(raw_len);
-            steps += 1;
-        }
-
-        if self.pos > start {
-            self.messages.push(ParserMessage::new_unexpected(
-                Span::new(start, self.pos),
-                last_expected,
-            ));
-            true
-        } else {
-            false
-        }
-    }
-
-    fn try_bridge_mend(
-        &mut self,
-        raw_term: usize,
-        expected_ids: &[usize],
-        state_stack: &mut Vec<usize>,
-        node_stack: &mut Vec<StackEntry>,
-    ) -> bool {
-        let raw_is_beacon = self.recovery_profile.sync_tokens.contains(&raw_term)
-            || self.recovery_profile.opening_tokens.contains(&raw_term)
-            || self.recovery_profile.closing_tokens.contains(&raw_term);
-        if !raw_is_beacon {
-            return false;
-        }
-
-        let mut candidates: Vec<(usize, usize)> = expected_ids
-            .iter()
-            .copied()
-            .filter_map(|term_ix| {
-                let priority = self.bridge_insert_priority(term_ix, raw_term)?;
-                Some((priority, term_ix))
-            })
-            .collect();
-
-        if candidates.is_empty() {
-            return false;
-        }
-
-        candidates.sort_by_key(|(priority, term_ix)| (*priority, *term_ix));
-        candidates.dedup_by_key(|(_, term_ix)| *term_ix);
-
-        for (_priority, term_ix) in candidates {
-            let silent_opener = self.recovery_profile.closing_tokens.contains(&raw_term)
-                && self.recovery_profile.opening_tokens.contains(&term_ix)
-                && self
-                    .recovery_profile
-                    .closing_to_opening
-                    .get(&raw_term)
-                    .is_some_and(|openers| openers.contains(&term_ix));
-
-            let token_node = if silent_opener {
-                self.alloc.alloc_token(Tag::new_token(term_ix), 0)
-            } else {
-                self.alloc.alloc(
-                    Tag::new_error(ParsecError::MissingToken {
-                        expected: vec![term_ix],
-                    }),
-                    vec![],
-                    0,
-                )
-            };
-            let mut trial_states = state_stack.clone();
-            let mut trial_nodes = node_stack.clone();
-
-            if self.apply_terminal(
-                term_ix,
-                0,
-                token_node,
-                false,
-                &mut trial_states,
-                &mut trial_nodes,
-            ) {
-                *state_stack = trial_states;
-                *node_stack = trial_nodes;
-                if !silent_opener {
-                    self.messages.push(ParserMessage::new_missing(
-                        Span::new(self.pos, self.pos),
-                        vec![term_ix],
-                    ));
-                }
-                return true;
-            }
-        }
-
-        false
     }
 
     fn apply_terminal(
@@ -1396,63 +968,17 @@ impl Parser {
         }
     }
 
-    fn apply_terminal_with_analysis(
-        &mut self,
-        term: usize,
-        len: usize,
-        token_node: GreenId,
-        consume_input: bool,
-        state_stack: &mut Vec<usize>,
-        node_stack: &mut Vec<StackEntry>,
-        analysis: &GrammarStateAnalysis,
-    ) -> bool {
-        loop {
-            let current_state_idx = *state_stack.last().unwrap();
-            let action = analysis.states[current_state_idx]
-                .actions
-                .get(&term)
-                .cloned();
-
-            match action {
-                Some(Action::Shift(next_state)) => {
-                    if consume_input && self.is_quote_terminal(term) {
-                        self.string_opened = !self.string_opened;
-                    }
-                    if consume_input {
-                        self.consume(len);
-                    }
-                    state_stack.push(next_state);
-                    node_stack.push(StackEntry {
-                        node: token_node,
-                        binds_state: true,
-                    });
-                    return true;
-                }
-                Some(Action::Reduce(prod_idx)) => {
-                    if !self.perform_reduce_with_analysis(
-                        prod_idx,
-                        state_stack,
-                        node_stack,
-                        analysis,
-                    ) {
-                        return false;
-                    }
-                }
-                Some(Action::Accept) => return true,
-                None => return false,
-            }
-        }
-    }
-
     fn finalize_root(&self, node_stack: &mut Vec<StackEntry>) -> GreenId {
         if node_stack.is_empty() {
-            return self.alloc.new_placeholder(0);
+            return self
+                .alloc
+                .alloc(Tag::new_error(ParsecError::Incomplete), vec![], 0);
         }
         if node_stack.len() == 1 {
-            return node_stack
-                .pop()
-                .map(|e| e.node)
-                .unwrap_or_else(|| self.alloc.new_placeholder(0));
+            return node_stack.pop().map(|e| e.node).unwrap_or_else(|| {
+                self.alloc
+                    .alloc(Tag::new_error(ParsecError::Incomplete), vec![], 0)
+            });
         }
 
         let children: Vec<GreenId> = node_stack.drain(..).map(|e| e.node).collect();
@@ -1461,7 +987,7 @@ impl Parser {
             .map(|id| self.alloc.get_node(*id).width)
             .sum();
         self.alloc
-            .alloc(Tag::Error(ParsecError::Placeholder), children, width)
+            .alloc(Tag::new_error(ParsecError::Incomplete), children, width)
     }
 
     fn pop_reduce_entries(
@@ -1515,7 +1041,14 @@ impl Parser {
 
         let popped = match self.pop_reduce_entries(rhs_len, state_stack, node_stack) {
             Some(entries) => entries,
-            None => return false,
+            None => {
+                #[cfg(test)]
+                eprintln!(
+                    "[perform_reduce] pop_reduce_entries({rhs_len}) returned None, state_stack={state_stack:?}, node_stack.len()={}",
+                    node_stack.len()
+                );
+                return false;
+            }
         };
 
         let mut children: Vec<GreenId> = popped.iter().map(|entry| entry.node).collect();
@@ -1570,6 +1103,13 @@ impl Parser {
             state_stack.push(*goto_state);
             true
         } else {
+            #[cfg(test)]
+            {
+                let all_gotos: Vec<_> = top_state.goto.iter().collect();
+                eprintln!(
+                    "[perform_reduce] goto[lhs={lhs}] not found in top_state_idx={top_state_idx}, available_goto={all_gotos:?}, state_stack={state_stack:?}"
+                );
+            }
             false
         }
     }
@@ -1590,115 +1130,6 @@ impl Parser {
             .copied()
             .filter(|id| !exclude_eof || *id != EOF_TOKEN)
             .collect()
-    }
-
-    fn build_recovery_profile(grammar: &Grammar) -> RecoveryProfile {
-        let mut profile = RecoveryProfile::default();
-
-        for prod in &grammar.table.productions {
-            if prod.rhs.len() < 2 {
-                continue;
-            }
-
-            let first_term = match prod.rhs.first() {
-                Some(Symbol::Terminal(t)) => Some(*t),
-                _ => None,
-            };
-            let last_term = match prod.rhs.last() {
-                Some(Symbol::Terminal(t)) => Some(*t),
-                _ => None,
-            };
-            let contains_nonterminal = prod.rhs.iter().any(|s| matches!(s, Symbol::NonTerminal(_)));
-
-            // Delimiter pair extraction directly from production envelope: T ... T.
-            if let (Some(open), Some(close)) = (first_term, last_term) {
-                if contains_nonterminal {
-                    profile.opening_tokens.insert(open);
-                    profile.closing_tokens.insert(close);
-                    profile
-                        .closing_to_opening
-                        .entry(close)
-                        .or_default()
-                        .insert(open);
-                }
-            }
-
-            // Separator/sync extraction: terminal between nonterminals.
-            for win in prod.rhs.windows(3) {
-                if let [
-                    Symbol::NonTerminal(_),
-                    Symbol::Terminal(t),
-                    Symbol::NonTerminal(_),
-                ] = win
-                {
-                    profile.sync_tokens.insert(*t);
-                }
-            }
-
-            // Prefix separator/sync extraction: terminal followed by a nonterminal.
-            // This captures list separators like "," in sep-tail productions.
-            for win in prod.rhs.windows(2) {
-                if let [Symbol::Terminal(t), Symbol::NonTerminal(_)] = win {
-                    profile.sync_tokens.insert(*t);
-                }
-            }
-
-            // Statement/list boundary sync: terminal suffix after nonterminal content.
-            if let Some(Symbol::Terminal(t)) = prod.rhs.last() {
-                if prod.rhs[..prod.rhs.len() - 1]
-                    .iter()
-                    .any(|s| matches!(s, Symbol::NonTerminal(_)))
-                {
-                    profile.sync_tokens.insert(*t);
-                }
-            }
-        }
-
-        // Closers are always sync anchors.
-        for close in profile.closing_tokens.iter().copied() {
-            profile.sync_tokens.insert(close);
-        }
-
-        profile
-    }
-
-    fn bridge_insert_priority(&self, expected_term: usize, raw_term: usize) -> Option<usize> {
-        let expected_is_closer = self
-            .recovery_profile
-            .closing_tokens
-            .contains(&expected_term);
-        let expected_is_opener = self
-            .recovery_profile
-            .opening_tokens
-            .contains(&expected_term);
-        let raw_is_sync = self.recovery_profile.sync_tokens.contains(&raw_term);
-        let raw_is_closer = self.recovery_profile.closing_tokens.contains(&raw_term);
-
-        // Construction-site insertion: prefer inserting closing delimiters near sync boundaries.
-        if expected_is_closer {
-            if raw_is_sync || expected_term == raw_term {
-                return Some(0);
-            }
-            if raw_is_closer {
-                return Some(1);
-            }
-            return Some(2);
-        }
-
-        // If parser expects an opener while seeing a closing token, prefer matched opener.
-        if expected_is_opener {
-            if self
-                .recovery_profile
-                .closing_to_opening
-                .get(&raw_term)
-                .is_some_and(|openers| openers.contains(&expected_term))
-            {
-                return Some(3);
-            }
-            return Some(6);
-        }
-
-        None
     }
 
     fn push_unexpected_trimmed(&mut self, start: usize, end: usize, expected: Vec<usize>) {

@@ -16,10 +16,17 @@ struct RuleInfo {
     description: &'static str,
 }
 
+#[derive(Clone, serde::Serialize)]
+struct TerminalInfo {
+    idx: usize,
+    display: String,
+}
+
 #[derive(Clone)]
 pub struct WebPreviewInterface {
     sender: channel::Sender<runtime::RuntimeRequest>,
     rule_infos: &'static Vec<RuleInfo>,
+    terminal_infos: &'static Vec<TerminalInfo>,
     host: &'static str,
     port: u16,
 }
@@ -30,9 +37,11 @@ impl Interface for WebPreviewInterface {
         grammar: &'static grammar::Grammar,
     ) -> Self {
         let rule_infos = serialize_rule_infos(grammar);
+        let terminal_infos = serialize_terminal_infos(grammar);
         Self {
             sender,
             rule_infos,
+            terminal_infos,
             host: "localhost",
             port: 8080,
         }
@@ -130,6 +139,7 @@ fn resolve_api_request(
 
         /* GET */
         "api/rules" => rouille::Response::json(&this.rule_infos),
+        "api/terminals" => rouille::Response::json(&this.terminal_infos),
 
         _ => rouille::Response::empty_404(),
     }
@@ -148,4 +158,15 @@ fn serialize_rule_infos(grammar: &'static grammar::Grammar) -> &'static Vec<Rule
         rule_infos.push(info);
     }
     Box::leak(Box::new(rule_infos))
+}
+
+fn serialize_terminal_infos(grammar: &'static grammar::Grammar) -> &'static Vec<TerminalInfo> {
+    let mut terminal_infos = Vec::new();
+    for (idx, terminal) in grammar.table.terminals.iter().enumerate() {
+        terminal_infos.push(TerminalInfo {
+            idx,
+            display: terminal.display(),
+        });
+    }
+    Box::leak(Box::new(terminal_infos))
 }

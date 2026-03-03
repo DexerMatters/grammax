@@ -1030,8 +1030,13 @@ fn collect_from(
         } else {
             let mut preferred = None;
 
+            // Prefer zero-width Rule children (e.g. ε-productions like @sep_tail → ())
+            // but NOT zero-width Error children (MissingToken / UnexpectedToken).
+            // Error nodes with width 0 would trigger the early-return guard below,
+            // preventing descent into adjacent real-width content (pair, string, etc.).
             for candidate in &overlaps {
-                if alloc.get_node(candidate.1).width == 0 {
+                let n = alloc.get_node(candidate.1);
+                if n.width == 0 && !matches!(n.tag, Tag::Error(_)) {
                     preferred = Some(*candidate);
                     break;
                 }

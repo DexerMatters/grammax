@@ -92,14 +92,29 @@ export interface ErrorKind {
   expected?: number[];
 }
 
+export interface TerminalInfo {
+  idx: number;
+  display: string;
+}
+
 export async function fetchRuleInfos(): Promise<RuleInfo[]> {
   return axios.get<RuleInfo[]>(`${BASE_URL}/rules`).then(res => res.data);
+}
+
+export async function fetchTerminalInfos(): Promise<TerminalInfo[]> {
+  return axios.get<TerminalInfo[]>(`${BASE_URL}/terminals`).then(res => res.data);
 }
 
 export async function getSource(): Promise<string> {
   const action: GetSourceAction = { type: 'getSource' };
   const response = await axios.post<string>(`${BASE_URL}/action`, action).then(res => res.data);
   return typeof response === 'string' ? response : '';
+}
+
+export async function getTree(): Promise<Command[]> {
+  const action = { type: 'getTree' };
+  const response = await axios.post<Command[] | string>(`${BASE_URL}/action`, action).then(res => res.data);
+  return Array.isArray(response) ? response : [];
 }
 
 export async function submitAction(action: Action): Promise<Command[]> {

@@ -39,6 +39,34 @@ pub(crate) fn generate_commands_incremental(
     commands
 }
 
+/// Generate a full-tree snapshot as commands: creates every node and inserts the root.
+/// Used to bootstrap a fresh client that has no prior tree state.
+pub(crate) fn generate_commands_for_full_tree(
+    alloc: &TreeAllocRef,
+    root_green: usize,
+    source_text: &str,
+) -> Vec<Command> {
+    let mut commands = Vec::new();
+    let mut next_node_id = 1u64;
+
+    let node_id = emit_create_commands_from_green(
+        alloc,
+        root_green,
+        0,
+        source_text,
+        &mut commands,
+        &mut next_node_id,
+    );
+
+    commands.push(Command::InsertNodeAtPath {
+        path: NodePath(vec![]),
+        node_id,
+        cascade_to_root: false,
+    });
+
+    commands
+}
+
 fn emit_commands_for_delta(
     alloc: &TreeAllocRef,
     old_green: usize,
@@ -53,20 +81,6 @@ fn emit_commands_for_delta(
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) {
     if old_green == new_green || greens_equivalent(alloc, old_green, new_green, eq_cache) {
-        return;
-    }
-
-    if path.0.is_empty() {
-        emit_replace_at_path(
-            alloc,
-            old_green,
-            path,
-            new_green,
-            new_green_offset,
-            source_text,
-            out,
-            next_node_id,
-        );
         return;
     }
 
@@ -85,6 +99,34 @@ fn emit_commands_for_delta(
             next_node_id,
         );
         return;
+    }
+
+    // Field nodes with a single child are transparent in the frontend tree:
+    // emit_create_commands_from_green_with_field skips them and hoists their name onto the child.
+    // Therefore the path emitted by the delta must NOT include the Field wrapper level.
+    // When both old and new are single-child Field nodes, recurse into the children at the
+    // *same* path (no extra index pushed), so generated paths stay aligned with the frontend.
+    if let Tag::Field { .. } = &old_node.tag {
+        if old_node.children.len() == 1 && new_node.children.len() == 1 {
+            let old_child = old_node.children[0];
+            let new_child = new_node.children[0];
+            drop(old_node);
+            drop(new_node);
+            emit_commands_for_delta(
+                alloc,
+                old_child,
+                new_child,
+                new_green_offset,
+                source_text,
+                path,
+                false,
+                out,
+                next_node_id,
+                eq_cache,
+                align_cache,
+            );
+            return;
+        }
     }
 
     let old_children = &old_node.children;
@@ -152,6 +194,30 @@ fn emit_commands_for_delta(
             delete_path.0.push(ix);
             out.push(Command::DeleteNodeAtPath { path: delete_path });
         }
+        return;
+    }
+
+    // Unified greedy tag-match: match new_mid children to old_mid children left-to-right by
+    // immediate tag.  Unmatched old children are deleted; unmatched new children are inserted.
+    // This subsumes both the equal-count same-tag pairing and the subsequence alignment
+    // strategies, and crucially never contaminates `out` on failure — all commands are buffered
+    // and only flushed on success.
+    if try_emit_by_greedy_tag_match(
+        alloc,
+        path,
+        old_children,
+        new_children,
+        old_mid_start,
+        old_mid_end,
+        new_mid_start,
+        new_mid_end,
+        new_green_offset,
+        source_text,
+        out,
+        next_node_id,
+        eq_cache,
+        align_cache,
+    ) {
         return;
     }
 
@@ -274,6 +340,161 @@ fn emit_insert_at_path(
     });
 }
 
+fn try_emit_by_greedy_tag_match(
+    alloc: &TreeAllocRef,
+    path: &NodePath,
+    old_children: &[usize],
+    new_children: &[usize],
+    old_mid_start: usize,
+    old_mid_end: usize,
+    new_mid_start: usize,
+    new_mid_end: usize,
+    new_green_offset: usize,
+    source_text: &str,
+    out: &mut Vec<Command>,
+    next_node_id: &mut u64,
+    eq_cache: &mut FxHashMap<(usize, usize), bool>,
+    align_cache: &mut FxHashMap<(usize, usize), bool>,
+) -> bool {
+    let old_mid = &old_children[old_mid_start..old_mid_end];
+    let new_mid = &new_children[new_mid_start..new_mid_end];
+
+    // Greedy left-to-right matching by immediate tag only.
+    // For each new child, find the next old child (from old_ix forward) with the same tag.
+    // This determines which old children to match (recurse) vs. skip (delete).
+    // New children that skip over old children themselves will be inserted.
+    //
+    // Strategy: scan new_mid left-to-right.  For each new child, advance old_ix while tags
+    // differ — those unmatched old children become deletions.  When a match is found, pair them
+    // for recursion and advance both indices.  Any new children that have no remaining old match
+    // become insertions.  We only proceed if the greedy scan consumes all remaining old children
+    // either as matches or deletions (i.e. old cannot have leftover items that can't be handled).
+
+    // First, compute the matching permutation (dry run into a buffer — no writes yet).
+    // matched_old[i] = new_rel index that old_mid[i] maps to, or None (→ delete)
+    // matched_new[j] = old_rel index that new_mid[j] maps to, or None (→ insert)
+    let mut matched_old: Vec<Option<usize>> = vec![None; old_mid.len()];
+    let mut matched_new: Vec<Option<usize>> = vec![None; new_mid.len()];
+    {
+        let mut old_ix = 0usize;
+        for (new_rel, &new_child) in new_mid.iter().enumerate() {
+            let new_tag = &alloc.get_node(new_child).tag;
+            // Look for next old child with the same tag.
+            if let Some(oi) =
+                (old_ix..old_mid.len()).find(|&oi| &alloc.get_node(old_mid[oi]).tag == new_tag)
+            {
+                // Old children between old_ix and oi are unmatched (deletions).
+                matched_old[oi] = Some(new_rel);
+                matched_new[new_rel] = Some(oi);
+                old_ix = oi + 1;
+            }
+            // No match found → this new child will be an insertion.
+        }
+    }
+
+    // If NONE of the new children matched anything, we can't do better than a full replace.
+    if matched_new.iter().all(|m| m.is_none()) {
+        return false;
+    }
+
+    // Buffer all commands so we only flush to `out` when we're done (never pollute on failure).
+    let mut buf: Vec<Command> = Vec::new();
+    let mut child_node_id = *next_node_id;
+
+    // Replay: walk old_mid left-to-right.  Interleave insertions of new children whose matched
+    // old partner comes *after* the current old position (or whose match is None and they come
+    // before the next matched old child).
+    //
+    // Simpler: walk new_mid left-to-right, and for each new child either:
+    //   • It's matched → first delete any skipped old children that precede its old partner,
+    //     then recurse into (old_partner, new_child) at the CURRENT live-tree index.
+    //   • It's unmatched → insert it at the current live-tree index.
+    //
+    // `current_index` tracks the live-tree position: starts at old_mid_start, advances by +1
+    // for each old child we keep (match+recurse) or new child we insert, stays the same after
+    // every deletion (the deleted slot disappears, shifting the rest back).
+
+    let mut old_cursor = 0usize; // next old_mid index to process
+    let mut current_index = old_mid_start; // live-tree index
+
+    for (new_rel, (&new_child, &old_rel_opt)) in new_mid.iter().zip(matched_new.iter()).enumerate()
+    {
+        if let Some(old_rel) = old_rel_opt {
+            // Delete every unmatched old child that comes before this match.
+            while old_cursor < old_rel {
+                let mut del_path = path.clone();
+                del_path.0.push(current_index);
+                buf.push(Command::DeleteNodeAtPath { path: del_path });
+                // Deletion: live-tree index does NOT advance (next child shifts into this slot).
+                old_cursor += 1;
+            }
+
+            // Recurse into (old_mid[old_rel], new_mid[new_rel]).
+            let old_child = old_mid[old_rel];
+            let mut child_path = path.clone();
+            child_path.0.push(current_index);
+            let child_offset = child_offset_at(
+                alloc,
+                new_children,
+                new_green_offset,
+                new_mid_start + new_rel,
+            );
+            emit_commands_for_delta(
+                alloc,
+                old_child,
+                new_child,
+                child_offset,
+                source_text,
+                &child_path,
+                false,
+                &mut buf,
+                &mut child_node_id,
+                eq_cache,
+                align_cache,
+            );
+            current_index += 1;
+            old_cursor += 1;
+        } else {
+            // No old match → insert this new child at the current live-tree index.
+            let insert_offset = child_offset_at(
+                alloc,
+                new_children,
+                new_green_offset,
+                new_mid_start + new_rel,
+            );
+            let node_id = emit_create_commands_from_green(
+                alloc,
+                new_child,
+                insert_offset,
+                source_text,
+                &mut buf,
+                &mut child_node_id,
+            );
+            let mut insert_path = path.clone();
+            insert_path.0.push(current_index);
+            buf.push(Command::InsertNodeAtPath {
+                path: insert_path,
+                node_id,
+                cascade_to_root: false,
+            });
+            current_index += 1;
+        }
+    }
+
+    // Delete any remaining old children that had no matching new child.
+    while old_cursor < old_mid.len() {
+        let mut del_path = path.clone();
+        del_path.0.push(current_index);
+        buf.push(Command::DeleteNodeAtPath { path: del_path });
+        old_cursor += 1;
+    }
+
+    out.append(&mut buf);
+    *next_node_id = child_node_id;
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn try_emit_insertions_as_subsequence_aligned(
     alloc: &TreeAllocRef,
     path: &NodePath,
@@ -382,6 +603,12 @@ fn try_emit_deletions_as_subsequence_aligned(
     let mut new_ix = 0usize;
     let mut current_index = old_mid_start;
 
+    // Buffer all commands so we only write them to `out` when we know the attempt succeeds.
+    // Previously, DeleteNodeAtPath commands were pushed into `out` during the loop and were
+    // left behind as stale entries when the function ultimately returned `false`.
+    let mut buf: Vec<Command> = Vec::new();
+    let mut child_node_id = *next_node_id;
+
     for &old_child in old_mid {
         if new_ix < new_mid.len()
             && greens_align_equivalent(alloc, old_child, new_mid[new_ix], align_cache)
@@ -398,8 +625,8 @@ fn try_emit_deletions_as_subsequence_aligned(
                 source_text,
                 &child_path,
                 false,
-                out,
-                next_node_id,
+                &mut buf,
+                &mut child_node_id,
                 eq_cache,
                 align_cache,
             );
@@ -408,11 +635,17 @@ fn try_emit_deletions_as_subsequence_aligned(
         } else {
             let mut delete_path = path.clone();
             delete_path.0.push(current_index);
-            out.push(Command::DeleteNodeAtPath { path: delete_path });
+            buf.push(Command::DeleteNodeAtPath { path: delete_path });
         }
     }
 
-    new_ix == new_mid.len()
+    if new_ix == new_mid.len() {
+        out.append(&mut buf);
+        *next_node_id = child_node_id;
+        true
+    } else {
+        false
+    }
 }
 
 fn common_prefix_len(

@@ -12,6 +12,78 @@ use crate::runtime::delta::generate_commands_incremental;
 use crate::semantic::Command;
 use crate::semantic::command::NodePath;
 
+/// Verifies that adding a character inside a deeply-nested node (e.g. typing "a" into a
+/// partially-written JSON string key) produces a *minimal* set of semantic commands rather than
+/// recreating the entire tree.  Before the fix, the delta algorithm would bail out at root with a
+/// full Delete+Insert of every node in the tree.
+#[test]
+fn test_json_insert_char_minimal_commands() {
+    let grammar = new_grammar!(
+        start where
+        start   -> r!(json) + tt(EndOfInput)
+        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
+        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
+        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
+        string  -> tt("\"") + t(STRING) + t("\"")
+        number  -> tt(NUMS)
+        boolean -> tt("true") | tt("false")
+        null    -> tt("null")
+    );
+
+    let mut parser = Parser::new(grammar);
+
+    // Parse the "before" text: an unclosed JSON object with an unterminated string key.
+    let old = parser.parse_text("{\n\"a\": ");
+    let old_root = old.root.green;
+
+    // Parse the "after" text: the user typed one character "a" inside the string.
+    let new = parser.parse_text("{\n\"a\": 1");
+    let new_root = new.root.green;
+
+    let root_path = NodePath(vec![]);
+
+    let cmds = generate_commands_incremental(
+        &parser.alloc,
+        &root_path,
+        old_root,
+        new_root,
+        0,
+        "{\n\"a\": 1",
+        true,
+    );
+
+    println!("Commands for incremental update from `{{\\n\"a\": ` to `{{\\n\"a\": 1`:");
+    for cmd in &cmds {
+        println!("  {cmd:?}");
+    }
+
+    // Must not recreate the entire tree: no top-level Delete+Insert pair.
+    let has_root_delete = cmds
+        .iter()
+        .any(|c| matches!(c, Command::DeleteNodeAtPath { path } if path.0.is_empty()));
+    assert!(
+        !has_root_delete,
+        "should not emit DeleteNodeAtPath at root — full tree was recreated; cmds: {cmds:?}"
+    );
+
+    // No stale/duplicate Delete commands at the same path.
+    let delete_paths: Vec<&NodePath> = cmds
+        .iter()
+        .filter_map(|c| match c {
+            Command::DeleteNodeAtPath { path } => Some(path),
+            _ => None,
+        })
+        .collect();
+    let unique_deletes: std::collections::HashSet<Vec<usize>> =
+        delete_paths.iter().map(|p| p.0.clone()).collect();
+    assert_eq!(
+        delete_paths.len(),
+        unique_deletes.len(),
+        "duplicate DeleteNodeAtPath commands detected; cmds: {cmds:?}"
+    );
+}
+
 #[test]
 fn test_expr_example() {
     let grammar = new_grammar!(
@@ -153,7 +225,6 @@ fn test_semantic_commands() {
 
     let listener = RuntimeListener::new().after_update(move |result| {
         println!("> Updated source: {}", result.source_text);
-        println!("> Mapped IR: {:?}", result.semantic_ir_root.unwrap());
         println!("> Commands: \n");
         for cmd in &result.semantic_commands {
             println!("  {:?}", cmd);

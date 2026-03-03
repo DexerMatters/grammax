@@ -1,6 +1,6 @@
 import React, { useState, useReducer } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import type { CreateTokenCommand, CreateNodeCommand, CreateErrorCommand, DeleteNodeAtPathCommand, ReplaceNodeAtPathCommand, InsertNodeAtPathCommand, Command, RuleInfo } from '../Fetch';
+import type { CreateTokenCommand, CreateNodeCommand, CreateErrorCommand, DeleteNodeAtPathCommand, ReplaceNodeAtPathCommand, InsertNodeAtPathCommand, Command, RuleInfo, TerminalInfo } from '../Fetch';
 
 // ============ Runtime Tree Node Model ============
 
@@ -192,9 +192,10 @@ function replaceAtPath(node: TreeNode | null, path: number[], newNode: TreeNode)
 interface TreeDisplayProps {
   node: TreeNode;
   rules: Map<number, RuleInfo>;
+  terminals: Map<number, TerminalInfo>;
 }
 
-const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
+const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules, terminals }) => {
   // All hooks must be called unconditionally at the top
   const [isExpanded, setIsExpanded] = useState(true);
   const [showDetails, setShowDetails] = useState(false);
@@ -256,8 +257,10 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
     // For missing errors, display expected rule name; otherwise display text
     let displayContent: React.ReactNode;
     if (node.errorKind === 'missing' && node.expectedRuleIx.length > 0) {
-      const expectedRule = rules.get(node.expectedRuleIx[0]);
-      displayContent = <span className="text-[#66ddff]">{'{' + (expectedRule?.name || `rule_${node.expectedRuleIx[0]}`) + '}'}</span>;
+      // expectedRuleIx contains terminal indices, not rule indices — look up terminal display names
+      const terminalDisplay = terminals.get(node.expectedRuleIx[0])?.display;
+      const label = terminalDisplay ?? `#${node.expectedRuleIx[0]}`;
+      displayContent = <span className="text-[#66ddff]">{'{' + label + '}'}</span>;
     } else {
       displayContent = <span className="text-[#8bdb8b]">"{node.text}"</span>;
     }
@@ -290,14 +293,15 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
           >
             <div className="flex flex-wrap gap-1">
               {node.expectedRuleIx.map((ix) => {
-                const rule = rules.get(ix);
+                // ix is a terminal index; display the terminal's match text
+                const terminal = terminals.get(ix);
                 return (
                   <span
                     key={ix}
                     className="px-1 py-0.25 bg-[#2a2a2a] border border-[#66ddff]/40 rounded text-[#66ddff] font-mono text-xs"
-                    title={`Rule #${ix}`}
+                    title={`Terminal #${ix}`}
                   >
-                    {rule ? rule.name : `#${ix}`}
+                    {terminal ? terminal.display : `#${ix}`}
                   </span>
                 );
               })}
@@ -339,7 +343,7 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
                 const isLast = idx === node.children.length - 1;
                 return (
                   <motion.div
-                    key={child.id}
+                    key={`${child.id}-${idx}`}
                     className="flex"
                     initial={{ opacity: 0, height: 0 }}
                     animate={{ opacity: 1, height: 'auto' }}
@@ -363,7 +367,7 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
                     </div>
 
                     <div className="flex-1 py-1">
-                      <TreeNodeDisplay node={child} rules={rules} />
+                      <TreeNodeDisplay node={child} rules={rules} terminals={terminals} />
                     </div>
                   </motion.div>
                 );
@@ -390,9 +394,10 @@ const TreeNodeDisplay: React.FC<TreeDisplayProps> = ({ node, rules }) => {
 interface TreeViewerProps {
   tree: TreeNode | null;
   rules: Map<number, RuleInfo>;
+  terminals: Map<number, TerminalInfo>;
 }
 
-const TreeViewer: React.FC<TreeViewerProps> = ({ tree, rules }) => {
+const TreeViewer: React.FC<TreeViewerProps> = ({ tree, rules, terminals }) => {
   if (!tree) {
     return (
       <div className="px-2 py-1 text-[#666] italic">
@@ -401,7 +406,7 @@ const TreeViewer: React.FC<TreeViewerProps> = ({ tree, rules }) => {
     );
   }
 
-  return <TreeNodeDisplay node={tree} rules={rules} />;
+  return <TreeNodeDisplay node={tree} rules={rules} terminals={terminals} />;
 };
 
 function useTreeReducer(initialTree: TreeNode | null = null) {

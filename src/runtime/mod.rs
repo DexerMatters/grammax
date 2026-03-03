@@ -36,6 +36,7 @@ pub enum Action {
     Update { span: Span, text: String },
 
     GetSource,
+    GetTree,
 
     Run,
     Pause,
@@ -66,6 +67,7 @@ impl<'de> serde::Deserialize<'de> for Action {
                 text: String,
             },
             GetSource,
+            GetTree,
             Run,
             Pause,
             Resume,
@@ -83,6 +85,7 @@ impl<'de> serde::Deserialize<'de> for Action {
                 text,
             },
             ActionHelper::GetSource => Action::GetSource,
+            ActionHelper::GetTree => Action::GetTree,
             ActionHelper::Run => Action::Run,
             ActionHelper::Pause => Action::Pause,
             ActionHelper::Resume => Action::Resume,
@@ -102,6 +105,7 @@ impl Action {
             Action::Resume => RuntimeAction::Resume,
             Action::Exit => RuntimeAction::Exit,
             Action::GetSource => RuntimeAction::Get,
+            Action::GetTree => RuntimeAction::Get,
         }
     }
 }
@@ -763,6 +767,15 @@ where
                 Ok(Some(RuntimeResponse::String(
                     self.parser.text().to_string(),
                 )))
+            }
+            Action::GetTree => {
+                self.ensure_mode(RuntimeMode::Running, RuntimeAction::Get)?;
+                let commands = delta::generate_commands_for_full_tree(
+                    &self.parser.alloc,
+                    self.cursor.current.green,
+                    &self.text,
+                );
+                Ok(Some(RuntimeResponse::Commands(commands)))
             }
             edit @ Action::Insert { .. }
             | edit @ Action::Delete { .. }

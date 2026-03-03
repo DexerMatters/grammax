@@ -61,10 +61,8 @@ fn test_json() {
     println!("Grammar:\n{}", parser.grammar.table);
 
     let text = r#"{
-        "name: "John",
-        "age": [30, 31],
-        "isStudent": 33
-    }
+        "a": 12
+    
     "#;
     let result = parser.parse_text(text);
 

@@ -20,17 +20,85 @@ pub enum ParsecError {
 pub type GreenId = usize;
 
 /// Tags indicating the type of a syntax tree node, such as whether it's a rule, token, field, or an error.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+///
+/// `Tag::Rule` carries two rule indices:
+/// - `rule_ix`        — the "display" rule used for semantics/display (e.g. `expr`).
+/// - `reparse_rule_ix`— the original rule used to produce this node (e.g. `expr@drop_1`).
+///                      Used by the incremental reparser to pick the correct grammar entry
+///                      point when re-parsing a subtree, so drop constraints are respected.
+///                      Excluded from PartialEq/Hash so tree equivalence is based on structure.
+#[derive(Debug, Clone, Serialize)]
 pub enum Tag {
-    Rule { rule_ix: usize },
-    Token { rule_ix: usize }, // Usually terminal_idx
-    Field { rule_ix: usize, name: &'static str },
+    Rule {
+        rule_ix: usize,
+        #[serde(skip)]
+        reparse_rule_ix: usize,
+    },
+    Token {
+        rule_ix: usize,
+    }, // Usually terminal_idx
+    Field {
+        rule_ix: usize,
+        name: &'static str,
+    },
     Error(ParsecError),
+}
+
+impl PartialEq for Tag {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            // Intentionally ignore reparse_rule_ix — tree equivalence is based on display rule.
+            (Tag::Rule { rule_ix: a, .. }, Tag::Rule { rule_ix: b, .. }) => a == b,
+            (Tag::Token { rule_ix: a }, Tag::Token { rule_ix: b }) => a == b,
+            (
+                Tag::Field {
+                    rule_ix: a,
+                    name: na,
+                },
+                Tag::Field {
+                    rule_ix: b,
+                    name: nb,
+                },
+            ) => a == b && na == nb,
+            (Tag::Error(a), Tag::Error(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Tag {}
+
+impl std::hash::Hash for Tag {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        match self {
+            // Intentionally skip reparse_rule_ix to match PartialEq.
+            Tag::Rule { rule_ix, .. } => {
+                0u8.hash(state);
+                rule_ix.hash(state);
+            }
+            Tag::Token { rule_ix } => {
+                1u8.hash(state);
+                rule_ix.hash(state);
+            }
+            Tag::Field { rule_ix, name } => {
+                2u8.hash(state);
+                rule_ix.hash(state);
+                name.hash(state);
+            }
+            Tag::Error(e) => {
+                3u8.hash(state);
+                e.hash(state);
+            }
+        }
+    }
 }
 
 impl Tag {
     pub fn new_rule(rule_ix: usize) -> Self {
-        Tag::Rule { rule_ix }
+        Tag::Rule {
+            rule_ix,
+            reparse_rule_ix: rule_ix,
+        }
     }
     pub fn new_token(rule_ix: usize) -> Self {
         Tag::Token { rule_ix }

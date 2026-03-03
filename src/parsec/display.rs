@@ -246,7 +246,7 @@ fn format_label(
 ) -> (String, String) {
     let node = alloc.get_node(id);
     match &node.tag {
-        Tag::Rule { rule_ix } => {
+        Tag::Rule { rule_ix, .. } => {
             let name = grammar.name(*rule_ix);
             if name.starts_with('@') {
                 (String::new(), String::new())

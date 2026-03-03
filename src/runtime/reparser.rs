@@ -535,7 +535,10 @@ impl Reparser {
         // because single-child Field nodes are not emitted as separate nodes in
         // the command stream (they are merged into their child's field attribute).
         let path = NodePath(
-            candidate.zipper.steps.iter()
+            candidate
+                .zipper
+                .steps
+                .iter()
                 .filter(|s| !matches!(self.alloc.get_node(s.parent.green).tag, Tag::Field { .. }))
                 .map(|s| s.child_idx)
                 .collect(),
@@ -709,13 +712,13 @@ impl Reparser {
 
         let start_rule_ix = parser.grammar.table.start_rule;
 
-        if let Tag::Rule { rule_ix } = &root.tag {
+        if let Tag::Rule { rule_ix, .. } = &root.tag {
             if *rule_ix != start_rule_ix {
                 if let Some(&child) =
                     children
                         .iter()
                         .find(|&&child| match &self.alloc.get_node(child).tag {
-                            Tag::Rule { rule_ix } => *rule_ix == start_rule_ix,
+                            Tag::Rule { rule_ix, .. } => *rule_ix == start_rule_ix,
                             _ => false,
                         })
                 {
@@ -731,7 +734,7 @@ impl Reparser {
 
             // Check for duplicate rule without cloning tags
             let is_duplicate_rule = match (&root.tag, &child_node.tag) {
-                (Tag::Rule { rule_ix: a }, Tag::Rule { rule_ix: b }) => a == b,
+                (Tag::Rule { rule_ix: a, .. }, Tag::Rule { rule_ix: b, .. }) => a == b,
                 _ => false,
             };
 
@@ -750,7 +753,7 @@ impl Reparser {
                 children
                     .iter()
                     .find(|&&child| match &self.alloc.get_node(child).tag {
-                        Tag::Rule { rule_ix } => *rule_ix == start_rule_ix,
+                        Tag::Rule { rule_ix, .. } => *rule_ix == start_rule_ix,
                         _ => false,
                     });
 
@@ -950,14 +953,19 @@ fn collect_from(
 ) {
     let green = alloc.get_node(node.green);
     let _rule_ix = match &green.tag {
-        Tag::Rule { rule_ix } => *rule_ix,
+        Tag::Rule { rule_ix, .. } => *rule_ix,
         _ => usize::MAX,
     };
 
-    if let Tag::Rule { rule_ix } = &green.tag {
+    if let Tag::Rule {
+        reparse_rule_ix, ..
+    } = &green.tag
+    {
         out.push(Zipper {
             node: node.clone(),
-            rule_ix: *rule_ix,
+            // Use reparse_rule_ix so @drop_ nodes (e.g. expr@drop_1 tagged as expr)
+            // are reparsed with the correct restricted grammar entry point.
+            rule_ix: *reparse_rule_ix,
             offset: node.offset,
             old_width: green.width,
             level,
@@ -1152,12 +1160,13 @@ fn collect_from(
 
             if should_stop_at_separator {
                 if let Tag::Rule {
-                    rule_ix: child_rule_ix,
+                    reparse_rule_ix: child_reparse_rule_ix,
+                    ..
                 } = &child.tag
                 {
                     out.push(Zipper {
                         node: child_node.clone(),
-                        rule_ix: *child_rule_ix,
+                        rule_ix: *child_reparse_rule_ix,
                         offset: child_start,
                         old_width: child.width,
                         level: level + 1,
@@ -1172,7 +1181,7 @@ fn collect_from(
             steps.pop();
 
             // For sep-based list rules, also explore following children to find @sep_tail
-            if let Tag::Rule { rule_ix } = &green.tag {
+            if let Tag::Rule { rule_ix, .. } = &green.tag {
                 let rule_name = parser.grammar.name(*rule_ix);
                 if is_insertion && (rule_name == "@sep" || rule_name.ends_with("@sep")) {
                     // After processing the selected child, also check remaining children for @sep_tail
@@ -1184,6 +1193,7 @@ fn collect_from(
                         let remaining_child = alloc.get_node(remaining_id);
                         if let Tag::Rule {
                             rule_ix: remaining_rule,
+                            ..
                         } = &remaining_child.tag
                         {
                             let remaining_name = parser.grammar.name(*remaining_rule);

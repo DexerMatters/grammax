@@ -723,7 +723,7 @@ impl Parser {
             return;
         }
 
-        if let Tag::Rule { rule_ix } = tag {
+        if let Tag::Rule { rule_ix, .. } = tag {
             let slice = self.text[offset..end].to_string();
             let cache_key = self.build_parse_rule_cache_key(rule_ix, width, &slice);
             self.reuse_cache.insert(
@@ -747,7 +747,9 @@ impl Parser {
     fn extract_rule_node(&self, green: GreenId, rule_ix: usize) -> Option<GreenId> {
         let node = self.alloc.get_node(green);
         match &node.tag {
-            Tag::Rule { rule_ix: current } if *current == rule_ix => Some(green),
+            Tag::Rule {
+                rule_ix: current, ..
+            } if *current == rule_ix => Some(green),
             _ => node
                 .children
                 .iter()

@@ -43,6 +43,7 @@ impl Interface for WebPreviewInterface {
         Self {
             sender,
             rule_infos,
+            terminal_infos,
             host: "127.0.0.1",
             port: 8080,
         }

@@ -510,7 +510,7 @@ impl<'a, T> NodeView<'a, T> {
 
     pub fn rule_name(&self) -> Option<&'a str> {
         let rule_ix = match &self.parse_nodes.get(&self.green)?.tag {
-            Tag::Rule { rule_ix } => Some(*rule_ix),
+            Tag::Rule { rule_ix, .. } => Some(*rule_ix),
             _ => None,
         }?;
         Some(self.grammar.name(rule_ix))
@@ -823,7 +823,7 @@ impl<T> AstMapper<T> for RuleMap<T> {
     fn map(&self, cx: &LowerCtx<'_, T>) -> MapOutput<T> {
         let node = cx.node();
         match cx.tag {
-            Tag::Rule { rule_ix } => {
+            Tag::Rule { rule_ix, .. } => {
                 if let Some(mapper) = self.rules_ix.get(rule_ix) {
                     return (mapper)(node);
                 }
@@ -1125,7 +1125,10 @@ where
             .collect();
 
         let tag = if field.is_empty() {
-            Tag::Rule { rule_ix }
+            Tag::Rule {
+                rule_ix,
+                reparse_rule_ix: rule_ix,
+            }
         } else {
             let name = self.intern_field_name(field);
             Tag::Field { rule_ix, name }
@@ -1376,7 +1379,7 @@ where
         let width = memo_snapshot.width;
         let token_text = memo_snapshot.token_text.as_deref();
         let rule_name = match &tag {
-            Tag::Rule { rule_ix } => Some(self.grammar.name(*rule_ix)),
+            Tag::Rule { rule_ix, .. } => Some(self.grammar.name(*rule_ix)),
             _ => None,
         };
         let mapped = {

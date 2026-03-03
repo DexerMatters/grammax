@@ -2,13 +2,11 @@
 use crate::interface::webui::WebPreviewInterface;
 #[cfg(feature = "webui")]
 use crate::{
-    interface::{BasicInterface, webui::WebPreviewInterface},
     new_grammar,
-    parsec::{ParserConfig, display::format_ast, recovery::RecoveryConfig, words::*},
+    parsec::{ParserConfig, recovery::RecoveryConfig, words::*},
     runtime::{Interactive, RuntimeListener},
     semantic::{ASTCell, MapOutput, RuleMap},
 };
-use crate::{new_grammar, parsec::words::*};
 
 use crate::parsec::Parser;
 use crate::runtime::delta::generate_commands_incremental;
@@ -234,17 +232,6 @@ fn test_semantic_commands() {
         for cmd in &result.semantic_commands {
             println!("  {:?}", cmd);
         }
-        println!(
-            "> AST {}",
-            format_ast(
-                &result.current_parser.grammar,
-                result.current_tree,
-                &result.current_parser.alloc,
-                result.source_text
-            )
-        );
-        println!("> Duration: {}µs", result.metrics.total_duration_us);
-        println!("> Metrics: {:#?}", result.metrics);
     });
 
     let runtime = Interactive::new(expr_grammar)

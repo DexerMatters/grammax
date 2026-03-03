@@ -1,3 +1,5 @@
+use std::net::{SocketAddr, TcpListener};
+
 use color_print::cprintln;
 use crossbeam::channel;
 use rust_embed::Embed;
@@ -41,8 +43,7 @@ impl Interface for WebPreviewInterface {
         Self {
             sender,
             rule_infos,
-            terminal_infos,
-            host: "localhost",
+            host: "127.0.0.1",
             port: 8080,
         }
     }
@@ -68,8 +69,22 @@ impl WebPreviewInterface {
 
     pub fn run(&self) -> runtime::RuntimeResult {
         self.request(runtime::Action::Run)?;
+
+        // Find a free port
+        let mut port = self.port;
+        while !is_port_free(self.host, port) {
+            cprintln!(
+                "<yellow>Port {} is in use, trying {}...</yellow>",
+                port,
+                port + 1
+            );
+            port += 1;
+        }
+
+        // Create server on the free port
+        let addr = format!("{}:{}", self.host, port);
         let self_clone = self.clone();
-        let server = rouille::Server::new(self.addr(), move |request| {
+        let server = rouille::Server::new(addr, move |request| {
             let mut path = request.raw_url().trim_start_matches('/').to_string();
 
             // API
@@ -93,18 +108,11 @@ impl WebPreviewInterface {
                 .first_or_octet_stream()
                 .to_string();
             rouille::Response::from_data(mime, content.data.into_owned())
-        });
+        })
+        .map_err(|e| runtime::RuntimeError::GeneralError(e))?;
 
-        if let Err(e) = server {
-            return Err(runtime::RuntimeError::GeneralError(e));
-        }
-
-        let server = server.unwrap();
-
-        cprintln!(
-            "Web preview server running at <green>{}</green>.",
-            self.url()
-        );
+        let url = format!("http://{}:{}/", self.host, port);
+        cprintln!("Web preview server running at <green>{}</green>.", url);
         cprintln!("Press Ctrl+C to stop the server.");
 
         let (handler, sender_to_stop) = server.stoppable();
@@ -118,6 +126,20 @@ impl WebPreviewInterface {
         handler.join().unwrap(); // Keep the server running until it's stopped
 
         Ok(None)
+    }
+}
+
+fn is_port_free(host: &str, port: u16) -> bool {
+    // Use 127.0.0.1 for 127.0.0.1 to avoid DNS resolution issues
+    let check_host = if host == "127.0.0.1" || host.is_empty() {
+        "127.0.0.1"
+    } else {
+        host
+    };
+
+    match format!("{}:{}", check_host, port).parse::<SocketAddr>() {
+        Ok(addr) => TcpListener::bind(addr).is_ok(),
+        Err(_) => false,
     }
 }
 

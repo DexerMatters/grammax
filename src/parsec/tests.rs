@@ -1,7 +1,6 @@
 use crate::new_grammar;
 use crate::parsec::display::{format_ast, format_messages};
 use crate::parsec::parser::Parser;
-use crate::parsec::tree::{ParsecError, Tag, TreeAllocRefExt};
 use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
 #[test]

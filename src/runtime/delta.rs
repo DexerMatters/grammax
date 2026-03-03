@@ -259,15 +259,21 @@ fn emit_commands_for_delta(
         return;
     }
 
-    emit_replace_at_path(
+    emit_lcs_diff(
         alloc,
-        old_green,
         path,
-        new_green,
+        old_children,
+        new_children,
+        old_mid_start,
+        old_mid_end,
+        new_mid_start,
+        new_mid_end,
         new_green_offset,
         source_text,
         out,
         next_node_id,
+        eq_cache,
+        align_cache,
     );
 }
 
@@ -640,6 +646,114 @@ fn try_emit_deletions_as_subsequence_aligned(
         true
     } else {
         false
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_lcs_diff(
+    alloc: &TreeAllocRef,
+    path: &NodePath,
+    old_children: &[usize],
+    new_children: &[usize],
+    old_mid_start: usize,
+    old_mid_end: usize,
+    new_mid_start: usize,
+    new_mid_end: usize,
+    new_green_offset: usize,
+    source_text: &str,
+    out: &mut Vec<Command>,
+    next_node_id: &mut u64,
+    eq_cache: &mut FxHashMap<(usize, usize), bool>,
+    align_cache: &mut FxHashMap<(usize, usize), bool>,
+) {
+    let old_mid = &old_children[old_mid_start..old_mid_end];
+    let new_mid = &new_children[new_mid_start..new_mid_end];
+    let m = old_mid.len();
+    let n = new_mid.len();
+
+    // Compute LCS lengths table using greens_align_equivalent
+    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    for i in (0..m).rev() {
+        for j in (0..n).rev() {
+            dp[i][j] = if greens_align_equivalent(alloc, old_mid[i], new_mid[j], align_cache) {
+                1 + dp[i + 1][j + 1]
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    // Trace the LCS to classify each position as delete, insert, or match
+    let mut unmatched_old: Vec<usize> = Vec::new();
+    let mut unmatched_new: Vec<usize> = Vec::new();
+    let mut matched_pairs: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    let mut j = 0;
+    while i < m || j < n {
+        if i < m && j < n && greens_align_equivalent(alloc, old_mid[i], new_mid[j], align_cache) {
+            matched_pairs.push((i, j));
+            i += 1;
+            j += 1;
+        } else if j >= n || (i < m && dp[i + 1][j] >= dp[i][j + 1]) {
+            unmatched_old.push(i);
+            i += 1;
+        } else {
+            unmatched_new.push(j);
+            j += 1;
+        }
+    }
+
+    // 1. Emit deletions in reverse original order so earlier indices stay valid
+    for &old_rel in unmatched_old.iter().rev() {
+        let mut delete_path = path.clone();
+        delete_path.0.push(old_mid_start + old_rel);
+        out.push(Command::DeleteNodeAtPath { path: delete_path });
+    }
+
+    // 2. Emit insertions using new-tree positions (valid after all deletes above)
+    for &new_rel in &unmatched_new {
+        let mut insert_path = path.clone();
+        insert_path.0.push(new_mid_start + new_rel);
+        let insert_offset = child_offset_at(
+            alloc,
+            new_children,
+            new_green_offset,
+            new_mid_start + new_rel,
+        );
+        emit_insert_at_path(
+            alloc,
+            &insert_path,
+            new_mid[new_rel],
+            insert_offset,
+            source_text,
+            out,
+            next_node_id,
+        );
+    }
+
+    // 3. Recurse on matched pairs using new-tree positions
+    for (old_rel, new_rel) in matched_pairs {
+        let mut child_path = path.clone();
+        child_path.0.push(new_mid_start + new_rel);
+        let child_offset = child_offset_at(
+            alloc,
+            new_children,
+            new_green_offset,
+            new_mid_start + new_rel,
+        );
+        emit_commands_for_delta(
+            alloc,
+            old_mid[old_rel],
+            new_mid[new_rel],
+            child_offset,
+            source_text,
+            &child_path,
+            false,
+            out,
+            next_node_id,
+            eq_cache,
+            align_cache,
+        );
     }
 }
 

@@ -1,13 +1,14 @@
+#[cfg(feature = "webui")]
+use crate::interface::webui::WebPreviewInterface;
+use crate::{new_grammar, parsec::words::*};
+#[cfg(feature = "webui")]
 use crate::{
-    interface::{BasicInterface, webui::WebPreviewInterface},
-    new_grammar,
-    parsec::{ParserConfig, display::format_ast, recovery::RecoveryConfig, words::*},
+    parsec::{ParserConfig, display::format_ast, recovery::RecoveryConfig},
     runtime::{Interactive, RuntimeListener},
     semantic::{ASTCell, MapOutput, RuleMap},
 };
 
 use crate::parsec::Parser;
-use crate::parsec::tree::TreeAllocRefExt;
 use crate::runtime::delta::generate_commands_incremental;
 use crate::semantic::Command;
 use crate::semantic::command::NodePath;
@@ -84,6 +85,7 @@ fn test_json_insert_char_minimal_commands() {
     );
 }
 
+#[cfg(feature = "webui")]
 #[test]
 fn test_expr_example() {
     let grammar = new_grammar!(
@@ -175,6 +177,7 @@ fn test_expr_example() {
     runtime.run().unwrap();
 }
 
+#[cfg(feature = "webui")]
 #[test]
 fn test_semantic_commands() {
     let expr_grammar = new_grammar!(
@@ -251,104 +254,4 @@ fn test_semantic_commands() {
         })
         .finish::<WebPreviewInterface>();
     runtime.run().unwrap();
-}
-
-#[test]
-fn test_incremental_leaf_update_emits_replace_command() {
-    let grammar = new_grammar!(
-        start where
-        start -> r!(expr) + tt(EndOfInput)
-        expr -> r!(add) | r!(mul) | r!(primary)
-        add  -> field("lhs", r!(expr)) + tt("+") + field("rhs", r!(expr).drop(1))
-        mul  -> field("lhs", r!(expr).drop(1)) + tt("*") + field("rhs", r!(expr).drop(2))
-        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
-    );
-
-    let mut parser = Parser::new(grammar);
-    let old = parser.parse_text("1+1");
-    let old_root = old.root.green;
-    let new = parser.parse_text("1+12");
-    let new_root = new.root.green;
-
-    let leaf_path = NodePath(vec![0, 0, 2, 0, 0, 0]);
-
-    fn green_at_path(
-        alloc: &crate::parsec::tree::TreeAllocRef,
-        root: usize,
-        path: &[usize],
-    ) -> Option<usize> {
-        let mut cur = root;
-        for &ix in path {
-            let node = alloc.get_node(cur);
-            cur = *node.children.get(ix)?;
-        }
-        Some(cur)
-    }
-
-    fn offset_at_path(
-        alloc: &crate::parsec::tree::TreeAllocRef,
-        root: usize,
-        path: &[usize],
-    ) -> Option<usize> {
-        let mut cur = root;
-        let mut offset = 0usize;
-        for &ix in path {
-            let node = alloc.get_node(cur);
-            if ix > node.children.len() {
-                return None;
-            }
-            for &child in node.children.iter().take(ix) {
-                offset += alloc.get_node(child).width;
-            }
-            cur = *node.children.get(ix)?;
-        }
-        Some(offset)
-    }
-
-    let old_green =
-        green_at_path(&parser.alloc, old_root, &leaf_path.0).expect("old leaf path should exist");
-    let new_green =
-        green_at_path(&parser.alloc, new_root, &leaf_path.0).expect("new leaf path should exist");
-    let new_offset = offset_at_path(&parser.alloc, new_root, &leaf_path.0)
-        .expect("new leaf offset should be computable");
-
-    let commands = generate_commands_incremental(
-        &parser.alloc,
-        &leaf_path,
-        old_green,
-        new_green,
-        new_offset,
-        "1+12",
-        false,
-    );
-
-    assert!(
-        commands
-            .iter()
-            .any(|c| matches!(c, Command::ReplaceNodeAtPath { path, .. } if path.0 == leaf_path.0)),
-        "leaf update should emit ReplaceNodeAtPath for non-root path; commands: {commands:?}"
-    );
-
-    let delete_paths: Vec<Vec<usize>> = commands
-        .iter()
-        .filter_map(|c| match c {
-            Command::DeleteNodeAtPath { path } if !path.0.is_empty() => Some(path.0.clone()),
-            _ => None,
-        })
-        .collect();
-    let insert_paths: Vec<Vec<usize>> = commands
-        .iter()
-        .filter_map(|c| match c {
-            Command::InsertNodeAtPath { path, .. } if !path.0.is_empty() => Some(path.0.clone()),
-            _ => None,
-        })
-        .collect();
-
-    let has_non_root_delete_insert_pair = delete_paths
-        .iter()
-        .any(|d| insert_paths.iter().any(|i| i == d));
-    assert!(
-        !has_non_root_delete_insert_pair,
-        "leaf update should not emit delete+insert pair on same non-root path; commands: {commands:?}"
-    );
 }

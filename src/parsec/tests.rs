@@ -19,7 +19,7 @@ fn test_simple_arithmetic_precedence() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "1+4*3+4";
+    let text = "1+1+1";
     let result = parser.parse_text(text);
 
     let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());

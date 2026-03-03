@@ -392,11 +392,6 @@ fn try_emit_by_greedy_tag_match(
         }
     }
 
-    // If NONE of the new children matched anything, we can't do better than a full replace.
-    if matched_new.iter().all(|m| m.is_none()) {
-        return false;
-    }
-
     // Buffer all commands so we only flush to `out` when we're done (never pollute on failure).
     let mut buf: Vec<Command> = Vec::new();
     let mut child_node_id = *next_node_id;

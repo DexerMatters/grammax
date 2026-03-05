@@ -9,14 +9,10 @@ Next generation solution for a neat language server.
 - [x] Normalize repetitive and optional rules
 - [x] Extract sync tokens and delimiters
 - [x] Derive bridge parsing specs
-- [x] Left recursion elimination 
-- [x] Shrunken alternative branches by merging common terms
 - [x] Red-green tree
-- [ ] Store and load processed grammar and analysis results 
+- [x] Store and load processed grammar and analysis results 
 - [x] Pretty print for AST
-- [x] Basic logic of the LL parser
-- [x] Memoize look-ahead probing
-- [ ] Leading-word optimization for parsing alternatives
+- [x] Basic logic of the LR parser
 - [x] Temporal LRU cache for node reusing 
 - [x] Coarse-grained error recovery
 - [x] Fine-grained error recovery (missing tokens)
@@ -27,15 +23,21 @@ Next generation solution for a neat language server.
 - [x] Concurrent runtime platform
 - [ ] Fully configurable runtime behaviors 
 - [x] Channel communication with the main thread
-- [ ] Faster node cache invalidation
+- [x] Faster node cache invalidation
 - [x] Basic ascending-based reparsing
 - [x] Strategy-based reparsing
 - [ ] Further localize reparsing range
 - [ ] Stabilize reparsing
 - [ ] Perfect parser listeners
 - [ ] Perfect runtime listeners
-- [ ] Basic interactive platform
-- [ ] IR ready for semantic analysis of red-green AST
+- [x] Basic interactive platform
+- [x] IR ready for semantic analysis of red-green AST
 - [ ] Specified meta information on AST nodes
 - [ ] Simple reactive framework 
+- [ ] Language server protocol integration
+
+## Documentation
+- [ ] Inline documentation for public APIs
+- [ ] Examples for public APIs
+- [ ] Mdbook documentation for the design and implementation details
 ... 

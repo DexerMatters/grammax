@@ -1,0 +1,17 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run test_simple_arithmetic_precedence",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"test",
+				"parsec::tests::test_simple_arithmetic_precedence",
+				"--vars",
+				"--nocapture"
+			],
+			"group": "test"
+		}
+	]
+}

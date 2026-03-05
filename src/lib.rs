@@ -1,14 +1,13 @@
-mod core;
 pub mod grammar;
-pub mod grammar_dsl;
-pub mod parser;
-pub mod tree;
+pub mod interface;
+pub mod parsec;
+pub mod pass;
+pub mod runtime;
+pub mod semantic;
 pub mod utils;
-pub mod words;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn it_works() {}

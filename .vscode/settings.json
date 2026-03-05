@@ -6,5 +6,9 @@
         "**/.DS_Store": true,
         "**/Thumbs.db": true
     },
-    "hide-files.files": []
+    "hide-files.files": [],
+    "rust-analyzer.cargo.features": [
+        "webui",
+        "vsclsp"
+    ]
 }

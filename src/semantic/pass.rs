@@ -10,11 +10,12 @@ use std::{
 use crate::{
     grammar::Grammar,
     parsec::tree::{GreenId, Tag},
-    semantic::{
-        Command,
-        command::{NodePath, PathTargetKind},
-    },
+    runtime::command::{Command, NodePath},
 };
+
+// ============================================================================
+// Core AST Cell & Arena (stable)
+// ============================================================================
 
 pub struct ASTCell<T> {
     raw: usize,
@@ -355,220 +356,53 @@ impl<T> MapOutput<T> {
     }
 }
 
-/// Read-only view over one parse node during lowering.
-pub struct NodeView<'a, T> {
+// ============================================================================
+// Mapper & Query Interface
+// ============================================================================
+
+pub struct GreenQuery<'a, T> {
     grammar: &'a Grammar,
-    parse_nodes: &'a FxHashMap<GreenId, ParseMemo<T>>,
+    greens: &'a FxHashMap<GreenId, GreenNode<T>>,
     source_text: &'a str,
     green: GreenId,
-    trail: Vec<CursorFrame>,
 }
 
-impl<'a, T> Clone for NodeView<'a, T> {
-    fn clone(&self) -> Self {
-        Self {
-            grammar: self.grammar,
-            parse_nodes: self.parse_nodes,
-            source_text: self.source_text,
-            green: self.green,
-            trail: self.trail.clone(),
-        }
-    }
+struct GreenNode<T> {
+    children: Vec<GreenId>,
+    offset: usize,
+    width: usize,
+    token_text: Option<String>,
+    tag: Tag,
+    binding: Option<ASTCell<T>>,
 }
 
-#[derive(Clone, Copy)]
-struct CursorFrame {
-    parent: GreenId,
-    child_index: usize,
-}
-
-pub struct NextEachRule<'a, T> {
-    cursor: NodeView<'a, T>,
-    rule_name: String,
-    active: bool,
-}
-
-impl<'a, T> Iterator for NextEachRule<'a, T> {
-    type Item = NodeView<'a, T>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if !self.active {
-            return None;
-        }
-        if !self.cursor.next_rule(&self.rule_name) {
-            self.active = false;
-            return None;
-        }
-
-        let out = self.cursor.clone();
-        if !self.cursor.next() {
-            self.active = false;
-        }
-        Some(out)
-    }
-}
-
-impl<'a, T> NodeView<'a, T> {
-    fn child_at(&self, parent: GreenId, child_index: usize) -> Option<GreenId> {
-        self.parse_nodes
-            .get(&parent)
-            .and_then(|memo| memo.children.get(child_index).copied())
-    }
-
-    fn first_child_of(&self, parent: GreenId) -> Option<GreenId> {
-        self.child_at(parent, 0)
-    }
-
+impl<'a, T> GreenQuery<'a, T> {
     pub fn green(&self) -> GreenId {
         self.green
     }
 
-    pub fn step_in(&mut self) -> bool {
-        let Some(child) = self.first_child_of(self.green) else {
-            return false;
-        };
-        self.trail.push(CursorFrame {
-            parent: self.green,
-            child_index: 0,
-        });
-        self.green = child;
-        true
-    }
-
-    pub fn step_out(&mut self) -> bool {
-        let Some(frame) = self.trail.pop() else {
-            return false;
-        };
-        self.green = frame.parent;
-        true
-    }
-
-    pub fn next(&mut self) -> bool {
-        let Some(frame) = self.trail.last().copied() else {
-            return false;
-        };
-        let next_index = frame.child_index + 1;
-        let Some(next_green) = self.child_at(frame.parent, next_index) else {
-            return false;
-        };
-        if let Some(frame) = self.trail.last_mut() {
-            frame.child_index = next_index;
-        }
-        self.green = next_green;
-        true
-    }
-
-    pub fn next_into(&mut self, mut scope: impl FnMut(&mut Self) -> bool) -> bool {
-        if !self.step_in() {
-            return false;
-        }
-        let result = scope(self);
-        self.step_out();
-        self.next();
-        result
-    }
-
-    pub fn next_field(&mut self, field_name: &str) -> bool {
-        if self.field_name_is(field_name) {
-            return true;
-        }
-        while self.next() {
-            if self.field_name_is(field_name) {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn is_error(&self) -> bool {
-        self.parse_nodes
-            .get(&self.green)
-            .is_some_and(|memo| matches!(memo.tag, Tag::Error(_)))
-    }
-
-    pub fn next_rule(&mut self, rule_name: &str) -> bool {
-        if self.rule_name_is(rule_name) {
-            return true;
-        }
-        while self.next() {
-            if self.rule_name_is(rule_name) {
-                return true;
-            }
-        }
-        false
-    }
-
-    pub fn next_each_rule(&self, rule_name: &str) -> NextEachRule<'a, T> {
-        let mut cursor = self.clone();
-        let active = cursor.step_in();
-        NextEachRule {
-            cursor,
-            rule_name: rule_name.to_string(),
-            active,
-        }
+    pub fn tag(&self) -> &Tag {
+        &self.greens[&self.green].tag
     }
 
     pub fn rule_name(&self) -> Option<&'a str> {
-        let rule_ix = match &self.parse_nodes.get(&self.green)?.tag {
-            Tag::Rule { rule_ix, .. } => Some(*rule_ix),
-            _ => None,
-        }?;
-        Some(self.grammar.name(rule_ix))
-    }
-
-    pub fn rule_name_is(&self, expected: &str) -> bool {
-        self.rule_name().map_or(false, |name| name == expected)
-    }
-
-    pub fn field_name_is(&self, expected: &str) -> bool {
-        self.field_name().map_or(false, |name| name == expected)
-    }
-
-    pub fn field_name(&self) -> Option<&'static str> {
-        match &self.parse_nodes.get(&self.green)?.tag {
-            Tag::Field { name, .. } => Some(*name),
+        match self.tag() {
+            Tag::Rule { rule_ix, .. } => Some(self.grammar.name(*rule_ix)),
             _ => None,
         }
     }
 
-    pub fn mapped_opt<U>(&self) -> Option<ASTCell<U>> {
-        self.parse_nodes
-            .get(&self.green)
-            .and_then(|memo| memo.binding.cell())
-            .map(ASTCell::cast)
-    }
-
-    pub fn mapped<U>(&self) -> ASTCell<U> {
-        self.mapped_opt::<U>().unwrap_or_else(|| {
-            panic!(
-                "NodeView: no mapped AST cell for node (rule: {:?}, green: {:?})",
-                self.rule_name(),
-                self.green
-            )
-        })
-    }
-
     pub fn span(&self) -> (usize, usize) {
-        let start = self
-            .parse_nodes
-            .get(&self.green)
-            .map_or(0, |memo| memo.offset)
-            .min(self.source_text.len());
-        let width = self
-            .parse_nodes
-            .get(&self.green)
-            .map_or(0, |memo| memo.width);
-        let end = start.saturating_add(width).min(self.source_text.len());
+        let node = &self.greens[&self.green];
+        let start = node.offset.min(self.source_text.len());
+        let end = start.saturating_add(node.width).min(self.source_text.len());
         (start, end)
     }
 
     pub fn text(&self) -> &'a str {
-        if let Some(token_text) = self
-            .parse_nodes
-            .get(&self.green)
-            .and_then(|memo| memo.token_text.as_deref())
-        {
-            return token_text;
+        let node = &self.greens[&self.green];
+        if let Some(text) = &node.token_text {
+            return text;
         }
         let (start, end) = self.span();
         self.source_text.get(start..end).unwrap_or("")
@@ -578,148 +412,116 @@ impl<'a, T> NodeView<'a, T> {
         self.text().trim()
     }
 
-    pub fn mapped_children<U>(&self) -> impl Iterator<Item = ASTCell<U>> + 'a {
-        self.children().filter_map(|child| child.mapped_opt::<U>())
+    pub fn children(&self) -> Vec<GreenQuery<'a, T>> {
+        let node = &self.greens[&self.green];
+        node.children
+            .iter()
+            .map(|&child| GreenQuery {
+                grammar: self.grammar,
+                greens: self.greens,
+                source_text: self.source_text,
+                green: child,
+            })
+            .collect()
     }
 
-    pub fn children(&self) -> impl Iterator<Item = NodeView<'a, T>> + 'a {
-        let mut out = Vec::new();
-        let mut cursor = self.clone();
-        if !cursor.step_in() {
-            return out.into_iter();
-        }
-        loop {
-            out.push(cursor.clone());
-            if !cursor.next() {
-                break;
-            }
-        }
-        out.into_iter()
+    pub fn child_asts(&self) -> Vec<Option<ASTCell<T>>> {
+        let node = &self.greens[&self.green];
+        node.children
+            .iter()
+            .map(|&child| self.greens[&child].binding)
+            .collect()
     }
 
-    pub fn for_nodes_by_name(
-        &self,
-        rule_name: &'static str,
-    ) -> impl Iterator<Item = NodeView<'a, T>> + 'a {
-        self.next_each_rule(rule_name)
-    }
-
-    pub fn for_node_by_field_name(&self, field_name: &'static str) -> NodeView<'a, T> {
-        let mut cursor = self.clone();
-        if !cursor.step_in() || !cursor.next_field(field_name) {
-            panic!(
-                "NodeView: no child with field name '{}' (node rule: {:?}, green: {:?})",
-                field_name,
-                self.rule_name(),
-                self.green
-            );
-        }
-        cursor
-    }
-}
-
-/// Context passed to user mapping closures.
-pub struct LowerCtx<'a, T> {
-    pub green: GreenId,
-    pub tag: &'a Tag,
-    pub rule_name: Option<&'a str>,
-    grammar: &'a Grammar,
-    parse_nodes: &'a FxHashMap<GreenId, ParseMemo<T>>,
-    source_text: &'a str,
-    token_text: Option<&'a str>,
-    offset: usize,
-    width: usize,
-    child_asts: &'a [Option<ASTCell<()>>],
-    child_greens: &'a [GreenId],
-}
-
-impl<'a, T> LowerCtx<'a, T> {
-    pub fn node(&self) -> NodeView<'a, T> {
-        NodeView {
+    /// Get a child at a specific index (0-based)
+    pub fn child_at(&self, index: usize) -> Option<GreenQuery<'a, T>> {
+        let node = &self.greens[&self.green];
+        node.children.get(index).map(|&child| GreenQuery {
             grammar: self.grammar,
-            parse_nodes: self.parse_nodes,
+            greens: self.greens,
             source_text: self.source_text,
-            green: self.green,
-            trail: Vec::new(),
-        }
-    }
-
-    pub fn child<U>(&self, index: usize) -> Option<ASTCell<U>> {
-        self.child_asts
-            .get(index)
-            .copied()
-            .flatten()
-            .map(ASTCell::cast)
-    }
-
-    pub fn child_green(&self, index: usize) -> Option<GreenId> {
-        self.child_greens.get(index).copied()
-    }
-
-    pub fn child_field_name(&self, index: usize) -> Option<&'static str> {
-        let child = *self.child_greens.get(index)?;
-        match &self.parse_nodes.get(&child)?.tag {
-            Tag::Field { name, .. } => Some(*name),
-            _ => None,
-        }
-    }
-
-    pub fn children<'b, U: 'b>(&'b self) -> impl Iterator<Item = ASTCell<U>> + 'b {
-        self.child_asts
-            .iter()
-            .filter_map(|id| *id)
-            .map(|id| id.cast::<U>())
-    }
-
-    pub fn fields<'b, U: 'b>(
-        &'b self,
-        field_name: &'b str,
-    ) -> impl Iterator<Item = ASTCell<U>> + 'b {
-        self.child_asts
-            .iter()
-            .enumerate()
-            .filter_map(
-                move |(index, id)| match (id, self.child_field_name(index)) {
-                    (Some(id), Some(name)) if name == field_name => Some(id.cast::<U>()),
-                    _ => None,
-                },
-            )
-    }
-
-    pub fn next_field<U>(&self, field_name: &str) -> Option<ASTCell<U>> {
-        self.child_asts.iter().enumerate().find_map(|(index, id)| {
-            match (id, self.child_field_name(index)) {
-                (Some(id), Some(name)) if name == field_name => Some(id.cast::<U>()),
-                _ => None,
-            }
+            green: child,
         })
     }
 
-    pub fn span(&self) -> (usize, usize) {
-        let start = self.offset.min(self.source_text.len());
-        let end = start.saturating_add(self.width).min(self.source_text.len());
-        (start, end)
-    }
-
-    pub fn text(&self) -> &'a str {
-        if let Some(token_text) = self.token_text {
-            return token_text;
+    /// Get a child with a specific field name
+    pub fn child_with_field(&self, field_name: &'static str) -> Option<GreenQuery<'a, T>> {
+        let node = &self.greens[&self.green];
+        for &child_id in &node.children {
+            let child_node = &self.greens[&child_id];
+            if matches!(
+                &child_node.tag,
+                Tag::Field { name, .. } if *name == field_name
+            ) {
+                return Some(GreenQuery {
+                    grammar: self.grammar,
+                    greens: self.greens,
+                    source_text: self.source_text,
+                    green: child_id,
+                });
+            }
         }
-        let (start, end) = self.span();
-        self.source_text.get(start..end).unwrap_or("")
+        None
     }
 
-    pub fn text_trimmed(&self) -> &'a str {
-        self.text().trim()
+    /// Get all children that are rules with a specific name (unwraps through field wrappers)
+    pub fn children_with_rule(&self, rule_name: &str) -> Vec<GreenQuery<'a, T>> {
+        let node = &self.greens[&self.green];
+        let mut result = Vec::new();
+        for &child_id in &node.children {
+            let mut actual_id = child_id;
+            // Unwrap field wrapper if present
+            let child_node = &self.greens[&child_id];
+            if matches!(&child_node.tag, Tag::Field { .. }) {
+                if let Some(&inner_id) = child_node.children.first() {
+                    actual_id = inner_id;
+                }
+            }
+
+            let actual_node = &self.greens[&actual_id];
+            if let Tag::Rule { rule_ix, .. } = &actual_node.tag {
+                if self.grammar.name(*rule_ix) == rule_name {
+                    result.push(GreenQuery {
+                        grammar: self.grammar,
+                        greens: self.greens,
+                        source_text: self.source_text,
+                        green: actual_id,
+                    });
+                }
+            }
+        }
+        result
+    }
+
+    /// Get the first child that's a rule with a specific name
+    pub fn first_child_with_rule(&self, rule_name: &str) -> Option<GreenQuery<'a, T>> {
+        self.children_with_rule(rule_name).into_iter().next()
+    }
+
+    /// Get the AST binding for the first child (after unwrapping field wrapper)
+    pub fn first_child_ast<U>(&self) -> Option<ASTCell<U>> {
+        let node = &self.greens[&self.green];
+        if let Some(&child_id) = node.children.first() {
+            return self.greens[&child_id].binding.map(|id| id.cast::<U>());
+        }
+        None
+    }
+
+    /// Get all child ASTs that are mapped (filters out None values)
+    pub fn mapped_children<U>(&self) -> Vec<ASTCell<U>> {
+        self.child_asts()
+            .into_iter()
+            .filter_map(|binding| binding.map(|id| id.cast::<U>()))
+            .collect()
     }
 }
 
 pub trait AstMapper<T> {
-    fn map(&self, cx: &LowerCtx<'_, T>) -> MapOutput<T>;
+    fn map(&self, cx: &GreenQuery<'_, T>) -> MapOutput<T>;
 }
 
 impl AstMapper<()> for () {
-    fn map(&self, _cx: &LowerCtx<'_, ()>) -> MapOutput<()> {
+    fn map(&self, _: &GreenQuery<'_, ()>) -> MapOutput<()> {
         MapOutput::skip()
     }
 }
@@ -736,9 +538,8 @@ impl Default for FallbackMode {
     }
 }
 
-type RuleMapperFn<T> = dyn for<'a> Fn(NodeView<'a, T>) -> MapOutput<T> + Send + Sync + 'static;
+type RuleMapperFn<T> = dyn for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static;
 
-/// Builder-style mapper so users only register the rules they care about.
 pub struct RuleMap<T> {
     rules_ix: FxHashMap<usize, Box<RuleMapperFn<T>>>,
     rules_name: FxHashMap<String, Box<RuleMapperFn<T>>>,
@@ -773,7 +574,7 @@ impl<T> RuleMap<T> {
 
     pub fn on_rule<F>(mut self, rule_name: impl Into<String>, mapper: F) -> Self
     where
-        F: for<'a> Fn(NodeView<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
     {
         self.rules_name.insert(rule_name.into(), Box::new(mapper));
         self
@@ -781,7 +582,7 @@ impl<T> RuleMap<T> {
 
     pub fn on_rule_ix<F>(mut self, rule_ix: usize, mapper: F) -> Self
     where
-        F: for<'a> Fn(NodeView<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
     {
         self.rules_ix.insert(rule_ix, Box::new(mapper));
         self
@@ -789,7 +590,7 @@ impl<T> RuleMap<T> {
 
     pub fn on_token<F>(mut self, rule_ix: usize, mapper: F) -> Self
     where
-        F: for<'a> Fn(NodeView<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
     {
         self.tokens.insert(rule_ix, Box::new(mapper));
         self
@@ -797,7 +598,7 @@ impl<T> RuleMap<T> {
 
     pub fn on_field<F>(mut self, rule_ix: usize, mapper: F) -> Self
     where
-        F: for<'a> Fn(NodeView<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
     {
         self.fields.insert(rule_ix, Box::new(mapper));
         self
@@ -805,7 +606,7 @@ impl<T> RuleMap<T> {
 
     pub fn on_error<F>(mut self, mapper: F) -> Self
     where
-        F: for<'a> Fn(NodeView<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
     {
         self.error = Some(Box::new(mapper));
         self
@@ -820,16 +621,15 @@ impl<T> RuleMap<T> {
 }
 
 impl<T> AstMapper<T> for RuleMap<T> {
-    fn map(&self, cx: &LowerCtx<'_, T>) -> MapOutput<T> {
-        let node = cx.node();
-        match cx.tag {
+    fn map(&self, cx: &GreenQuery<'_, T>) -> MapOutput<T> {
+        match cx.tag() {
             Tag::Rule { rule_ix, .. } => {
                 if let Some(mapper) = self.rules_ix.get(rule_ix) {
-                    return (mapper)(node);
+                    return (mapper)(cx);
                 }
-                if let Some(rule_name) = cx.rule_name {
+                if let Some(rule_name) = cx.rule_name() {
                     if let Some(mapper) = self.rules_name.get(rule_name) {
-                        return (mapper)(node);
+                        return (mapper)(cx);
                     }
                 }
                 self.fallback()
@@ -837,73 +637,30 @@ impl<T> AstMapper<T> for RuleMap<T> {
             Tag::Token { rule_ix } => self
                 .tokens
                 .get(rule_ix)
-                .map(|f| (f)(node))
+                .map(|f| (f)(cx))
                 .unwrap_or_else(|| self.fallback()),
             Tag::Field { rule_ix, .. } => self
                 .fields
                 .get(rule_ix)
-                .map(|f| (f)(node))
+                .map(|f| (f)(cx))
                 .unwrap_or_else(|| self.fallback()),
             Tag::Error(_) => self
                 .error
                 .as_ref()
-                .map(|f| (f)(node))
+                .map(|f| (f)(cx))
                 .unwrap_or_else(|| self.fallback()),
         }
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
-enum AstBinding<T> {
-    None,
-    Alias(ASTCell<T>),
-    Owned(ASTCell<T>),
-}
+// ============================================================================
+// Incremental Lowerer - Clean Command→AST Delta
+// ============================================================================
 
-impl<T> AstBinding<T> {
-    fn cell(self) -> Option<ASTCell<T>> {
-        match self {
-            AstBinding::None => None,
-            AstBinding::Alias(id) | AstBinding::Owned(id) => Some(id),
-        }
-    }
-}
-
-impl<T> Copy for AstBinding<T> {}
-
-impl<T> Clone for AstBinding<T> {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ParseMemo<T> {
-    children: Vec<GreenId>,
-    offset: usize,
-    width: usize,
-    token_text: Option<String>,
-    tag: Tag,
-    binding: AstBinding<T>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-struct RecomputeStart {
-    green: GreenId,
-    cascade_to_root: bool,
-}
-
-/// Incremental red-green -> user IR lowering state.
-///
-/// Usage:
-/// 1. Build a `RuleMap` (or implement `AstMapper`).
-/// 2. Call `initialize_root` once with the parser root green.
-/// 3. Feed parser/reparser semantic commands into `apply_parse_delta`.
 pub struct IncrementalLowerer<T, M> {
     grammar: &'static Grammar,
     mapper: M,
-    parse_nodes: FxHashMap<GreenId, ParseMemo<T>>,
-    parents: FxHashMap<GreenId, FxHashSet<GreenId>>,
+    greens: FxHashMap<GreenId, GreenNode<T>>,
     field_symbols: FxHashMap<String, &'static str>,
     command_nodes: FxHashMap<u64, GreenId>,
     arena: AstArena<T>,
@@ -921,8 +678,7 @@ where
         Self {
             grammar,
             mapper,
-            parse_nodes: FxHashMap::default(),
-            parents: FxHashMap::default(),
+            greens: FxHashMap::default(),
             field_symbols: FxHashMap::default(),
             command_nodes: FxHashMap::default(),
             arena: AstArena::new(),
@@ -941,7 +697,7 @@ where
     }
 
     pub fn has_parse_node(&self, green: GreenId) -> bool {
-        self.parse_nodes.contains_key(&green)
+        self.greens.contains_key(&green)
     }
 
     pub fn apply_parse_delta(&mut self, commands: &[Command]) -> AstDelta<T> {
@@ -953,44 +709,24 @@ where
         commands: &[Command],
         source_text: &str,
     ) -> AstDelta<T> {
+        // Phase 1: Update green tree from commands
         self.reset_command_nodes_if_needed(commands);
+        let mut dirty = FxHashSet::default();
 
-        let mut ops = Vec::new();
-        let mut recompute_starts = Vec::new();
-        let mut seen_recompute = FxHashSet::default();
         for command in commands {
-            if let Some(start) = self.apply_command(command, &mut ops) {
-                if seen_recompute.insert(start) {
-                    recompute_starts.push(start);
-                }
-            }
+            self.apply_command(command, &mut dirty);
         }
-        for start in recompute_starts {
-            if self.parse_nodes.contains_key(&start.green) {
-                if start.cascade_to_root {
-                    self.recompute_lineage(start.green, &mut ops, source_text);
-                } else {
-                    self.recompute_one(start.green, &mut ops, source_text);
-                }
+
+        // Phase 2: Recompute dirty greens & emit AST deltas
+        let mut ops = Vec::new();
+        for &green in &dirty {
+            if self.greens.contains_key(&green) {
+                self.recompute_binding(green, source_text, &mut ops);
             }
         }
 
-        if let Some(root_green) = self.root_green {
-            self.recompute_one(root_green, &mut ops, source_text);
-        }
-
-        let next_root = self.root_green.and_then(|green| {
-            self.parse_nodes
-                .get(&green)
-                .and_then(|memo| memo.binding.cell())
-                .filter(|id| id.arena_ty == Some(type_name::<T>()))
-        });
-        let next_root = if self.root_green.is_some() {
-            next_root.or(self.root_ast)
-        } else {
-            next_root
-        };
-
+        // Phase 3: Update root & emit root-change if needed
+        let next_root = self.compute_root();
         if next_root != self.root_ast {
             self.root_ast = next_root;
             ops.push(AstDeltaOp::SetRoot { root: next_root });
@@ -1002,487 +738,300 @@ where
         }
     }
 
-    fn apply_command(
-        &mut self,
-        command: &Command,
-        ops: &mut Vec<AstDeltaOp<T>>,
-    ) -> Option<RecomputeStart> {
+    fn apply_command(&mut self, command: &Command, dirty: &mut FxHashSet<GreenId>) {
         match command {
             Command::CreateToken {
                 node_id,
                 rule_ix,
                 text,
                 field,
-            } => self.create_token_node(*node_id, *rule_ix, text, field),
+            } => {
+                let green = self.create_token_leaf(*rule_ix, text);
+                let wrapped = self.wrap_in_field(green, *rule_ix, field);
+                self.command_nodes.insert(*node_id, wrapped);
+                dirty.insert(wrapped);
+            }
             Command::CreateError {
                 node_id,
                 kind,
                 text,
                 field,
-            } => self.create_error_node(*node_id, kind, text, field),
+            } => {
+                let green = self.create_error_leaf(kind.clone(), text);
+                let fallback_rule_ix = self.grammar.table.start_rule;
+                let wrapped = self.wrap_in_field(green, fallback_rule_ix, field);
+                self.command_nodes.insert(*node_id, wrapped);
+                dirty.insert(wrapped);
+            }
             Command::CreateNode {
                 node_id,
                 rule_ix,
                 children,
                 field,
-            } => self.create_rule_or_field_node(*node_id, *rule_ix, children, field),
-            Command::DeleteNodeAtPath { path } => self.delete_node_at_path(path, ops),
+            } => {
+                let child_greens: Vec<GreenId> = children
+                    .iter()
+                    .filter_map(|id| self.command_nodes.get(id).copied())
+                    .collect();
+                let parent = self.create_rule_node(*rule_ix, child_greens);
+                let wrapped = self.wrap_in_field(parent, *rule_ix, field);
+                self.command_nodes.insert(*node_id, wrapped);
+                dirty.insert(wrapped);
+            }
+            Command::DeleteNodeAtPath { path } => {
+                if path.0.is_empty() {
+                    if let Some(old) = self.root_green.take() {
+                        self.prune_green(old);
+                    }
+                } else if let Some(parent) = self.green_at_path(&path.parent().unwrap()) {
+                    if let Some(&idx) = path.0.last() {
+                        if let Some(removed) = self.greens.get_mut(&parent).and_then(|p| {
+                            if idx < p.children.len() {
+                                Some(p.children.remove(idx))
+                            } else {
+                                None
+                            }
+                        }) {
+                            self.prune_green(removed);
+                            dirty.insert(parent);
+                        }
+                    }
+                }
+            }
             Command::ReplaceNodeAtPath {
                 path,
                 node_id,
-                target_kind,
-            } => self.replace_node_at_path(path, *node_id, *target_kind, ops),
+                target_kind: _,
+            } => {
+                let new_green = self.command_nodes.get(node_id).copied();
+                if let Some(new_green) = new_green {
+                    if path.0.is_empty() {
+                        if let Some(old) = self.root_green.replace(new_green) {
+                            self.prune_green(old);
+                        }
+                        dirty.insert(new_green);
+                    } else if let Some(parent) = self.green_at_path(&path.parent().unwrap()) {
+                        if let Some(&idx) = path.0.last() {
+                            if let Some(node) = self.greens.get_mut(&parent) {
+                                if idx < node.children.len() {
+                                    let old = node.children[idx];
+                                    node.children[idx] = new_green;
+                                    self.prune_green(old);
+                                    dirty.insert(parent);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Command::InsertNodeAtPath {
                 path,
                 node_id,
-                cascade_to_root,
-            } => self.insert_node_at_path(path, *node_id, *cascade_to_root, ops),
+                cascade_to_root: _,
+            } => {
+                let new_green = self.command_nodes.get(node_id).copied();
+                if let Some(new_green) = new_green {
+                    if path.0.is_empty() {
+                        if let Some(old) = self.root_green.replace(new_green) {
+                            self.prune_green(old);
+                        }
+                        dirty.insert(new_green);
+                    } else if let Some(parent) = self.green_at_path(&path.parent().unwrap()) {
+                        if let Some(&idx) = path.0.last() {
+                            if let Some(node) = self.greens.get_mut(&parent) {
+                                node.children.insert(idx, new_green);
+                                dirty.insert(parent);
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
-    fn alloc_green_id(&mut self) -> GreenId {
-        let green = self.next_green_id;
+    fn create_token_leaf(&mut self, rule_ix: usize, text: &str) -> GreenId {
+        let id = self.next_green_id;
         self.next_green_id = self.next_green_id.saturating_add(1);
-        green
-    }
-
-    fn create_leaf_node(&mut self, tag: Tag, text: &str) -> GreenId {
-        let green = self.alloc_green_id();
-        self.parse_nodes.insert(
-            green,
-            ParseMemo {
+        self.greens.insert(
+            id,
+            GreenNode {
                 children: Vec::new(),
                 offset: 0,
                 width: text.len(),
                 token_text: Some(text.to_string()),
-                tag,
-                binding: AstBinding::None,
+                tag: Tag::Token { rule_ix },
+                binding: None,
             },
         );
-        green
+        id
     }
 
-    fn create_parent_node(&mut self, tag: Tag, child_greens: Vec<GreenId>) -> GreenId {
-        let green = self.alloc_green_id();
-        let width: usize = child_greens.iter().map(|&cg| self.memo(cg).width).sum();
+    fn create_error_leaf(&mut self, kind: crate::parsec::tree::ParsecError, text: &str) -> GreenId {
+        let id = self.next_green_id;
+        self.next_green_id = self.next_green_id.saturating_add(1);
+        self.greens.insert(
+            id,
+            GreenNode {
+                children: Vec::new(),
+                offset: 0,
+                width: text.len(),
+                token_text: Some(text.to_string()),
+                tag: Tag::new_error(kind),
+                binding: None,
+            },
+        );
+        id
+    }
 
-        self.parse_nodes.insert(
-            green,
-            ParseMemo {
-                children: child_greens.clone(),
+    fn create_rule_node(&mut self, rule_ix: usize, children: Vec<GreenId>) -> GreenId {
+        let width = children.iter().map(|&c| self.greens[&c].width).sum();
+        let id = self.next_green_id;
+        self.next_green_id = self.next_green_id.saturating_add(1);
+        self.greens.insert(
+            id,
+            GreenNode {
+                children,
                 offset: 0,
                 width,
                 token_text: None,
-                tag,
-                binding: AstBinding::None,
+                tag: Tag::Rule {
+                    rule_ix,
+                    reparse_rule_ix: rule_ix,
+                },
+                binding: None,
             },
         );
-
-        for &child in &child_greens {
-            self.add_parent(child, green);
-        }
-
-        green
+        id
     }
 
-    fn create_token_node(
-        &mut self,
-        node_id: u64,
-        rule_ix: usize,
-        text: &str,
-        field: &str,
-    ) -> Option<RecomputeStart> {
-        let green = self.create_leaf_node(Tag::Token { rule_ix }, text);
-        let command_green = self.wrap_in_field_if_needed(green, rule_ix, field);
-        self.command_nodes.insert(node_id, command_green);
-        None
-    }
-
-    fn create_error_node(
-        &mut self,
-        node_id: u64,
-        kind: &crate::parsec::tree::ParsecError,
-        text: &str,
-        field: &str,
-    ) -> Option<RecomputeStart> {
-        let green = self.create_leaf_node(Tag::new_error(kind.clone()), text);
-        let fallback_rule_ix = self.grammar.table.start_rule;
-        let command_green = self.wrap_in_field_if_needed(green, fallback_rule_ix, field);
-        self.command_nodes.insert(node_id, command_green);
-        None
-    }
-
-    fn create_rule_or_field_node(
-        &mut self,
-        node_id: u64,
-        rule_ix: usize,
-        children: &[u64],
-        field: &str,
-    ) -> Option<RecomputeStart> {
-        let child_greens: Vec<GreenId> = children
-            .iter()
-            .filter_map(|id| self.command_nodes.get(id).copied())
-            .collect();
-
-        let tag = if field.is_empty() {
-            Tag::Rule {
-                rule_ix,
-                reparse_rule_ix: rule_ix,
-            }
-        } else {
-            let name = self.intern_field_name(field);
-            Tag::Field { rule_ix, name }
-        };
-
-        let green = self.create_parent_node(tag, child_greens);
-        self.command_nodes.insert(node_id, green);
-        None
-    }
-
-    fn delete_node_at_path(
-        &mut self,
-        path: &NodePath,
-        ops: &mut Vec<AstDeltaOp<T>>,
-    ) -> Option<RecomputeStart> {
-        if path.0.is_empty() {
-            if let Some(old_root) = self.root_green.take() {
-                self.prune_unreachable(old_root, ops);
-            }
-            return None;
-        }
-
-        let Some(parent_path) = path.parent() else {
-            return None;
-        };
-        let Some(&child_index) = path.0.last() else {
-            return None;
-        };
-        let Some(parent_green) = self.green_at_path(&parent_path) else {
-            return None;
-        };
-
-        if child_index >= self.memo(parent_green).children.len() {
-            return None;
-        }
-
-        let removed = self.memo_mut(parent_green).children.remove(child_index);
-        self.remove_parent(removed, parent_green);
-        if self.parent_count(removed) == 0 && self.root_green != Some(removed) {
-            self.prune_unreachable(removed, ops);
-        }
-        Some(RecomputeStart {
-            green: parent_green,
-            cascade_to_root: true,
-        })
-    }
-
-    fn insert_node_at_path(
-        &mut self,
-        path: &NodePath,
-        node_id: u64,
-        cascade_to_root: bool,
-        ops: &mut Vec<AstDeltaOp<T>>,
-    ) -> Option<RecomputeStart> {
-        let new_green = self.command_nodes.get(&node_id).copied()?;
-
-        if path.0.is_empty() {
-            if let Some(old_root) = self.root_green.replace(new_green) {
-                if old_root != new_green {
-                    self.prune_unreachable(old_root, ops);
-                }
-            }
-            self.refresh_offsets_from(new_green, 0);
-            return Some(RecomputeStart {
-                green: new_green,
-                cascade_to_root: false,
-            });
-        }
-
-        let parent_path = path.parent()?;
-        let &child_index = path.0.last()?;
-        let parent_green = self.green_at_path(&parent_path)?;
-
-        let child_offset = self.child_offset(parent_green, child_index);
-        if child_index <= self.memo(parent_green).children.len() {
-            self.memo_mut(parent_green)
-                .children
-                .insert(child_index, new_green);
-        } else {
-            return None;
-        }
-
-        self.add_parent(new_green, parent_green);
-        self.refresh_offsets_from(new_green, child_offset);
-
-        if cascade_to_root || !path.0.is_empty() {
-            self.refresh_offsets(parent_green);
-            Some(RecomputeStart {
-                green: parent_green,
-                cascade_to_root: true,
-            })
-        } else {
-            Some(RecomputeStart {
-                green: new_green,
-                cascade_to_root: false,
-            })
-        }
-    }
-
-    fn replace_node_at_path(
-        &mut self,
-        path: &NodePath,
-        node_id: u64,
-        target_kind: PathTargetKind,
-        ops: &mut Vec<AstDeltaOp<T>>,
-    ) -> Option<RecomputeStart> {
-        let new_green = self.command_nodes.get(&node_id).copied()?;
-
-        if path.0.is_empty() {
-            if let Some(old_root) = self.root_green.replace(new_green) {
-                if old_root != new_green {
-                    self.prune_unreachable(old_root, ops);
-                }
-            }
-            self.refresh_offsets_from(new_green, 0);
-            return Some(RecomputeStart {
-                green: new_green,
-                cascade_to_root: false,
-            });
-        }
-
-        let parent_path = path.parent()?;
-        let &child_index = path.0.last()?;
-        let parent_green = self.green_at_path(&parent_path)?;
-
-        if child_index >= self.memo(parent_green).children.len() {
-            return None;
-        }
-
-        let old_green = self.memo(parent_green).children[child_index];
-        let old_is_leaf = matches!(self.memo(old_green).tag, Tag::Token { .. } | Tag::Error(_));
-        if matches!(target_kind, PathTargetKind::Leaf) && !old_is_leaf {
-            return None;
-        }
-        if matches!(target_kind, PathTargetKind::Node) && old_is_leaf {
-            return None;
-        }
-
-        self.memo_mut(parent_green).children[child_index] = new_green;
-        self.remove_parent(old_green, parent_green);
-        self.add_parent(new_green, parent_green);
-
-        if self.parent_count(old_green) == 0 && self.root_green != Some(old_green) {
-            self.prune_unreachable(old_green, ops);
-        }
-
-        self.refresh_offsets(parent_green);
-        Some(RecomputeStart {
-            green: parent_green,
-            cascade_to_root: true,
-        })
-    }
-
-    fn wrap_in_field_if_needed(
-        &mut self,
-        green: GreenId,
-        rule_ix: usize,
-        field_name: &str,
-    ) -> GreenId {
+    fn wrap_in_field(&mut self, child: GreenId, rule_ix: usize, field_name: &str) -> GreenId {
         if field_name.is_empty() {
-            return green;
+            return child;
         }
-
-        let field_green = self.next_green_id;
-        self.next_green_id = self.next_green_id.saturating_add(1);
-        let width = self.memo(green).width;
+        let width = self.greens[&child].width;
         let name = self.intern_field_name(field_name);
-
-        self.parse_nodes.insert(
-            field_green,
-            ParseMemo {
-                children: vec![green],
+        let id = self.next_green_id;
+        self.next_green_id = self.next_green_id.saturating_add(1);
+        self.greens.insert(
+            id,
+            GreenNode {
+                children: vec![child],
                 offset: 0,
                 width,
                 token_text: None,
                 tag: Tag::Field { rule_ix, name },
-                binding: AstBinding::None,
+                binding: None,
             },
         );
-        self.add_parent(green, field_green);
-
-        field_green
+        id
     }
 
-    fn intern_field_name(&mut self, field_name: &str) -> &'static str {
-        if let Some(name) = self.field_symbols.get(field_name) {
-            return name;
+    fn intern_field_name(&mut self, name: &str) -> &'static str {
+        if let Some(&interned) = self.field_symbols.get(name) {
+            return interned;
         }
-        let leaked: &'static str = Box::leak(field_name.to_string().into_boxed_str());
-        self.field_symbols.insert(field_name.to_string(), leaked);
+        let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+        self.field_symbols.insert(name.to_string(), leaked);
         leaked
     }
 
     fn green_at_path(&self, path: &NodePath) -> Option<GreenId> {
         let mut current = self.root_green?;
-        for &index in &path.0 {
-            let memo = self.parse_nodes.get(&current)?;
-            current = *memo.children.get(index)?;
+        for &idx in &path.0 {
+            let children = &self.greens.get(&current)?.children;
+            current = *children.get(idx)?;
         }
         Some(current)
     }
 
-    fn recompute_lineage(
+    fn recompute_binding(
         &mut self,
-        mut green: GreenId,
-        ops: &mut Vec<AstDeltaOp<T>>,
+        green: GreenId,
         source_text: &str,
+        ops: &mut Vec<AstDeltaOp<T>>,
     ) {
-        loop {
-            self.recompute_one(green, ops, source_text);
-            let Some(parent) = self.primary_parent(green) else {
-                break;
-            };
-            green = parent;
+        // Ensure all children are recomputed first
+        let children = self.greens[&green].children.clone();
+        for child in children {
+            if self
+                .greens
+                .get(&child)
+                .map_or(false, |n| n.binding.is_none())
+            {
+                self.recompute_binding(child, source_text, ops);
+            }
         }
-    }
 
-    fn ensure_binding(
-        &mut self,
-        green: GreenId,
-        ops: &mut Vec<AstDeltaOp<T>>,
-        source_text: &str,
-    ) -> Option<ASTCell<T>> {
-        let cached = self.memo(green).binding.cell();
-        if cached.is_some() {
-            return cached;
-        }
-        self.recompute_one(green, ops, source_text)
-    }
-
-    fn recompute_one(
-        &mut self,
-        green: GreenId,
-        ops: &mut Vec<AstDeltaOp<T>>,
-        source_text: &str,
-    ) -> Option<ASTCell<T>> {
-        let memo_snapshot = self.memo(green).clone();
-        let mut child_asts = Vec::with_capacity(memo_snapshot.children.len());
-        for &child in &memo_snapshot.children {
-            child_asts.push(self.ensure_binding(child, ops, source_text));
-        }
-        let child_cells: Vec<Option<ASTCell<()>>> = child_asts
+        // Get child AST IDs before invoking mapper (to avoid borrow conflicts)
+        let child_asts: Vec<_> = self.greens[&green]
+            .children
             .iter()
-            .copied()
-            .map(|cell| cell.map(|id| id.cast::<()>()))
+            .map(|&child| self.greens[&child].binding)
             .collect();
-        let tag = memo_snapshot.tag.clone();
-        let width = memo_snapshot.width;
-        let token_text = memo_snapshot.token_text.as_deref();
-        let rule_name = match &tag {
-            Tag::Rule { rule_ix, .. } => Some(self.grammar.name(*rule_ix)),
+
+        // Build query view and invoke mapper
+        let query = GreenQuery {
+            grammar: self.grammar,
+            greens: &self.greens,
+            source_text,
+            green,
+        };
+        let mapped = self.mapper.map(&query);
+
+        // Process mapped output to get new binding (before mutating)
+        let old_binding = self.greens[&green].binding;
+        let forward_child_ast = match &mapped.kind {
+            MapOutputKind::ForwardChild(idx) => child_asts.get(*idx).copied(),
             _ => None,
         };
-        let mapped = {
-            let cx = LowerCtx {
-                green,
-                tag: &tag,
-                rule_name,
-                grammar: &self.grammar,
-                parse_nodes: &self.parse_nodes,
-                source_text,
-                token_text,
-                offset: memo_snapshot.offset,
-                width,
-                child_asts: &child_cells,
-                child_greens: &memo_snapshot.children,
-            };
-            self.mapper.map(&cx)
-        };
-        let new_binding = self.apply_map_output(memo_snapshot.binding, mapped, &child_asts, ops);
-        self.memo_mut(green).binding = new_binding;
-        new_binding.cell()
-    }
 
-    fn apply_map_output(
-        &mut self,
-        old_binding: AstBinding<T>,
-        mapped: MapOutput<T>,
-        child_asts: &[Option<ASTCell<T>>],
-        ops: &mut Vec<AstDeltaOp<T>>,
-    ) -> AstBinding<T> {
+        // Drop query to release borrow on self.greens
+        drop(query);
+
+        // Now update binding
         let new_binding = match mapped.kind {
-            MapOutputKind::Node(node) => match old_binding {
-                AstBinding::Owned(id) => {
-                    if self
-                        .arena
-                        .get_erased(id.cast())
-                        .is_some_and(|current| current.same_value(&node))
-                    {
-                        AstBinding::Owned(id)
-                    } else {
-                        let typed_node = node.downcast_ref::<T>().cloned();
-                        self.arena.set_erased(id.cast(), node);
-                        if let Some(node) = typed_node {
-                            ops.push(AstDeltaOp::Update { id, node });
-                        }
-                        AstBinding::Owned(id)
-                    }
+            MapOutputKind::Node(erased) => {
+                let typed = erased.downcast_ref::<T>().cloned();
+                let id = self.arena.insert_erased(erased).cast();
+                if let Some(node) = typed {
+                    ops.push(AstDeltaOp::Create { id, node });
                 }
-                AstBinding::Alias(_) | AstBinding::None => {
-                    let typed_node = node.downcast_ref::<T>().cloned();
-                    let id = self.arena.insert_erased(node).cast::<T>();
-                    if let Some(node) = typed_node {
-                        ops.push(AstDeltaOp::Create { id, node });
-                    }
-                    AstBinding::Owned(id)
-                }
-            },
-            MapOutputKind::ForwardChild(index) => child_asts
-                .get(index)
-                .copied()
-                .flatten()
-                .map(AstBinding::Alias)
-                .unwrap_or(AstBinding::None),
-            MapOutputKind::Alias(id) => AstBinding::Alias(id.cast()),
-            MapOutputKind::Skip => AstBinding::None,
+                Some(id)
+            }
+            MapOutputKind::Alias(id) => Some(id.cast()),
+            MapOutputKind::ForwardChild(_) => forward_child_ast.flatten(),
+            MapOutputKind::Skip => None,
         };
 
-        if let AstBinding::Owned(old_id) = old_binding {
-            if !matches!(new_binding, AstBinding::Owned(id) if id == old_id) {
-                self.arena.remove_erased(old_id.cast());
-                if old_id.arena_ty == Some(type_name::<T>()) {
+        // Clean up old binding if replaced
+        if let Some(old_id) = old_binding {
+            if new_binding != Some(old_id) {
+                if let Some(_) = self.arena.remove_erased(old_id.cast()) {
                     ops.push(AstDeltaOp::Delete { id: old_id });
                 }
             }
         }
 
-        new_binding
+        self.greens.get_mut(&green).unwrap().binding = new_binding;
     }
 
-    fn child_offset(&self, parent: GreenId, child_index: usize) -> usize {
-        let memo = self.memo(parent);
-        let mut offset = memo.offset;
-        for &child in memo.children.iter().take(child_index) {
-            offset += self.memo(child).width;
-        }
-        offset
+    fn compute_root(&self) -> Option<ASTCell<T>> {
+        self.root_green.and_then(|g| {
+            self.greens
+                .get(&g)
+                .and_then(|n| n.binding)
+                .filter(|id| id.arena_ty == Some(type_name::<T>()))
+        })
     }
 
-    fn refresh_offsets(&mut self, root: GreenId) {
-        let start = self.memo(root).offset;
-        self.refresh_offsets_from(root, start);
-    }
-
-    fn refresh_offsets_from(&mut self, green: GreenId, offset: usize) {
-        let Some(memo) = self.parse_nodes.get_mut(&green) else {
-            return;
-        };
-        memo.offset = offset;
-        let children = memo.children.clone();
-        let mut child_offset = offset;
-        for child in children {
-            self.refresh_offsets_from(child, child_offset);
-            child_offset += self.memo(child).width;
+    fn prune_green(&mut self, green: GreenId) {
+        if let Some(node) = self.greens.remove(&green) {
+            if let Some(binding_id) = node.binding {
+                self.arena.remove_erased(binding_id.cast());
+            }
+            for child in node.children {
+                self.prune_green(child);
+            }
         }
     }
 
@@ -1496,76 +1045,6 @@ where
             )
         }) {
             self.command_nodes.clear();
-        }
-    }
-
-    #[inline]
-    fn memo(&self, green: GreenId) -> &ParseMemo<T> {
-        self.parse_nodes.get(&green).unwrap_or_else(|| {
-            panic!(
-                "well-formed command stream should reference existing parse nodes (missing green={green})"
-            )
-        })
-    }
-
-    #[inline]
-    fn memo_mut(&mut self, green: GreenId) -> &mut ParseMemo<T> {
-        self.parse_nodes.get_mut(&green).unwrap_or_else(|| {
-            panic!(
-                "well-formed command stream should reference existing parse nodes (missing green={green})"
-            )
-        })
-    }
-
-    fn add_parent(&mut self, child: GreenId, parent: GreenId) {
-        self.parents.entry(child).or_default().insert(parent);
-    }
-
-    fn remove_parent(&mut self, child: GreenId, parent: GreenId) {
-        if let Some(parents) = self.parents.get_mut(&child) {
-            parents.remove(&parent);
-            if parents.is_empty() {
-                self.parents.remove(&child);
-            }
-        }
-    }
-
-    fn parent_count(&self, child: GreenId) -> usize {
-        self.parents.get(&child).map_or(0, FxHashSet::len)
-    }
-
-    fn primary_parent(&self, child: GreenId) -> Option<GreenId> {
-        self.parents
-            .get(&child)
-            .and_then(|parents| parents.iter().next().copied())
-    }
-
-    fn prune_unreachable(&mut self, start: GreenId, ops: &mut Vec<AstDeltaOp<T>>) {
-        let mut stack = vec![start];
-        while let Some(green) = stack.pop() {
-            if self.root_green == Some(green) {
-                continue;
-            }
-            if self.parent_count(green) > 0 {
-                continue;
-            }
-
-            let Some(removed) = self.parse_nodes.remove(&green) else {
-                continue;
-            };
-            self.parents.remove(&green);
-
-            if let AstBinding::Owned(ast_id) = removed.binding {
-                self.arena.remove(ast_id);
-                ops.push(AstDeltaOp::Delete { id: ast_id });
-            }
-
-            for child in removed.children {
-                self.remove_parent(child, green);
-                if self.root_green != Some(child) && self.parent_count(child) == 0 {
-                    stack.push(child);
-                }
-            }
         }
     }
 }

@@ -14,15 +14,18 @@ use crate::{
     interface::Interface,
     parsec::{self, Parser, ParserConfig, ParserListener, msg::ParserMessages, tree::RedNode},
     runtime::reparser::{ReparseError, Reparser},
-    semantic::{ASTCell, AstArena, AstDelta, AstMapper, Command, IncrementalLowerer},
+    semantic::{ASTCell, AstArena, AstDelta, AstMapper, IncrementalLowerer},
     utils::Span,
 };
+
+pub mod command;
 
 mod delta;
 mod metrics;
 mod reparser;
 mod strategy;
 
+pub use command::Command;
 pub use metrics::EditMetrics;
 pub use reparser::ReparserConfig;
 

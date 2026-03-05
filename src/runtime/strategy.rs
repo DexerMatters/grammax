@@ -299,6 +299,5 @@ fn count_errors(messages: &ParserMessages, edit_span: Span) -> (usize, usize) {
             outside += 1;
         }
     }
-
     (inside, outside)
 }

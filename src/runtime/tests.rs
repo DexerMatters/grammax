@@ -1,17 +1,19 @@
 #[cfg(feature = "webui")]
+use crate::interface::BasicInterface;
+#[cfg(feature = "webui")]
 use crate::interface::webui::WebPreviewInterface;
 #[cfg(feature = "webui")]
 use crate::{
-    new_grammar,
     parsec::{ParserConfig, recovery::RecoveryConfig, words::*},
     runtime::{Interactive, RuntimeListener},
     semantic::{ASTCell, MapOutput, RuleMap},
 };
 
+use crate::new_grammar;
 use crate::parsec::Parser;
+use crate::runtime::Command;
+use crate::runtime::command::NodePath;
 use crate::runtime::delta::generate_commands_incremental;
-use crate::semantic::Command;
-use crate::semantic::command::NodePath;
 
 /// Verifies that adding a character inside a deeply-nested node (e.g. typing "a" into a
 /// partially-written JSON string key) produces a *minimal* set of semantic commands rather than
@@ -119,15 +121,16 @@ fn test_expr_example() {
     let expr_map = RuleMap::new()
         .on_rule("object", |cx| {
             let entries = cx
-                .next_each_rule("pair")
-                .map(|mut pair| {
-                    let _ = pair.step_in();
-                    let _ = pair.next_field("key");
-                    let key = pair.text_trimmed().trim_matches('"').to_string();
-                    let _ = pair.next_field("value");
-                    let value = pair.mapped::<JsonPrimitive>();
-                    let _ = pair.step_out();
-                    (key, value)
+                .children_with_rule("pair")
+                .into_iter()
+                .filter_map(|pair| {
+                    let key_text = pair
+                        .child_with_field("key")
+                        .map(|k| k.text_trimmed().trim_matches('"').to_string())?;
+                    let value = pair
+                        .child_with_field("value")
+                        .and_then(|v| v.first_child_ast::<JsonPrimitive>())?;
+                    Some((key_text, value))
                 })
                 .collect();
             MapOutput::node(Json::Object(entries))
@@ -153,7 +156,7 @@ fn test_expr_example() {
             MapOutput::node(JsonPrimitive::String(value))
         })
         .on_rule("array", |cx| {
-            MapOutput::node(JsonPrimitive::Array(cx.mapped_children().collect()))
+            MapOutput::node(JsonPrimitive::Array(cx.mapped_children()))
         })
         .on_error(|_| MapOutput::node(Json::Error));
 
@@ -198,30 +201,37 @@ fn test_semantic_commands() {
 
     fn expr_map() -> RuleMap<ExprIr> {
         RuleMap::new()
-            .on_rule("add", |mut cx| {
-                let _ = cx.step_in();
-                let _ = cx.next_field("lhs");
-                let lhs = cx.mapped();
-                let _ = cx.next_field("rhs");
-                let rhs = cx.mapped();
-                let _ = cx.step_out();
-                MapOutput::node(ExprIr::Add(lhs, rhs))
-            })
-            .on_rule("mul", |mut cx| {
-                let _ = cx.step_in();
-                let _ = cx.next_field("lhs");
-                let lhs = cx.mapped();
-                let _ = cx.next_field("rhs");
-                let rhs = cx.mapped();
-                let _ = cx.step_out();
-                MapOutput::node(ExprIr::Mul(lhs, rhs))
-            })
-            .on_rule("primary", |mut cx| {
-                if cx.step_in() && cx.next_rule("expr") {
-                    MapOutput::alias(cx.mapped::<ExprIr>())
-                } else {
-                    MapOutput::node(ExprIr::Number(cx.text_trimmed().parse().unwrap_or(0)))
+            .on_rule("add", |cx| {
+                let lhs = cx
+                    .child_with_field("lhs")
+                    .and_then(|child| child.first_child_ast::<ExprIr>());
+                let rhs = cx
+                    .child_with_field("rhs")
+                    .and_then(|child| child.first_child_ast::<ExprIr>());
+                match (lhs, rhs) {
+                    (Some(l), Some(r)) => MapOutput::node(ExprIr::Add(l, r)),
+                    _ => MapOutput::node(ExprIr::Error),
                 }
+            })
+            .on_rule("mul", |cx| {
+                let lhs = cx
+                    .child_with_field("lhs")
+                    .and_then(|child| child.first_child_ast::<ExprIr>());
+                let rhs = cx
+                    .child_with_field("rhs")
+                    .and_then(|child| child.first_child_ast::<ExprIr>());
+                match (lhs, rhs) {
+                    (Some(l), Some(r)) => MapOutput::node(ExprIr::Mul(l, r)),
+                    _ => MapOutput::node(ExprIr::Error),
+                }
+            })
+            .on_rule("primary", |cx| {
+                if let Some(expr) = cx.first_child_with_rule("expr") {
+                    if let Some(ast) = expr.first_child_ast::<ExprIr>() {
+                        return MapOutput::alias(ast);
+                    }
+                }
+                MapOutput::node(ExprIr::Number(cx.text_trimmed().parse().unwrap_or(0)))
             })
             .on_error(|_cx| MapOutput::node(ExprIr::Error))
     }
@@ -243,4 +253,33 @@ fn test_semantic_commands() {
         })
         .finish::<WebPreviewInterface>();
     runtime.run().unwrap();
+}
+
+#[test]
+fn test_semantic_commands_() {
+    let expr_grammar = new_grammar!(
+        start where
+        start -> r!(expr) + tt(EndOfInput)
+        expr -> r!(add) | r!(primary)
+        add  -> r!(expr) + tt("+") + r!(expr).drop(1)
+        primary -> tt(NUMS)
+    );
+
+    let listener = RuntimeListener::new().after_update(move |result| {
+        println!("> Updated source: {}", result.source_text);
+        println!("> Commands: \n");
+        for cmd in &result.semantic_commands {
+            println!("  {:?}", cmd);
+        }
+    });
+
+    let runtime = Interactive::new(expr_grammar)
+        .with_listener(listener)
+        .with_parser_config(ParserConfig {
+            simple_ast: true,
+            recovery: RecoveryConfig::default(),
+        })
+        .finish::<BasicInterface>();
+    runtime.run().unwrap();
+    runtime.insert(0, "1+2").unwrap();
 }

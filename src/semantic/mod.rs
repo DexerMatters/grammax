@@ -1,7 +1,6 @@
-pub mod command;
+pub mod delta;
 pub mod pass;
-pub use command::Command;
 pub use pass::{
-    ASTCell, AstArena, AstDelta, AstDeltaOp, AstMapper, FallbackMode, IncrementalLowerer, LowerCtx,
-    MapOutput, NodeView, RuleMap,
+    ASTCell, AstArena, AstDelta, AstDeltaOp, AstMapper, FallbackMode, GreenQuery,
+    IncrementalLowerer, MapOutput, RuleMap,
 };

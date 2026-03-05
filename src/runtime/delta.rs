@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    semantic::{
+    runtime::{
         Command,
         command::{NodePath, PathTargetKind},
     },

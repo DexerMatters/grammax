@@ -6,12 +6,12 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
+    runtime::{Command, command::NodePath},
     runtime::{
         delta,
         metrics::EditMetrics,
         strategy::{CandidateScore, EditKind, StrategyCandidate, StrategyContext, pick_candidate},
     },
-    semantic::{Command, command::NodePath},
     utils::Span,
 };
 

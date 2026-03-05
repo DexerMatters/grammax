@@ -1,12 +1,10 @@
 pub mod grammar;
-pub mod parsec;
-
-pub mod runtime;
-pub mod utils;
-
-pub mod semantic;
-
 pub mod interface;
+pub mod parsec;
+pub mod pass;
+pub mod runtime;
+pub mod semantic;
+pub mod utils;
 
 #[cfg(test)]
 mod tests {

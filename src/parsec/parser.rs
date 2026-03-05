@@ -11,6 +11,7 @@ use crate::parsec::recovery::{
     OpenScopeToken, RecoveryCache, RecoveryConfig, RepairOp, ScopeStop, recover, scope_recover,
 };
 use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
+use crate::runtime;
 use crate::utils::{LruCache, Span};
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
@@ -45,7 +46,7 @@ pub struct ParserListener {
 pub struct Result {
     pub root: RedNode,
     pub messages: ParserMessages,
-    pub semantic_commands: Vec<crate::semantic::Command>,
+    pub semantic_commands: Vec<runtime::Command>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]

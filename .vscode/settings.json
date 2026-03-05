@@ -8,6 +8,7 @@
     },
     "hide-files.files": [],
     "rust-analyzer.cargo.features": [
-        "webui"
+        "webui",
+        "vsclsp"
     ]
 }

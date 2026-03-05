@@ -202,10 +202,6 @@ impl ErasedAstNode {
         self.value.downcast::<U>().ok().map(|value| *value)
     }
 
-    fn same_value(&self, other: &Self) -> bool {
-        self.type_id == other.type_id && (self.eq_fn)(&self.value, &other.value)
-    }
-
     fn fmt_value(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         (self.debug_fn)(&self.value, f)
     }

@@ -2,3 +2,6 @@
 title = "Grammax Book"
 authors = ["Dexer Matters"]
 language = "en"
+
+[output.html]
+mathjax-support = true

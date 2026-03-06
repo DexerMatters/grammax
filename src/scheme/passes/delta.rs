@@ -2,10 +2,8 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    runtime::{
-        Command,
-        command::{NodePath, PathTargetKind},
-    },
+    runtime::Command,
+    scheme::layers::{NodePath, ParseNodeValue},
 };
 
 pub(crate) fn generate_commands_incremental(
@@ -18,7 +16,7 @@ pub(crate) fn generate_commands_incremental(
     current_is_root: bool,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
-    let mut next_node_id = 1u64;
+    let mut next_node_id = 1usize;
     let mut eq_cache = FxHashMap::default();
     let mut align_cache = FxHashMap::default();
 
@@ -47,7 +45,7 @@ pub(crate) fn generate_commands_for_full_tree(
     source_text: &str,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
-    let mut next_node_id = 1u64;
+    let mut next_node_id = 1usize;
 
     let node_id = emit_create_commands_from_green(
         alloc,
@@ -58,10 +56,9 @@ pub(crate) fn generate_commands_for_full_tree(
         &mut next_node_id,
     );
 
-    commands.push(Command::InsertNodeAtPath {
-        path: NodePath(vec![]),
-        node_id,
-        cascade_to_root: false,
+    commands.push(Command::Insert {
+        index: NodePath(vec![]),
+        id: node_id,
     });
 
     commands
@@ -76,7 +73,7 @@ fn emit_commands_for_delta(
     path: &NodePath,
     _current_is_root: bool,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) {
@@ -179,10 +176,9 @@ fn emit_commands_for_delta(
                 out,
                 next_node_id,
             );
-            out.push(Command::InsertNodeAtPath {
-                path: insert_path.clone(),
-                node_id,
-                cascade_to_root: false,
+            out.push(Command::Insert {
+                index: insert_path.clone(),
+                id: node_id,
             });
         }
         return;
@@ -192,7 +188,7 @@ fn emit_commands_for_delta(
         for ix in (old_mid_start..old_mid_end).rev() {
             let mut delete_path = path.clone();
             delete_path.0.push(ix);
-            out.push(Command::DeleteNodeAtPath { path: delete_path });
+            out.push(Command::Delete { index: delete_path });
         }
         return;
     }
@@ -279,13 +275,13 @@ fn emit_commands_for_delta(
 
 fn emit_replace_at_path(
     alloc: &TreeAllocRef,
-    old_green: usize,
+    _old_green: usize,
     path: &NodePath,
     new_green: usize,
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
 ) {
     let node_id = emit_create_commands_from_green(
         alloc,
@@ -297,29 +293,20 @@ fn emit_replace_at_path(
     );
 
     if path.0.is_empty() {
-        out.push(Command::DeleteNodeAtPath { path: path.clone() });
-        out.push(Command::InsertNodeAtPath {
-            path: path.clone(),
-            node_id,
-            cascade_to_root: false,
+        out.push(Command::Delete {
+            index: path.clone(),
+        });
+        out.push(Command::Insert {
+            index: path.clone(),
+            id: node_id,
         });
         return;
     }
 
-    out.push(Command::ReplaceNodeAtPath {
-        path: path.clone(),
-        node_id,
-        target_kind: target_kind_for_green(alloc, old_green),
+    out.push(Command::Replace {
+        index: path.clone(),
+        id: node_id,
     });
-}
-
-fn target_kind_for_green(alloc: &TreeAllocRef, green: usize) -> PathTargetKind {
-    let tag = alloc.get_node(green).tag.clone();
-    if matches!(tag, Tag::Token { .. } | Tag::Error(_)) {
-        PathTargetKind::Leaf
-    } else {
-        PathTargetKind::Node
-    }
 }
 
 fn emit_insert_at_path(
@@ -329,7 +316,7 @@ fn emit_insert_at_path(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
 ) {
     let node_id = emit_create_commands_from_green(
         alloc,
@@ -339,10 +326,9 @@ fn emit_insert_at_path(
         out,
         next_node_id,
     );
-    out.push(Command::InsertNodeAtPath {
-        path: path.clone(),
-        node_id,
-        cascade_to_root: false,
+    out.push(Command::Insert {
+        index: path.clone(),
+        id: node_id,
     });
 }
 
@@ -358,7 +344,7 @@ fn try_emit_by_greedy_tag_match(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
@@ -425,7 +411,7 @@ fn try_emit_by_greedy_tag_match(
             while old_cursor < old_rel {
                 let mut del_path = path.clone();
                 del_path.0.push(current_index);
-                buf.push(Command::DeleteNodeAtPath { path: del_path });
+                buf.push(Command::Delete { index: del_path });
                 // Deletion: live-tree index does NOT advance (next child shifts into this slot).
                 old_cursor += 1;
             }
@@ -473,10 +459,9 @@ fn try_emit_by_greedy_tag_match(
             );
             let mut insert_path = path.clone();
             insert_path.0.push(current_index);
-            buf.push(Command::InsertNodeAtPath {
-                path: insert_path,
-                node_id,
-                cascade_to_root: false,
+            out.push(Command::Insert {
+                index: insert_path.clone(),
+                id: node_id,
             });
             current_index += 1;
         }
@@ -486,7 +471,7 @@ fn try_emit_by_greedy_tag_match(
     while old_cursor < old_mid.len() {
         let mut del_path = path.clone();
         del_path.0.push(current_index);
-        buf.push(Command::DeleteNodeAtPath { path: del_path });
+        buf.push(Command::Delete { index: del_path });
         old_cursor += 1;
     }
 
@@ -508,7 +493,7 @@ fn try_emit_insertions_as_subsequence_aligned(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
@@ -594,7 +579,7 @@ fn try_emit_deletions_as_subsequence_aligned(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
@@ -636,7 +621,7 @@ fn try_emit_deletions_as_subsequence_aligned(
         } else {
             let mut delete_path = path.clone();
             delete_path.0.push(current_index);
-            buf.push(Command::DeleteNodeAtPath { path: delete_path });
+            buf.push(Command::Delete { index: delete_path });
         }
     }
 
@@ -662,7 +647,7 @@ fn emit_lcs_diff(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) {
@@ -707,7 +692,7 @@ fn emit_lcs_diff(
     for &old_rel in unmatched_old.iter().rev() {
         let mut delete_path = path.clone();
         delete_path.0.push(old_mid_start + old_rel);
-        out.push(Command::DeleteNodeAtPath { path: delete_path });
+        out.push(Command::Delete { index: delete_path });
     }
 
     // 2. Emit insertions using new-tree positions (valid after all deletes above)
@@ -857,8 +842,8 @@ fn emit_create_commands_from_green(
     node_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
-) -> u64 {
+    next_node_id: &mut usize,
+) -> usize {
     emit_create_commands_from_green_with_field(
         alloc,
         green,
@@ -876,9 +861,9 @@ fn emit_create_commands_from_green_with_field(
     node_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     inherited_field: Option<&str>,
-) -> u64 {
+) -> usize {
     let node = alloc.get_node(green);
 
     if let Tag::Field { name, .. } = &node.tag {
@@ -919,37 +904,45 @@ fn emit_create_commands_from_green_with_field(
         Tag::Token { rule_ix } => {
             let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
                 .unwrap_or_default();
-            out.push(Command::CreateToken {
-                node_id,
-                rule_ix: *rule_ix,
-                text,
-                field,
+            out.push(Command::Create {
+                id: node_id,
+                value: ParseNodeValue::Token {
+                    rule_ix: *rule_ix,
+                    text,
+                    field,
+                },
             });
         }
         Tag::Error(err) => {
             let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
                 .unwrap_or_default();
-            out.push(Command::CreateError {
-                node_id,
-                kind: err.clone(),
-                text,
-                field,
+            out.push(Command::Create {
+                id: node_id,
+                value: ParseNodeValue::Error {
+                    error: err.clone(),
+                    text,
+                    field,
+                },
             });
         }
         Tag::Rule { rule_ix, .. } => {
-            out.push(Command::CreateNode {
-                node_id,
-                rule_ix: *rule_ix,
-                children: child_ids,
-                field,
+            out.push(Command::Create {
+                id: node_id,
+                value: ParseNodeValue::Node {
+                    rule_ix: *rule_ix,
+                    children: child_ids,
+                    field,
+                },
             });
         }
         Tag::Field { rule_ix, .. } => {
-            out.push(Command::CreateNode {
-                node_id,
-                rule_ix: *rule_ix,
-                children: child_ids,
-                field,
+            out.push(Command::Create {
+                id: node_id,
+                value: ParseNodeValue::Node {
+                    rule_ix: *rule_ix,
+                    children: child_ids,
+                    field,
+                },
             });
         }
     }

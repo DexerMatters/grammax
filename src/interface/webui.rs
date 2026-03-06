@@ -4,7 +4,7 @@ use color_print::cprintln;
 use crossbeam::channel;
 use rust_embed::Embed;
 
-use crate::{grammar, interface::Interface, runtime};
+use crate::{grammar, interface::Interface, runtime, utils};
 
 #[derive(Embed)]
 #[folder = "frontend/dist/"]
@@ -24,9 +24,20 @@ struct TerminalInfo {
     display: String,
 }
 
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum WebAction {
+    ApplyTextEdit {
+        span: utils::Span,
+        text: String,
+        completion: Option<runtime::CompletionPolicy>,
+    },
+    Shutdown,
+}
+
 #[derive(Clone)]
 pub struct WebPreviewInterface {
-    sender: channel::Sender<runtime::RuntimeRequest>,
+    sender: channel::Sender<runtime::RuntimeEnvelope>,
     rule_infos: &'static Vec<RuleInfo>,
     terminal_infos: &'static Vec<TerminalInfo>,
     host: &'static str,
@@ -35,7 +46,7 @@ pub struct WebPreviewInterface {
 
 impl Interface for WebPreviewInterface {
     fn new(
-        sender: channel::Sender<runtime::RuntimeRequest>,
+        sender: channel::Sender<runtime::RuntimeEnvelope>,
         grammar: &'static grammar::Grammar,
     ) -> Self {
         let rule_infos = serialize_rule_infos(grammar);
@@ -49,7 +60,7 @@ impl Interface for WebPreviewInterface {
         }
     }
 
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeRequest> {
+    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
         &self.sender
     }
 }
@@ -69,8 +80,6 @@ impl WebPreviewInterface {
     }
 
     pub fn run(&self) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Run)?;
-
         // Find a free port
         let mut port = self.port;
         while !is_port_free(self.host, port) {
@@ -110,7 +119,9 @@ impl WebPreviewInterface {
                 .to_string();
             rouille::Response::from_data(mime, content.data.into_owned())
         })
-        .map_err(|e| runtime::RuntimeError::GeneralError(e))?;
+        .map_err(|e| runtime::RuntimeError::InvalidRequest {
+            message: e.to_string(),
+        })?;
 
         let url = format!("http://{}:{}/", self.host, port);
         cprintln!("Web preview server running at <green>{}</green>.", url);
@@ -122,11 +133,13 @@ impl WebPreviewInterface {
             cprintln!("Stopping web preview server...");
             sender_to_stop.send(()).unwrap();
         })
-        .map_err(|e| runtime::RuntimeError::GeneralError(Box::new(e)))?;
+        .map_err(|e| runtime::RuntimeError::InvalidRequest {
+            message: e.to_string(),
+        })?;
 
-        handler.join().unwrap(); // Keep the server running until it's stopped
+        let _ = handler.join();
 
-        Ok(None)
+        Ok(runtime::RuntimeResponse::Ack)
     }
 }
 
@@ -152,10 +165,22 @@ fn resolve_api_request(
     match path {
         /* POST */
         "api/action" => {
-            let body: runtime::Action = rouille::try_or_400!(rouille::input::json_input(request));
-            match this.request(body) {
-                Ok(Some(response)) => rouille::Response::json(&response),
-                Ok(None) => rouille::Response::empty_204(),
+            let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
+            let request = match body {
+                WebAction::ApplyTextEdit {
+                    span,
+                    text,
+                    completion,
+                } => runtime::RuntimeRequest::ApplyTextEdit {
+                    span,
+                    text,
+                    completion: completion.unwrap_or(runtime::CompletionPolicy::Settled),
+                },
+                WebAction::Shutdown => runtime::RuntimeRequest::Shutdown,
+            };
+
+            match this.request(request) {
+                Ok(response) => rouille::Response::json(&response),
                 Err(e) => rouille::Response::json(&e).with_status_code(500),
             }
         }

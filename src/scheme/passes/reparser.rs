@@ -6,21 +6,18 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
-    runtime::{Command, command::NodePath},
-    runtime::{
+    scheme::layers::cst::Command,
+    scheme::passes::{
         delta,
         metrics::EditMetrics,
         strategy::{CandidateScore, EditKind, StrategyCandidate, StrategyContext, pick_candidate},
     },
+    scheme::layers::cst::NodePath,
     utils::Span,
 };
 
 #[derive(Debug, Clone)]
 pub(crate) struct EditResult {
-    pub messages: ParserMessages,
-    pub reparsed_tree: Rc<RedNode>,
-    pub newly_computed_nodes: Vec<Span>,
-    pub newly_computed_tokens: Vec<Span>,
     pub semantic_commands: Vec<Command>,
 }
 
@@ -113,7 +110,7 @@ impl Reparser {
         (focus, steps, level)
     }
 
-    pub fn handle_edit(
+    pub(crate) fn handle_edit(
         &mut self,
         parser: &mut Parser,
         span: Span,
@@ -135,10 +132,6 @@ impl Reparser {
                 m.used_incremental_path = false;
             }
             return Ok(EditResult {
-                messages: parser.messages.clone(),
-                reparsed_tree: self.current.clone(),
-                newly_computed_nodes: Vec::new(),
-                newly_computed_tokens: Vec::new(),
                 semantic_commands: Vec::new(),
             });
         }
@@ -510,21 +503,6 @@ impl Reparser {
 
         parser.messages = new_messages;
         self.normalize_root(parser);
-        let reparsed_tree = self.focus_reparsed_tree(parser, focus_span);
-
-        let new_width = self.alloc.get_node(candidate.green).width;
-        let changed = Self::changed_window(
-            old_source_text,
-            new_source_text,
-            candidate.zipper.offset,
-            candidate.zipper.old_width,
-            new_width,
-        );
-        let newly_computed_nodes =
-            Self::filter_spans_by_window(candidate.newly_computed_nodes, changed);
-        let newly_computed_tokens =
-            Self::filter_spans_by_window(candidate.newly_computed_tokens, changed);
-
         let semantic_start = if metrics.is_some() {
             Some(std::time::Instant::now())
         } else {
@@ -560,13 +538,7 @@ impl Reparser {
             }
         }
 
-        EditResult {
-            messages: parser.messages.clone(),
-            reparsed_tree,
-            newly_computed_nodes,
-            newly_computed_tokens,
-            semantic_commands,
-        }
+        EditResult { semantic_commands }
     }
 
     fn ascend_to_root(&mut self) {

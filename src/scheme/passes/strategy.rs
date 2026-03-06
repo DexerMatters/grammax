@@ -9,7 +9,7 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, Tag, TreeAllocRefExt},
     },
-    runtime::{
+    scheme::passes::{
         metrics::EditMetrics,
         reparser::{ReparserConfig, Zipper},
     },

@@ -10,19 +10,19 @@ pub mod vsclsp;
 
 pub trait Interface {
     fn new(
-        sender: channel::Sender<runtime::RuntimeRequest>,
+        sender: channel::Sender<runtime::RuntimeEnvelope>,
         grammar: &'static grammar::Grammar,
     ) -> Self
     where
         Self: Sized;
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeRequest>;
-    fn request(&self, action: runtime::Action) -> runtime::RuntimeResult {
+    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope>;
+    fn request(&self, request: runtime::RuntimeRequest) -> runtime::RuntimeResult {
         let (reply_tx, reply_rx) = channel::bounded(1);
-        let request = runtime::RuntimeRequest {
-            action,
+        let envelope = runtime::RuntimeEnvelope {
+            request,
             reply: reply_tx,
         };
-        match self.sender().try_send(request) {
+        match self.sender().try_send(envelope) {
             Ok(()) => reply_rx
                 .recv()
                 .map_err(|_| runtime::RuntimeError::ChannelClosed)?,
@@ -35,53 +35,50 @@ pub trait Interface {
 }
 
 pub struct BasicInterface {
-    sender: channel::Sender<runtime::RuntimeRequest>,
+    sender: channel::Sender<runtime::RuntimeEnvelope>,
 }
 
 impl Interface for BasicInterface {
-    fn new(sender: channel::Sender<runtime::RuntimeRequest>, _: &'static grammar::Grammar) -> Self {
+    fn new(
+        sender: channel::Sender<runtime::RuntimeEnvelope>,
+        _: &'static grammar::Grammar,
+    ) -> Self {
         Self { sender }
     }
 
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeRequest> {
+    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
         &self.sender
     }
 }
 
 impl BasicInterface {
-    pub fn update(&self, start: usize, end: usize, text: &str) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Update {
+    pub fn update_with_policy(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+        completion: runtime::CompletionPolicy,
+    ) -> runtime::RuntimeResult {
+        self.request(runtime::RuntimeRequest::ApplyTextEdit {
             span: utils::Span::new(start, end),
             text: text.to_string(),
+            completion,
         })
+    }
+
+    pub fn update(&self, start: usize, end: usize, text: &str) -> runtime::RuntimeResult {
+        self.update_with_policy(start, end, text, runtime::CompletionPolicy::Settled)
     }
 
     pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Insert {
-            offset,
-            text: text.to_string(),
-        })
+        self.update_with_policy(offset, offset, text, runtime::CompletionPolicy::Settled)
     }
 
     pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Delete {
-            span: utils::Span::new(start, end),
-        })
+        self.update_with_policy(start, end, "", runtime::CompletionPolicy::Settled)
     }
 
-    pub fn pause(&self) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Pause)
-    }
-
-    pub fn resume(&self) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Resume)
-    }
-
-    pub fn run(&self) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Run)
-    }
-
-    pub fn exit(&self) -> runtime::RuntimeResult {
-        self.request(runtime::Action::Exit)
+    pub fn shutdown(&self) -> runtime::RuntimeResult {
+        self.request(runtime::RuntimeRequest::Shutdown)
     }
 }

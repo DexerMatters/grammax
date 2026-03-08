@@ -1,9 +1,8 @@
 pub mod grammar;
 pub mod interface;
 pub mod parsec;
-pub mod pass;
 pub mod runtime;
-pub mod semantic;
+pub mod scheme;
 pub mod utils;
 
 #[cfg(test)]

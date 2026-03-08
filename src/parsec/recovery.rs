@@ -632,6 +632,23 @@ impl TokenStream {
             if term == EOF_TOKEN && len == 0 {
                 break;
             }
+            if len == 0 {
+                // Defensive: recovery tokenization must always advance, otherwise
+                // nullable non-EOF terminals can cause an infinite loop.
+                let fallback_len = text[pos..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1);
+                let idx = tokens.len();
+                tokens.push(Token {
+                    term: UNKNOWN_TOKEN,
+                    len: fallback_len,
+                });
+                index_by_start.insert(pos, idx);
+                pos += fallback_len;
+                continue;
+            }
             let idx = tokens.len();
             tokens.push(Token { term, len });
             index_by_start.insert(pos, idx);
@@ -797,6 +814,9 @@ fn lex_at_text(
     let mut best_match: Option<(usize, usize)> = None;
 
     for (idx, matcher) in terminals.iter().enumerate() {
+        #[cfg(test)]
+        let trace_recover = std::env::var("TRACE_RECOVER_LEX").is_ok();
+
         if !string_opened && matcher.display().contains("json_string") {
             continue;
         }
@@ -809,17 +829,39 @@ fn lex_at_text(
             && matcher.preview() == Some("\"")
             && matcher.display().contains("char_predicate")
         {
+            #[cfg(test)]
+            if trace_recover {
+                eprintln!(
+                    "[recover_lex] skip-quote idx={} display={} pos={} rest={:?}",
+                    idx,
+                    matcher.display(),
+                    pos,
+                    rest
+                );
+            }
             continue;
         }
         let mut test_pos = 0;
         if let Some(len) = matcher.matches(rest, &mut test_pos) {
-            // Allow zero-length matches only at boundary, except json-string
-            // body handling which uses quote-start behaviour.
-            if len == 0 && !(at_boundary || rest.starts_with('"')) {
+            // Recovery tokenization must advance through input, so zero-length
+            // matches are only valid at true boundary (EOF/trailing whitespace).
+            if len == 0 && !at_boundary {
                 continue;
             }
             // Keep longest match
             if best_match.iter().all(|&(_, best_len)| len > best_len) {
+                #[cfg(test)]
+                if trace_recover {
+                    eprintln!(
+                        "[recover_lex] candidate idx={} len={} preview={:?} display={} pos={} rest={:?}",
+                        idx,
+                        len,
+                        matcher.preview(),
+                        matcher.display(),
+                        pos,
+                        rest
+                    );
+                }
                 best_match = Some((idx, len));
             }
         }

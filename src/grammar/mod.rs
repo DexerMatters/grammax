@@ -36,27 +36,35 @@ macro_rules! r {
 ///
 /// # Example
 /// ```
+/// use grammax::{new_grammar, r};
+/// use grammax::grammar::dsl::{t, tt};
+/// use grammax::parsec::words::{EndOfInput, NUMS};
+///
 /// let grammar = new_grammar! {
 ///     start where
 ///     start -> r!(expr) + t(EndOfInput)
-///     expr -> r!(expr) "+" r!(term) | r!(term)
-///     term -> t(NUMS) | "(" r!(expr) ")"
+///     expr -> r!(expr) + tt("+") + r!(term) | r!(term)
+///     term -> t(NUMS) | tt("(") + r!(expr) + tt(")")
 /// };
 /// ```
 ///
 /// is equivalent to:
 ///
 /// ```
+/// use grammax::grammar::{dsl::{GrammarNode, t, tt}, Grammar};
+/// use grammax::parsec::words::{EndOfInput, NUMS};
+/// use grammax::r;
+///
 /// fn start() -> GrammarNode {
 ///     r!(expr) + t(EndOfInput)
 /// }
 ///
 /// fn expr() -> GrammarNode {
-///     r!(expr) + r!(term) | r!(term)
+///     r!(expr) + tt("+") + r!(term) | r!(term)
 /// }
 ///
 /// fn term() -> GrammarNode {
-///     t(NUMS) | "(" + r!(expr) + ")"
+///     t(NUMS) | tt("(") + r!(expr) + tt(")")
 /// }
 ///
 /// let grammar = Grammar::new(start(), "start");

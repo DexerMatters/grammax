@@ -12,6 +12,7 @@ function App() {
   const [rules, setRules] = useState<Map<number, RuleInfo>>(new Map());
   const [terminals, setTerminals] = useState<Map<number, TerminalInfo>>(new Map());
   const prevCodeRef = useRef('');
+  const submitQueueRef = useRef<Promise<void>>(Promise.resolve());
 
   // Initialize from backend on mount
   useEffect(() => {
@@ -45,31 +46,49 @@ function App() {
     initialize();
   }, []);
 
-  const handleCodeChange = useCallback(async (newCode: string) => {
-    setCode(newCode);
-
+  const applyCodeChange = useCallback(async (newCode: string) => {
     const oldCode = prevCodeRef.current;
     if (oldCode === newCode) return;
 
-    prevCodeRef.current = newCode;
-
-    // Generate actions from diff
     const diffActions = diffToActions(oldCode, newCode);
     const optimizedActions = mergeAdjacentActions(diffActions);
 
-    // Send each action to the backend and apply response
     for (const action of optimizedActions) {
-      try {
-        const commands = await submitAction(action);
-        // Apply the response tree updates
-        if (commands.length > 0) {
-          applyBatch(commands);
-        }
-      } catch (error) {
-        // Silently fail
+      const commands = await submitAction(action);
+      if (commands.length > 0) {
+        applyBatch(commands);
       }
     }
+
+    prevCodeRef.current = newCode;
   }, [applyBatch]);
+
+  const recoverFromBackend = useCallback(async () => {
+    const sourceFromBackend = await getSource();
+    prevCodeRef.current = sourceFromBackend;
+    setCode(sourceFromBackend);
+
+    const initialCommands = await getTree();
+    if (initialCommands.length > 0) {
+      applyBatch(initialCommands);
+    }
+  }, [applyBatch]);
+
+  const handleCodeChange = useCallback((newCode: string) => {
+    setCode(newCode);
+
+    submitQueueRef.current = submitQueueRef.current.then(async () => {
+      try {
+        await applyCodeChange(newCode);
+      } catch {
+        try {
+          await recoverFromBackend();
+        } catch {
+          // Silently fail
+        }
+      }
+    });
+  }, [applyCodeChange, recoverFromBackend]);
 
   return (
     <div className="flex w-full h-screen bg-[#1a1a1a]">

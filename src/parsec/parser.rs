@@ -72,7 +72,7 @@ struct ParseRuleCacheKey {
 
 #[derive(Debug, Clone)]
 struct ParseRuleCacheEntry {
-    slice: String,
+    slice: Box<str>,
     green: Option<GreenId>,
     relative_messages: ParserMessages,
 }
@@ -98,6 +98,7 @@ pub struct Parser {
     reuse_cache: LruCache<ParseRuleCacheKey, ParseRuleCacheEntry>,
     reuse_stats: IncrementalReuseStats,
     recovery_cache: RecoveryCache,
+    recovery_specs_cache: Option<RecoverySpecs>,
 }
 
 impl Parser {
@@ -119,6 +120,7 @@ impl Parser {
             reuse_cache: LruCache::new(DEFAULT_REUSE_CAPACITY),
             reuse_stats: IncrementalReuseStats::default(),
             recovery_cache: RecoveryCache::default(),
+            recovery_specs_cache: None,
         }
     }
 
@@ -136,12 +138,17 @@ impl Parser {
         &self.text
     }
 
-    pub fn recovery_specs(&self) -> Option<&RecoverySpecs> {
-        None // TODO
+    pub fn recovery_specs(&mut self) -> Option<&RecoverySpecs> {
+        if self.recovery_specs_cache.is_none() {
+            let strategy = self.build_recovery_strategy();
+            self.recovery_specs_cache =
+                Some(RecoverySpecs::from_text_with_strategy(&self.text, strategy));
+        }
+        self.recovery_specs_cache.as_ref()
     }
 
-    pub fn recovery_strategy(&self) -> Option<&ErrorRecoveryStrategy> {
-        None // TODO
+    pub fn recovery_strategy(&mut self) -> Option<&ErrorRecoveryStrategy> {
+        self.recovery_specs().map(|specs| &specs.strategy)
     }
 
     pub fn newly_computed_nodes(&self) -> Vec<Span> {
@@ -158,6 +165,7 @@ impl Parser {
 
     pub fn set_text(&mut self, text: &str) {
         self.text = text.to_string();
+        self.recovery_specs_cache = None;
     }
 
     pub fn configure_reuse(&mut self, enabled: bool, cache_capacity: usize, cache_failures: bool) {
@@ -184,6 +192,7 @@ impl Parser {
 
     pub fn parse_text(&mut self, text: &str) -> Result {
         self.text = text.to_string();
+        self.recovery_specs_cache = None;
         self.pos = 0;
         self.messages.clear();
         self.newly_computed_nodes.clear();
@@ -367,7 +376,6 @@ impl Parser {
                 }
 
                 // CPCT+ error recovery: find minimum cost repair sequences and apply the first.
-                let recovery_config = &self.config.recovery;
                 let repairs = recover(
                     &self.grammar.analysis,
                     &self.grammar.table.productions,
@@ -376,7 +384,7 @@ impl Parser {
                     self.pos,
                     &state_stack,
                     self.string_opened,
-                    recovery_config,
+                    &self.config.recovery,
                     Some(&mut self.recovery_cache),
                 );
 
@@ -439,9 +447,12 @@ impl Parser {
         self.newly_computed_tokens.clear();
         self.recovery_cache.clear();
 
-        let slice = self.text[pos..pos + expected_width].to_string();
-        let cache_key = self.build_parse_rule_cache_key(rule_ix, expected_width, &slice);
-        if let Some(cached) = self.lookup_parse_rule_cache(&cache_key, &slice, pos) {
+        let cache_key = self.build_parse_rule_cache_key(
+            rule_ix,
+            expected_width,
+            &self.text[pos..pos + expected_width],
+        );
+        if let Some(cached) = self.lookup_parse_rule_cache(&cache_key, pos, expected_width) {
             return cached;
         }
 
@@ -470,7 +481,6 @@ impl Parser {
             let Some(action) = action else {
                 return self.finalize_parse_rule_failure(
                     cache_key,
-                    slice,
                     pos,
                     old_pos,
                     old_string_opened,
@@ -511,7 +521,6 @@ impl Parser {
                         ));
                         return self.finalize_parse_rule_failure(
                             cache_key,
-                            slice,
                             pos,
                             old_pos,
                             old_string_opened,
@@ -528,7 +537,6 @@ impl Parser {
         let Some(parsed_rule_green) = self.extract_rule_node(parsed_green, rule_ix) else {
             return self.finalize_parse_rule_failure(
                 cache_key,
-                slice,
                 pos,
                 old_pos,
                 old_string_opened,
@@ -539,7 +547,6 @@ impl Parser {
         if width != expected_width || parsed_rule_width != expected_width {
             return self.finalize_parse_rule_failure(
                 cache_key,
-                slice,
                 pos,
                 old_pos,
                 old_string_opened,
@@ -557,7 +564,7 @@ impl Parser {
         } else {
             self.store_parse_rule_cache(
                 cache_key,
-                slice,
+                self.text[pos..pos + expected_width].to_string(),
                 Some(parsed_rule_green),
                 self.messages.clone(),
                 pos,
@@ -569,7 +576,6 @@ impl Parser {
     fn finalize_parse_rule_failure(
         &mut self,
         cache_key: ParseRuleCacheKey,
-        slice: String,
         pos: usize,
         old_pos: usize,
         old_string_opened: bool,
@@ -593,7 +599,13 @@ impl Parser {
         self.newly_computed_nodes
             .push(Span::new(pos, pos + expected_width));
 
-        self.store_parse_rule_cache(cache_key, slice, None, self.messages.clone(), pos);
+        self.store_parse_rule_cache(
+            cache_key,
+            self.text[pos..pos + expected_width].to_string(),
+            None,
+            self.messages.clone(),
+            pos,
+        );
         Some(error_green)
     }
 
@@ -631,18 +643,24 @@ impl Parser {
     fn lookup_parse_rule_cache(
         &mut self,
         cache_key: &ParseRuleCacheKey,
-        slice: &str,
         pos: usize,
+        expected_width: usize,
     ) -> Option<Option<GreenId>> {
         if !self.reuse_enabled {
             return None;
         }
 
         self.reuse_stats.lookups += 1;
-        let cached = self.reuse_cache.get(cache_key)?;
-        if cached.slice != slice {
+        let slice = &self.text[pos..pos + expected_width];
+        let slice_matches = self
+            .reuse_cache
+            .peek(cache_key)
+            .is_some_and(|cached| cached.slice.as_ref() == slice);
+        if !slice_matches {
             return None;
         }
+        self.reuse_cache.touch_key(cache_key);
+        let cached = self.reuse_cache.peek(cache_key)?;
 
         self.reuse_stats.hits += 1;
         self.messages = cached
@@ -695,7 +713,7 @@ impl Parser {
         self.reuse_cache.insert(
             cache_key,
             ParseRuleCacheEntry {
-                slice,
+                slice: slice.into_boxed_str(),
                 green,
                 relative_messages,
             },
@@ -714,49 +732,77 @@ impl Parser {
     }
 
     fn prime_reuse_subtree(&mut self, green: GreenId, offset: usize) {
-        let (tag, width, children) = {
-            let node = self.alloc.get_node(green);
-            (node.tag.clone(), node.width, node.children.clone())
-        };
+        let mut stack = vec![(green, offset)];
+        while let Some((green, offset)) = stack.pop() {
+            let (tag, width, children) = {
+                let node = self.alloc.get_node(green);
+                (node.tag.clone(), node.width, node.children.clone())
+            };
 
-        let end = offset.saturating_add(width);
-        if end > self.text.len() {
-            return;
-        }
+            let end = offset.saturating_add(width);
+            if end > self.text.len() {
+                continue;
+            }
 
-        if let Tag::Rule { rule_ix, .. } = tag {
-            let slice = self.text[offset..end].to_string();
-            let cache_key = self.build_parse_rule_cache_key(rule_ix, width, &slice);
-            self.reuse_cache.insert(
-                cache_key,
-                ParseRuleCacheEntry {
-                    slice,
-                    green: Some(green),
-                    relative_messages: Vec::new(),
-                },
-            );
-            self.reuse_stats.inserts += 1;
-        }
+            if let Tag::Rule { rule_ix, .. } = tag {
+                let slice = self.text[offset..end].to_string();
+                let cache_key = self.build_parse_rule_cache_key(rule_ix, width, &slice);
+                self.reuse_cache.insert(
+                    cache_key,
+                    ParseRuleCacheEntry {
+                        slice: slice.into_boxed_str(),
+                        green: Some(green),
+                        relative_messages: Vec::new(),
+                    },
+                );
+                self.reuse_stats.inserts += 1;
+            }
 
-        let mut child_offset = offset;
-        for child in children {
-            self.prime_reuse_subtree(child, child_offset);
-            child_offset += self.alloc.get_node(child).width;
+            let mut child_offset = offset;
+            for child in children.into_iter().rev() {
+                let width = self.alloc.get_node(child).width;
+                stack.push((child, child_offset));
+                child_offset += width;
+            }
         }
     }
 
     fn extract_rule_node(&self, green: GreenId, rule_ix: usize) -> Option<GreenId> {
-        let node = self.alloc.get_node(green);
-        match &node.tag {
-            Tag::Rule {
-                rule_ix: current, ..
-            } if *current == rule_ix => Some(green),
-            _ => node
-                .children
-                .iter()
-                .copied()
-                .find_map(|child| self.extract_rule_node(child, rule_ix)),
+        let mut stack = vec![green];
+        while let Some(green) = stack.pop() {
+            let node = self.alloc.get_node(green);
+            match &node.tag {
+                Tag::Rule {
+                    rule_ix: current, ..
+                } if *current == rule_ix => return Some(green),
+                _ => {
+                    stack.extend(node.children.iter().rev().copied());
+                }
+            }
         }
+        None
+    }
+
+    fn build_recovery_strategy(&self) -> ErrorRecoveryStrategy {
+        let mut strategy = ErrorRecoveryStrategy::new();
+        strategy.sync_tokens = self
+            .grammar
+            .recovery_delimiters
+            .iter()
+            .filter_map(|&ix| self.grammar.table.terminals.get(ix).cloned())
+            .collect();
+
+        for (state_ix, state) in self.grammar.analysis.states.iter().enumerate() {
+            if state
+                .actions
+                .keys()
+                .any(|term| *term == EOF_TOKEN || self.grammar.recovery_delimiters.contains(term))
+            {
+                strategy.recovery_states.insert(state_ix);
+            }
+        }
+
+        strategy
     }
 
     fn lex(&mut self, expected: Option<&[usize]>) -> (usize, usize, GreenId) {

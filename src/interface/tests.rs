@@ -1,0 +1,50 @@
+#[cfg(feature = "webui")]
+use crate::{
+    new_grammar,
+    parsec::words::*,
+    runtime::{CompilerBuilder, ComposedCompiler, ParserPass},
+    scheme::layers::RedGreenTreeIR,
+};
+
+#[cfg(feature = "webui")]
+use crate::{interface::webui::WebPreviewInterface, runtime::RuntimeService};
+
+#[cfg(feature = "webui")]
+use std::thread;
+
+#[cfg(feature = "webui")]
+#[test]
+fn test_tap_prints_cst_commands() {
+    let grammar = new_grammar!(
+        start where
+        start   -> r!(json) + tt(EndOfInput)
+        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
+        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
+        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
+        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
+        string  -> tt("\"") + t(STRING) + tt("\"")
+        number  -> tt(NUMS)
+        boolean -> tt("true") | tt("false")
+        null    -> tt("null")
+    );
+
+    let (pass, observer) = CompilerBuilder::new()
+        .then_pass(ParserPass::new(grammar))
+        .then_layer(RedGreenTreeIR::default())
+        .tap();
+
+    thread::spawn(move || {
+        while let Some(transaction) = observer.recv() {
+            println!("======Received transaction:");
+            for cmd in transaction.iter() {
+                println!("CST Command: {:?}", cmd);
+            }
+        }
+    });
+
+    let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
+        ComposedCompiler::from_pass_with_events(pass, evt_tx)
+    });
+
+    runtime.run().expect("runtime failed");
+}

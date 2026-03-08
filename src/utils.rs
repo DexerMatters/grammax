@@ -100,6 +100,14 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
         self.push_back(key);
     }
 
+    pub fn peek(&self, key: &K) -> Option<&V> {
+        self.data.get(key).map(|entry| &entry.value)
+    }
+
+    pub fn touch_key(&mut self, key: &K) {
+        self.touch(key);
+    }
+
     pub fn get(&mut self, key: &K) -> Option<V> {
         let value = self.data.get(key).map(|entry| entry.value.clone())?;
         self.touch(key);

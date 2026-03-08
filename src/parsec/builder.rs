@@ -44,7 +44,10 @@ impl<'a> TreeBuilder<'a> {
             let mut flat_children = Vec::with_capacity(filtered_children.len());
             for &child_id in &filtered_children {
                 let child_node = self.alloc.get_node(child_id);
-                let should_flatten = if let Tag::Rule { rule_ix: child_ix, .. } = child_node.tag {
+                let should_flatten = if let Tag::Rule {
+                    rule_ix: child_ix, ..
+                } = child_node.tag
+                {
                     let child_name = self.grammar.name(child_ix);
                     child_name.contains('@')
                 } else {
@@ -63,7 +66,10 @@ impl<'a> TreeBuilder<'a> {
                 .map(|id| self.alloc.get_node(*id).width)
                 .sum();
             self.alloc.alloc(
-                Tag::Rule { rule_ix: effective_rule_ix, reparse_rule_ix },
+                Tag::Rule {
+                    rule_ix: effective_rule_ix,
+                    reparse_rule_ix,
+                },
                 flat_children,
                 width,
             )
@@ -73,7 +79,10 @@ impl<'a> TreeBuilder<'a> {
                 .map(|id| self.alloc.get_node(*id).width)
                 .sum();
             self.alloc.alloc(
-                Tag::Rule { rule_ix: effective_rule_ix, reparse_rule_ix },
+                Tag::Rule {
+                    rule_ix: effective_rule_ix,
+                    reparse_rule_ix,
+                },
                 filtered_children,
                 width,
             )

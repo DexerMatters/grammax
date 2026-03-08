@@ -2,11 +2,11 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    runtime::{
-        Command,
-        command::{NodePath, PathTargetKind},
-    },
+    runtime::Command,
+    scheme::layers::{NodePath, ParseNodeValue},
 };
+
+const MAX_LCS_CELLS: usize = 4096;
 
 pub(crate) fn generate_commands_incremental(
     alloc: &TreeAllocRef,
@@ -18,7 +18,7 @@ pub(crate) fn generate_commands_incremental(
     current_is_root: bool,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
-    let mut next_node_id = 1u64;
+    let mut next_node_id = 1usize;
     let mut eq_cache = FxHashMap::default();
     let mut align_cache = FxHashMap::default();
 
@@ -47,7 +47,7 @@ pub(crate) fn generate_commands_for_full_tree(
     source_text: &str,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
-    let mut next_node_id = 1u64;
+    let mut next_node_id = 1usize;
 
     let node_id = emit_create_commands_from_green(
         alloc,
@@ -58,10 +58,9 @@ pub(crate) fn generate_commands_for_full_tree(
         &mut next_node_id,
     );
 
-    commands.push(Command::InsertNodeAtPath {
-        path: NodePath(vec![]),
-        node_id,
-        cascade_to_root: false,
+    commands.push(Command::Insert {
+        index: NodePath(vec![]),
+        id: node_id,
     });
 
     commands
@@ -76,7 +75,7 @@ fn emit_commands_for_delta(
     path: &NodePath,
     _current_is_root: bool,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) {
@@ -179,10 +178,9 @@ fn emit_commands_for_delta(
                 out,
                 next_node_id,
             );
-            out.push(Command::InsertNodeAtPath {
-                path: insert_path.clone(),
-                node_id,
-                cascade_to_root: false,
+            out.push(Command::Insert {
+                index: insert_path.clone(),
+                id: node_id,
             });
         }
         return;
@@ -192,7 +190,7 @@ fn emit_commands_for_delta(
         for ix in (old_mid_start..old_mid_end).rev() {
             let mut delete_path = path.clone();
             delete_path.0.push(ix);
-            out.push(Command::DeleteNodeAtPath { path: delete_path });
+            out.push(Command::Delete { index: delete_path });
         }
         return;
     }
@@ -259,6 +257,24 @@ fn emit_commands_for_delta(
         return;
     }
 
+    if old_mid_len.saturating_mul(new_mid_len) > MAX_LCS_CELLS {
+        emit_linear_splice_diff(
+            alloc,
+            path,
+            old_children,
+            new_children,
+            old_mid_start,
+            old_mid_end,
+            new_mid_start,
+            new_mid_end,
+            new_green_offset,
+            source_text,
+            out,
+            next_node_id,
+        );
+        return;
+    }
+
     emit_lcs_diff(
         alloc,
         path,
@@ -277,15 +293,52 @@ fn emit_commands_for_delta(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn emit_linear_splice_diff(
+    alloc: &TreeAllocRef,
+    path: &NodePath,
+    _old_children: &[usize],
+    new_children: &[usize],
+    old_mid_start: usize,
+    old_mid_end: usize,
+    new_mid_start: usize,
+    new_mid_end: usize,
+    new_green_offset: usize,
+    source_text: &str,
+    out: &mut Vec<Command>,
+    next_node_id: &mut usize,
+) {
+    for ix in (old_mid_start..old_mid_end).rev() {
+        let mut delete_path = path.clone();
+        delete_path.0.push(ix);
+        out.push(Command::Delete { index: delete_path });
+    }
+
+    for ix in new_mid_start..new_mid_end {
+        let mut insert_path = path.clone();
+        insert_path.0.push(ix);
+        let insert_offset = child_offset_at(alloc, new_children, new_green_offset, ix);
+        emit_insert_at_path(
+            alloc,
+            &insert_path,
+            new_children[ix],
+            insert_offset,
+            source_text,
+            out,
+            next_node_id,
+        );
+    }
+}
+
 fn emit_replace_at_path(
     alloc: &TreeAllocRef,
-    old_green: usize,
+    _old_green: usize,
     path: &NodePath,
     new_green: usize,
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
 ) {
     let node_id = emit_create_commands_from_green(
         alloc,
@@ -297,29 +350,20 @@ fn emit_replace_at_path(
     );
 
     if path.0.is_empty() {
-        out.push(Command::DeleteNodeAtPath { path: path.clone() });
-        out.push(Command::InsertNodeAtPath {
-            path: path.clone(),
-            node_id,
-            cascade_to_root: false,
+        out.push(Command::Delete {
+            index: path.clone(),
+        });
+        out.push(Command::Insert {
+            index: path.clone(),
+            id: node_id,
         });
         return;
     }
 
-    out.push(Command::ReplaceNodeAtPath {
-        path: path.clone(),
-        node_id,
-        target_kind: target_kind_for_green(alloc, old_green),
+    out.push(Command::Replace {
+        index: path.clone(),
+        id: node_id,
     });
-}
-
-fn target_kind_for_green(alloc: &TreeAllocRef, green: usize) -> PathTargetKind {
-    let tag = alloc.get_node(green).tag.clone();
-    if matches!(tag, Tag::Token { .. } | Tag::Error(_)) {
-        PathTargetKind::Leaf
-    } else {
-        PathTargetKind::Node
-    }
 }
 
 fn emit_insert_at_path(
@@ -329,7 +373,7 @@ fn emit_insert_at_path(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
 ) {
     let node_id = emit_create_commands_from_green(
         alloc,
@@ -339,10 +383,9 @@ fn emit_insert_at_path(
         out,
         next_node_id,
     );
-    out.push(Command::InsertNodeAtPath {
-        path: path.clone(),
-        node_id,
-        cascade_to_root: false,
+    out.push(Command::Insert {
+        index: path.clone(),
+        id: node_id,
     });
 }
 
@@ -358,7 +401,7 @@ fn try_emit_by_greedy_tag_match(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
@@ -425,7 +468,7 @@ fn try_emit_by_greedy_tag_match(
             while old_cursor < old_rel {
                 let mut del_path = path.clone();
                 del_path.0.push(current_index);
-                buf.push(Command::DeleteNodeAtPath { path: del_path });
+                buf.push(Command::Delete { index: del_path });
                 // Deletion: live-tree index does NOT advance (next child shifts into this slot).
                 old_cursor += 1;
             }
@@ -473,10 +516,9 @@ fn try_emit_by_greedy_tag_match(
             );
             let mut insert_path = path.clone();
             insert_path.0.push(current_index);
-            buf.push(Command::InsertNodeAtPath {
-                path: insert_path,
-                node_id,
-                cascade_to_root: false,
+            buf.push(Command::Insert {
+                index: insert_path.clone(),
+                id: node_id,
             });
             current_index += 1;
         }
@@ -486,7 +528,7 @@ fn try_emit_by_greedy_tag_match(
     while old_cursor < old_mid.len() {
         let mut del_path = path.clone();
         del_path.0.push(current_index);
-        buf.push(Command::DeleteNodeAtPath { path: del_path });
+        buf.push(Command::Delete { index: del_path });
         old_cursor += 1;
     }
 
@@ -508,7 +550,7 @@ fn try_emit_insertions_as_subsequence_aligned(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
@@ -594,7 +636,7 @@ fn try_emit_deletions_as_subsequence_aligned(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
@@ -636,7 +678,7 @@ fn try_emit_deletions_as_subsequence_aligned(
         } else {
             let mut delete_path = path.clone();
             delete_path.0.push(current_index);
-            buf.push(Command::DeleteNodeAtPath { path: delete_path });
+            buf.push(Command::Delete { index: delete_path });
         }
     }
 
@@ -662,7 +704,7 @@ fn emit_lcs_diff(
     new_green_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     eq_cache: &mut FxHashMap<(usize, usize), bool>,
     align_cache: &mut FxHashMap<(usize, usize), bool>,
 ) {
@@ -707,7 +749,7 @@ fn emit_lcs_diff(
     for &old_rel in unmatched_old.iter().rev() {
         let mut delete_path = path.clone();
         delete_path.0.push(old_mid_start + old_rel);
-        out.push(Command::DeleteNodeAtPath { path: delete_path });
+        out.push(Command::Delete { index: delete_path });
     }
 
     // 2. Emit insertions using new-tree positions (valid after all deletes above)
@@ -809,19 +851,56 @@ fn greens_equivalent(
         return cached;
     }
 
-    let old_node = alloc.get_node(old_green);
-    let new_node = alloc.get_node(new_green);
+    let mut stack = vec![(old_green, new_green, false)];
+    while let Some((old_green, new_green, expanded)) = stack.pop() {
+        if old_green == new_green {
+            cache.insert((old_green, new_green), true);
+            continue;
+        }
+        if cache.contains_key(&(old_green, new_green)) {
+            continue;
+        }
 
-    let equivalent =
-        old_node.tag == new_node.tag
-            && old_node.width == new_node.width
-            && old_node.children.len() == new_node.children.len()
-            && old_node.children.iter().zip(new_node.children.iter()).all(
-                |(&old_child, &new_child)| greens_equivalent(alloc, old_child, new_child, cache),
-            );
+        let old_node = alloc.get_node(old_green);
+        let new_node = alloc.get_node(new_green);
 
-    cache.insert((old_green, new_green), equivalent);
-    equivalent
+        if old_node.tag != new_node.tag
+            || old_node.width != new_node.width
+            || old_node.children.len() != new_node.children.len()
+        {
+            cache.insert((old_green, new_green), false);
+            continue;
+        }
+
+        if !expanded {
+            let child_pairs: Vec<_> = old_node
+                .children
+                .iter()
+                .copied()
+                .zip(new_node.children.iter().copied())
+                .collect();
+            drop(old_node);
+            drop(new_node);
+
+            stack.push((old_green, new_green, true));
+            for (old_child, new_child) in child_pairs.into_iter().rev() {
+                if !cache.contains_key(&(old_child, new_child)) {
+                    stack.push((old_child, new_child, false));
+                }
+            }
+            continue;
+        }
+
+        let equivalent = old_node
+            .children
+            .iter()
+            .copied()
+            .zip(new_node.children.iter().copied())
+            .all(|(old_child, new_child)| cache.get(&(old_child, new_child)).copied().unwrap_or(false));
+        cache.insert((old_green, new_green), equivalent);
+    }
+
+    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
 }
 
 fn greens_align_equivalent(
@@ -838,17 +917,52 @@ fn greens_align_equivalent(
         return cached;
     }
 
-    let old_node = alloc.get_node(old_green);
-    let new_node = alloc.get_node(new_green);
+    let mut stack = vec![(old_green, new_green, false)];
+    while let Some((old_green, new_green, expanded)) = stack.pop() {
+        if old_green == new_green {
+            cache.insert((old_green, new_green), true);
+            continue;
+        }
+        if cache.contains_key(&(old_green, new_green)) {
+            continue;
+        }
 
-    let equivalent = old_node.tag == new_node.tag
-        && old_node.children.len() == new_node.children.len()
-        && old_node.children.iter().zip(new_node.children.iter()).all(
-            |(&old_child, &new_child)| greens_align_equivalent(alloc, old_child, new_child, cache),
-        );
+        let old_node = alloc.get_node(old_green);
+        let new_node = alloc.get_node(new_green);
 
-    cache.insert((old_green, new_green), equivalent);
-    equivalent
+        if old_node.tag != new_node.tag || old_node.children.len() != new_node.children.len() {
+            cache.insert((old_green, new_green), false);
+            continue;
+        }
+
+        if !expanded {
+            let child_pairs: Vec<_> = old_node
+                .children
+                .iter()
+                .copied()
+                .zip(new_node.children.iter().copied())
+                .collect();
+            drop(old_node);
+            drop(new_node);
+            stack.push((old_green, new_green, true));
+            for (old_child, new_child) in child_pairs.into_iter().rev() {
+                if !cache.contains_key(&(old_child, new_child)) {
+                    stack.push((old_child, new_child, false));
+                }
+            }
+            continue;
+        }
+
+        let equivalent = old_node
+            .children
+            .iter()
+            .copied()
+            .zip(new_node.children.iter().copied())
+            .all(|(old_child, new_child)| cache.get(&(old_child, new_child)).copied().unwrap_or(false));
+        cache.insert((old_green, new_green), equivalent);
+    }
+
+    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
 }
 
 fn emit_create_commands_from_green(
@@ -857,8 +971,8 @@ fn emit_create_commands_from_green(
     node_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
-) -> u64 {
+    next_node_id: &mut usize,
+) -> usize {
     emit_create_commands_from_green_with_field(
         alloc,
         green,
@@ -876,85 +990,136 @@ fn emit_create_commands_from_green_with_field(
     node_offset: usize,
     source_text: &str,
     out: &mut Vec<Command>,
-    next_node_id: &mut u64,
+    next_node_id: &mut usize,
     inherited_field: Option<&str>,
-) -> u64 {
-    let node = alloc.get_node(green);
-
-    if let Tag::Field { name, .. } = &node.tag {
-        if node.children.len() == 1 {
-            return emit_create_commands_from_green_with_field(
-                alloc,
-                node.children[0],
-                node_offset,
-                source_text,
-                out,
-                next_node_id,
-                Some(name),
-            );
-        }
+) -> usize {
+    #[derive(Debug, Clone)]
+    struct CreateFrame {
+        green: usize,
+        node_offset: usize,
+        inherited_field: Option<String>,
+        expanded: bool,
     }
 
-    let field = inherited_field.unwrap_or("").to_string();
-    let mut child_ids = Vec::with_capacity(node.children.len());
-    let mut child_offset = node_offset;
-    for &child in &node.children {
-        child_ids.push(emit_create_commands_from_green_with_field(
-            alloc,
-            child,
-            child_offset,
-            source_text,
-            out,
-            next_node_id,
-            None,
-        ));
-        child_offset += alloc.get_node(child).width;
+    let mut stack = vec![CreateFrame {
+        green,
+        node_offset,
+        inherited_field: inherited_field.map(str::to_string),
+        expanded: false,
+    }];
+    let mut emitted_ids: Vec<usize> = Vec::new();
+
+    while let Some(frame) = stack.pop() {
+        let node = alloc.get_node(frame.green);
+
+        if !frame.expanded {
+            if let Tag::Field { name, .. } = &node.tag {
+                if node.children.len() == 1 {
+                    stack.push(CreateFrame {
+                        green: node.children[0],
+                        node_offset: frame.node_offset,
+                        inherited_field: Some(name.to_string()),
+                        expanded: false,
+                    });
+                    continue;
+                }
+            }
+
+            if !node.children.is_empty() {
+                let child_specs: Vec<_> = {
+                    let mut child_offset = frame.node_offset;
+                    node.children
+                        .iter()
+                        .map(|&child| {
+                            let spec = (child, child_offset);
+                            child_offset += alloc.get_node(child).width;
+                            spec
+                        })
+                        .collect()
+                };
+
+                stack.push(CreateFrame {
+                    green: frame.green,
+                    node_offset: frame.node_offset,
+                    inherited_field: frame.inherited_field.clone(),
+                    expanded: true,
+                });
+
+                for (child, child_offset) in child_specs.into_iter().rev() {
+                    stack.push(CreateFrame {
+                        green: child,
+                        node_offset: child_offset,
+                        inherited_field: None,
+                        expanded: false,
+                    });
+                }
+                continue;
+            }
+        }
+
+        let mut child_ids = Vec::with_capacity(node.children.len());
+        for _ in 0..node.children.len() {
+            child_ids.push(emitted_ids.pop().expect("child create id missing during postorder walk"));
+        }
+        child_ids.reverse();
+
+        let field = frame.inherited_field.as_deref().unwrap_or("").to_string();
+        let node_id = *next_node_id;
+        *next_node_id = next_node_id.saturating_add(1);
+
+        match &node.tag {
+            Tag::Token { rule_ix } => {
+                let text = token_text_for_node(&node.tag, frame.node_offset, node.width, source_text)
+                    .unwrap_or_default();
+                out.push(Command::Create {
+                    id: node_id,
+                    value: ParseNodeValue::Token {
+                        rule_ix: *rule_ix,
+                        text,
+                        field,
+                    },
+                });
+            }
+            Tag::Error(err) => {
+                let text = token_text_for_node(&node.tag, frame.node_offset, node.width, source_text)
+                    .unwrap_or_default();
+                out.push(Command::Create {
+                    id: node_id,
+                    value: ParseNodeValue::Error {
+                        error: err.clone(),
+                        text,
+                        field,
+                    },
+                });
+            }
+            Tag::Rule { rule_ix, .. } => {
+                out.push(Command::Create {
+                    id: node_id,
+                    value: ParseNodeValue::Node {
+                        rule_ix: *rule_ix,
+                        children: child_ids,
+                        field,
+                    },
+                });
+            }
+            Tag::Field { rule_ix, .. } => {
+                out.push(Command::Create {
+                    id: node_id,
+                    value: ParseNodeValue::Node {
+                        rule_ix: *rule_ix,
+                        children: child_ids,
+                        field,
+                    },
+                });
+            }
+        }
+
+        emitted_ids.push(node_id);
     }
 
-    let node_id = *next_node_id;
-    *next_node_id = next_node_id.saturating_add(1);
-
-    // Emit different command types based on tag
-    match &node.tag {
-        Tag::Token { rule_ix } => {
-            let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
-                .unwrap_or_default();
-            out.push(Command::CreateToken {
-                node_id,
-                rule_ix: *rule_ix,
-                text,
-                field,
-            });
-        }
-        Tag::Error(err) => {
-            let text = token_text_for_node(&node.tag, node_offset, node.width, source_text)
-                .unwrap_or_default();
-            out.push(Command::CreateError {
-                node_id,
-                kind: err.clone(),
-                text,
-                field,
-            });
-        }
-        Tag::Rule { rule_ix, .. } => {
-            out.push(Command::CreateNode {
-                node_id,
-                rule_ix: *rule_ix,
-                children: child_ids,
-                field,
-            });
-        }
-        Tag::Field { rule_ix, .. } => {
-            out.push(Command::CreateNode {
-                node_id,
-                rule_ix: *rule_ix,
-                children: child_ids,
-                field,
-            });
-        }
-    }
-
-    node_id
+    emitted_ids
+        .pop()
+        .expect("root create id missing after iterative green walk")
 }
 
 fn child_offset_at(

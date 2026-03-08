@@ -95,7 +95,18 @@ impl<T> ASTCell<T> {
     }
 }
 
-pub type AstDelta<T> = scheme::Transaction<AstArena<T>>;
+pub type AstDelta<T> = Vec<scheme::Command<AstArena<T>>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AstArenaError {
+    MissingIndex {
+        index: usize,
+    },
+    TypeMismatch {
+        index: usize,
+        expected: &'static str,
+    },
+}
 
 #[derive(Debug)]
 pub struct AstArena<T> {
@@ -306,41 +317,46 @@ impl<T> AstArena<T> {
 impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena<T> {
     type Ix = usize;
     type Value = T;
-    type Error = std::convert::Infallible;
+    type Error = AstArenaError;
 
     fn query(&self, index: usize) -> Result<T, Self::Error> {
-        Ok(self
-            .get_erased(ASTCell::<()>::new(index))
-            .and_then(|n| n.downcast_ref::<T>())
+        let Some(node) = self.get_erased(ASTCell::<()>::new(index)) else {
+            return Err(AstArenaError::MissingIndex { index });
+        };
+
+        node.downcast_ref::<T>()
             .cloned()
-            .expect("AstArena::query: index out of range or wrong type"))
+            .ok_or(AstArenaError::TypeMismatch {
+                index,
+                expected: type_name::<T>(),
+            })
     }
     fn apply_transaction(&mut self, txn: scheme::Transaction<Self>) -> Result<(), Self::Error> {
         let mut staging: Vec<Option<ErasedAstNode>> = Vec::new();
-        for cmd in txn {
+        for cmd in txn.iter() {
             match cmd {
                 scheme::Command::Create { id, value } => {
-                    if id >= staging.len() {
-                        staging.resize_with(id + 1, || None);
+                    if *id >= staging.len() {
+                        staging.resize_with(*id + 1, || None);
                     }
-                    staging[id] = Some(ErasedAstNode::new(value));
+                    staging[*id] = Some(ErasedAstNode::new(value.clone()));
                 }
                 scheme::Command::Insert { index, id } => {
-                    if let Some(slot) = staging.get_mut(id) {
+                    if let Some(slot) = staging.get_mut(*id) {
                         if let Some(node) = slot.take() {
-                            self.force_alloc_at(index, node);
+                            self.force_alloc_at(*index, node);
                         }
                     }
                 }
                 scheme::Command::Replace { index, id } => {
-                    if let Some(slot) = staging.get_mut(id) {
+                    if let Some(slot) = staging.get_mut(*id) {
                         if let Some(node) = slot.take() {
-                            self.set_erased(ASTCell::<()>::new(index), node);
+                            self.set_erased(ASTCell::<()>::new(*index), node);
                         }
                     }
                 }
                 scheme::Command::Delete { index } => {
-                    self.remove_erased(ASTCell::<()>::new(index));
+                    self.remove_erased(ASTCell::<()>::new(*index));
                 }
                 scheme::Command::SetRoot { .. } => {}
             }

@@ -1,12 +1,15 @@
 use crossbeam::channel;
 
-use crate::{grammar, runtime, utils};
+use crate::{grammar, runtime, scheme::LayerName, utils};
 
 #[cfg(feature = "webui")]
 pub mod webui;
 
 #[cfg(feature = "vsclsp")]
 pub mod vsclsp;
+
+#[cfg(test)]
+mod tests;
 
 pub trait Interface {
     fn new(
@@ -41,7 +44,7 @@ pub struct BasicInterface {
 impl Interface for BasicInterface {
     fn new(
         sender: channel::Sender<runtime::RuntimeEnvelope>,
-        _: &'static grammar::Grammar,
+        _grammar: &'static grammar::Grammar,
     ) -> Self {
         Self { sender }
     }
@@ -76,6 +79,56 @@ impl BasicInterface {
 
     pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult {
         self.update_with_policy(start, end, "", runtime::CompletionPolicy::Settled)
+    }
+
+    pub fn submit_top_txn(
+        &self,
+        txn: serde_json::Value,
+        completion: runtime::CompletionPolicy,
+    ) -> runtime::RuntimeResult {
+        self.request(runtime::RuntimeRequest::ApplyTopTxn { txn, completion })
+    }
+
+    pub fn query_layer(
+        &self,
+        layer: LayerName,
+        index: serde_json::Value,
+    ) -> runtime::RuntimeResult<serde_json::Value> {
+        let expected_layer = layer;
+        let signal = self.request(runtime::RuntimeRequest::QueryLayer {
+            layer: expected_layer.clone(),
+            index,
+        })?;
+
+        match signal {
+            runtime::RuntimeSignal::QueryResult {
+                layer: returned_layer,
+                value,
+            } if returned_layer == expected_layer => Ok(value),
+            runtime::RuntimeSignal::QueryResult { layer, .. } => {
+                Err(runtime::RuntimeError::InvalidRequest {
+                    message: format!(
+                        "query layer mismatch: expected {expected_layer}, got {layer}"
+                    ),
+                })
+            }
+            other => Err(runtime::RuntimeError::InvalidRequest {
+                message: format!("unexpected signal for query request: {other:?}"),
+            }),
+        }
+    }
+
+    pub fn query_source_text(&self, span: utils::Span) -> runtime::RuntimeResult<String> {
+        let value = self.query_layer(
+            LayerName::root(),
+            serde_json::to_value(span).map_err(|err| runtime::RuntimeError::InvalidRequest {
+                message: format!("failed to encode span query: {err}"),
+            })?,
+        )?;
+
+        serde_json::from_value(value).map_err(|err| runtime::RuntimeError::InvalidRequest {
+            message: format!("failed to decode source text query result: {err}"),
+        })
     }
 
     pub fn shutdown(&self) -> runtime::RuntimeResult {

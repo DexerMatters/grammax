@@ -11,7 +11,7 @@ pub enum SourceTextError {
     NotAnInsertionPoint { span: Span },
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct SourceText {
     pub text: String,
     staging: Vec<Option<String>>,
@@ -68,34 +68,34 @@ impl IR for SourceText {
     /// Clears staging table then applies the transaction directly.
     fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Error> {
         self.staging.clear();
-        for command in transaction {
+        for command in transaction.iter() {
             match command {
                 Command::Create { id, value } => {
-                    if id >= self.staging.len() {
-                        self.staging.resize(id + 1, None);
+                    if *id >= self.staging.len() {
+                        self.staging.resize(*id + 1, None);
                     }
-                    self.staging[id] = Some(value);
+                    self.staging[*id] = Some(value.clone());
                 }
                 Command::Insert { index, id } => {
                     if index.start != index.end {
-                        return Err(SourceTextError::NotAnInsertionPoint { span: index });
+                        return Err(SourceTextError::NotAnInsertionPoint { span: *index });
                     }
                     if index.start > self.text.len() {
                         return Err(SourceTextError::InvalidSpan {
-                            span: index,
+                            span: *index,
                             text_len: self.text.len(),
                         });
                     }
-                    let fragment = self.ensure_staged(id)?.to_owned();
+                    let fragment = self.ensure_staged(*id)?.to_owned();
                     self.text.insert_str(index.start, &fragment);
                 }
                 Command::Delete { index } => {
-                    self.validate_span(index)?;
+                    self.validate_span(*index)?;
                     self.text.drain(index.start..index.end);
                 }
                 Command::Replace { index, id } => {
-                    self.validate_span(index)?;
-                    let fragment = self.ensure_staged(id)?.to_owned();
+                    self.validate_span(*index)?;
+                    let fragment = self.ensure_staged(*id)?.to_owned();
                     self.text.replace_range(index.start..index.end, &fragment);
                 }
                 Command::SetRoot { .. } => {} // text has no root concept

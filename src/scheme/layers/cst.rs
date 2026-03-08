@@ -7,7 +7,7 @@ use crate::{
     scheme::{self, IR},
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, serde::Deserialize)]
 pub struct NodePath(pub Vec<usize>);
 
 impl NodePath {
@@ -46,6 +46,12 @@ pub enum ParseNodeValue {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ParseTreeError {
+    MissingRoot,
+    InvalidPath(NodePath),
+}
+
 impl ParseNodeValue {
     pub fn field(&self) -> &str {
         match self {
@@ -75,6 +81,11 @@ pub struct ParseTreeIR {
     fields: FxHashMap<usize, String>,
     token_text: FxHashMap<usize, String>,
 }
+
+// SAFETY: ParseTreeIR is always owned by a single worker thread when used in
+// the concurrent runtime pipeline. It is moved across thread boundaries but
+// never shared concurrently.
+unsafe impl Send for ParseTreeIR {}
 
 impl fmt::Debug for ParseTreeIR {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -227,6 +238,33 @@ impl ParseTreeIR {
         self.root = Some(rebuilt);
     }
 
+    fn apply_child_edits(&mut self, parent_path: &[usize], edits: &[PendingChildEdit]) {
+        if edits.is_empty() {
+            return;
+        }
+
+        self.rebuild_parent_with_edit(parent_path, |children| {
+            for edit in edits {
+                match *edit {
+                    PendingChildEdit::Insert { at, green } => {
+                        let pos = at.min(children.len());
+                        children.insert(pos, green);
+                    }
+                    PendingChildEdit::Delete { at } => {
+                        if at < children.len() {
+                            children.remove(at);
+                        }
+                    }
+                    PendingChildEdit::Replace { at, green } => {
+                        if at < children.len() {
+                            children[at] = green;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     pub fn green_at_path(&self, path: &NodePath) -> Option<usize> {
         let mut current = self.root?;
         for &ix in &path.0 {
@@ -270,12 +308,14 @@ impl ParseTreeIR {
 impl IR for ParseTreeIR {
     type Ix = NodePath;
     type Value = ParseNodeValue;
-    type Error = std::convert::Infallible;
+    type Error = ParseTreeError;
 
     fn query(&self, index: NodePath) -> Result<ParseNodeValue, Self::Error> {
-        let green = self
-            .green_at_path(&index)
-            .expect("ParseTreeIR::query: invalid path or missing root");
+        let green = match self.green_at_path(&index) {
+            Some(green) => green,
+            None if self.root.is_none() => return Err(ParseTreeError::MissingRoot),
+            None => return Err(ParseTreeError::InvalidPath(index)),
+        };
         Ok(self.value_of_green(green))
     }
 
@@ -283,77 +323,105 @@ impl IR for ParseTreeIR {
         &mut self,
         transaction: scheme::Transaction<Self>,
     ) -> Result<(), Self::Error> {
+        let flush_pending = |this: &mut Self,
+                             pending_parent: &mut Option<Vec<usize>>,
+                             pending_edits: &mut Vec<PendingChildEdit>| {
+            if let Some(parent_path) = pending_parent.take() {
+                this.apply_child_edits(&parent_path, pending_edits);
+                pending_edits.clear();
+            }
+        };
+
         self.staging.clear();
         self.created.clear();
-        for command in transaction {
+        let mut pending_parent: Option<Vec<usize>> = None;
+        let mut pending_edits: Vec<PendingChildEdit> = Vec::new();
+
+        for command in transaction.iter() {
             match command {
                 scheme::Command::Create { id, value } => {
-                    if id >= self.staging.len() {
-                        self.staging.resize(id + 1, None);
+                    if *id >= self.staging.len() {
+                        self.staging.resize(*id + 1, None);
                     }
-                    self.staging[id] = Some(value.clone());
+                    self.staging[*id] = Some(value.clone());
 
-                    if id >= self.created.len() {
-                        self.created.resize(id + 1, None);
+                    if *id >= self.created.len() {
+                        self.created.resize(*id + 1, None);
                     }
-                    self.created[id] = self.alloc_from_value(&value);
+                    self.created[*id] = self.alloc_from_value(value);
                 }
                 scheme::Command::Insert { index, id } => {
-                    let Some(green) = self.created.get(id).and_then(|v| *v) else {
+                    let Some(green) = self.created.get(*id).and_then(|v| *v) else {
                         continue;
                     };
 
                     if index.0.is_empty() {
+                        flush_pending(self, &mut pending_parent, &mut pending_edits);
                         self.root = Some(green);
                         continue;
                     }
 
                     let parent_path = &index.0[..index.0.len() - 1];
                     let at = index.0[index.0.len() - 1];
-                    self.rebuild_parent_with_edit(parent_path, |children| {
-                        let pos = at.min(children.len());
-                        children.insert(pos, green);
-                    });
+
+                    if pending_parent.as_deref() != Some(parent_path) {
+                        flush_pending(self, &mut pending_parent, &mut pending_edits);
+                        pending_parent = Some(parent_path.to_vec());
+                    }
+                    pending_edits.push(PendingChildEdit::Insert { at, green });
                 }
                 scheme::Command::Delete { index } => {
                     if index.0.is_empty() {
+                        flush_pending(self, &mut pending_parent, &mut pending_edits);
                         self.root = None;
                         continue;
                     }
 
                     let parent_path = &index.0[..index.0.len() - 1];
                     let at = index.0[index.0.len() - 1];
-                    self.rebuild_parent_with_edit(parent_path, |children| {
-                        if at < children.len() {
-                            children.remove(at);
-                        }
-                    });
+
+                    if pending_parent.as_deref() != Some(parent_path) {
+                        flush_pending(self, &mut pending_parent, &mut pending_edits);
+                        pending_parent = Some(parent_path.to_vec());
+                    }
+                    pending_edits.push(PendingChildEdit::Delete { at });
                 }
                 scheme::Command::Replace { index, id } => {
-                    let Some(green) = self.created.get(id).and_then(|v| *v) else {
+                    let Some(green) = self.created.get(*id).and_then(|v| *v) else {
                         continue;
                     };
 
                     if index.0.is_empty() {
+                        flush_pending(self, &mut pending_parent, &mut pending_edits);
                         self.root = Some(green);
                         continue;
                     }
 
                     let parent_path = &index.0[..index.0.len() - 1];
                     let at = index.0[index.0.len() - 1];
-                    self.rebuild_parent_with_edit(parent_path, |children| {
-                        if at < children.len() {
-                            children[at] = green;
-                        }
-                    });
+
+                    if pending_parent.as_deref() != Some(parent_path) {
+                        flush_pending(self, &mut pending_parent, &mut pending_edits);
+                        pending_parent = Some(parent_path.to_vec());
+                    }
+                    pending_edits.push(PendingChildEdit::Replace { at, green });
                 }
                 scheme::Command::SetRoot { id } => {
-                    self.root = id.and_then(|ix| self.created.get(ix).and_then(|v| *v));
+                    flush_pending(self, &mut pending_parent, &mut pending_edits);
+                    self.root = (*id).and_then(|ix| self.created.get(ix).and_then(|v| *v));
                 }
             }
         }
+        flush_pending(self, &mut pending_parent, &mut pending_edits);
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingChildEdit {
+    Insert { at: usize, green: usize },
+    Delete { at: usize },
+    Replace { at: usize, green: usize },
 }
 
 // ── Command type alias ────────────────────────────────────────────────────────

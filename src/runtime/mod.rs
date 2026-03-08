@@ -1,9 +1,6 @@
 //! Runtime terraced facade.
 //!
-//! This module intentionally exposes only the core terraced pipeline pieces:
-//! - `Compiler<T, M>`: the 3-stage pipeline driver
-//! - `ParserPass`: Pass 1→2 (SourceText → RedGreenTreeIR)
-//! - `Command`: shared incremental command shape for parse-tree transactions
+//! - [`ComposedCompiler`]: composable compiler runtime built from IR/pass stages.
 
 pub mod compiler;
 pub mod protocol;
@@ -11,12 +8,13 @@ pub mod service;
 
 pub use crate::scheme::layers::cst::Command;
 pub use crate::scheme::passes::{ParserPass, Reparser, ReparserConfig};
-pub use compiler::Compiler;
+pub use crate::scheme::{LayerName, PassId};
+pub use compiler::{CompilerBuilder, ComposedCompiler, ExpectLayer, ExpectPass, LayerObserver};
 pub use protocol::{
     CompletionPolicy, RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimeRequest,
-    RuntimeResponse, RuntimeResult,
+    RuntimeResult, RuntimeSelector, RuntimeSignal, RuntimeSignalKind,
 };
-pub use service::{RuntimeService, RuntimeServiceConfig};
+pub use service::RuntimeService;
 
 #[cfg(test)]
 mod tests;

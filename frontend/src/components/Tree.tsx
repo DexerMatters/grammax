@@ -36,6 +36,12 @@ interface ErrorNode {
 
 // ============ Command Application Logic ============
 
+// Global monotonic counter so every TreeNode gets a unique ID across batches.
+// The backend resets its per-batch IDs to 1 every transaction; we must NOT use
+// those IDs directly as React keys or they will collide and suppress re-renders.
+let _nextGlobalId = 1;
+function nextGlobalId(): number { return _nextGlobalId++; }
+
 /**
  * Apply a batch of commands to the current tree, returning a new tree.
  * Handles node_id reset per batch using a local map.
@@ -43,7 +49,7 @@ interface ErrorNode {
 function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode | null {
   let currentTree = tree;
 
-  // Build local node map from create commands
+  // Map from batch-local node_id → TreeNode with a globally unique .id
   const nodeMap = new Map<number, TreeNode>();
 
   // First pass: create all nodes/tokens/errors
@@ -51,12 +57,12 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
     if (cmd.type === 'createToken') {
       const c = cmd as CreateTokenCommand;
       nodeMap.set(c.node_id, {
-        id: c.node_id,
+        id: nextGlobalId(),
         type: 'token',
         text: c.text,
         field: c.field,
         ruleIx: c.rule_ix,
-        span: [0, 0], // Note: API doesn't provide span for tokens yet
+        span: [0, 0],
       });
     } else if (cmd.type === 'createNode') {
       const c = cmd as CreateNodeCommand;
@@ -65,12 +71,12 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
         continue;
       }
       nodeMap.set(c.node_id, {
-        id: c.node_id,
+        id: nextGlobalId(),
         type: 'node',
         field: c.field,
         ruleIx: c.rule_ix,
         children: children as TreeNode[],
-        span: [0, 0], // Note: would be computed from children
+        span: [0, 0],
       });
     } else if (cmd.type === 'createError') {
       const c = cmd as CreateErrorCommand;
@@ -79,7 +85,7 @@ function applyCommandBatch(tree: TreeNode | null, commands: Command[]): TreeNode
           c.kind.type === 'missingToken' ? 'missing' :
             'incomplete';
       nodeMap.set(c.node_id, {
-        id: c.node_id,
+        id: nextGlobalId(),
         type: 'error',
         field: c.field,
         text: c.text,
@@ -165,8 +171,8 @@ function insertAtPath(node: TreeNode | null, path: number[], newNode: TreeNode):
 }
 
 function replaceAtPath(node: TreeNode | null, path: number[], newNode: TreeNode): TreeNode | null {
-  if (!node) return null;
   if (path.length === 0) return newNode;
+  if (!node) return null;
   if (node.type !== 'node') return node;
 
   const [head, ...rest] = path;

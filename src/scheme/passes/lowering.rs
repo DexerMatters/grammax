@@ -9,12 +9,7 @@
 //! lowerer caches the green tree in its own shadow map so it does not need to
 //! re-parse from scratch on every edit.
 
-use std::{
-    any::type_name,
-    fmt,
-    marker::PhantomData,
-    sync::{Arc, Mutex},
-};
+use std::{any::type_name, fmt, marker::PhantomData};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -94,6 +89,7 @@ pub struct GreenQuery<'a, T> {
     green: GreenId,
 }
 
+#[derive(Clone)]
 struct GreenNode<T> {
     children: Vec<GreenId>,
     offset: usize,
@@ -402,7 +398,6 @@ pub struct IncrementalLowerer<T, M> {
     pub(crate) arena: AstArena<T>,
     root_green: Option<GreenId>,
     root_ast: Option<ASTCell<T>>,
-    source_cell: Option<Arc<Mutex<String>>>,
 }
 
 impl<T, M> IncrementalLowerer<T, M>
@@ -418,13 +413,7 @@ where
             arena: AstArena::new(),
             root_green: None,
             root_ast: None,
-            source_cell: None,
         }
-    }
-
-    pub fn with_source_cell(mut self, source_cell: Arc<Mutex<String>>) -> Self {
-        self.source_cell = Some(source_cell);
-        self
     }
 
     pub fn arena(&self) -> &AstArena<T> {
@@ -444,7 +433,7 @@ where
         upstream: &RedGreenTreeIR,
         commands: &[Command],
         source_text: &str,
-    ) -> AstDelta<T> {
+    ) -> Vec<scheme::Command<AstArena<T>>> {
         let mut ops = Vec::new();
 
         self.sync_from_upstream(upstream, &mut ops);
@@ -452,9 +441,16 @@ where
 
         // Phase 2: Recompute dirty greens & emit AST deltas
         let mut visited = FxHashSet::default();
+        let mut next_create_id = 0usize;
         for &green in &dirty {
             if self.greens.contains_key(&green) {
-                self.recompute_binding(green, source_text, &mut ops, &mut visited);
+                self.recompute_binding(
+                    green,
+                    source_text,
+                    &mut ops,
+                    &mut visited,
+                    &mut next_create_id,
+                );
             }
         }
 
@@ -476,7 +472,7 @@ where
         txn: scheme::Transaction<RedGreenTreeIR>,
         source_text: &str,
     ) -> scheme::Transaction<AstArena<T>> {
-        self.apply_from_ir2(upstream, &txn, source_text)
+        std::sync::Arc::new(self.apply_from_ir2(upstream, &txn, source_text))
     }
 
     fn collect_dirty_nodes(
@@ -529,7 +525,11 @@ where
         dirty
     }
 
-    fn sync_from_upstream(&mut self, upstream: &RedGreenTreeIR, ops: &mut AstDelta<T>) {
+    fn sync_from_upstream(
+        &mut self,
+        upstream: &RedGreenTreeIR,
+        ops: &mut Vec<scheme::Command<AstArena<T>>>,
+    ) {
         let old = std::mem::take(&mut self.greens);
         let mut next = FxHashMap::default();
 
@@ -561,6 +561,13 @@ where
         old: &FxHashMap<GreenId, GreenNode<T>>,
         out: &mut FxHashMap<GreenId, GreenNode<T>>,
     ) {
+        if let Some(existing) = old.get(&green) {
+            if existing.offset == offset {
+                self.copy_shadow_subtree(green, upstream, old, out);
+                return;
+            }
+        }
+
         if out.contains_key(&green) {
             return;
         }
@@ -598,73 +605,119 @@ where
         }
     }
 
+    fn copy_shadow_subtree(
+        &self,
+        green: GreenId,
+        upstream: &RedGreenTreeIR,
+        old: &FxHashMap<GreenId, GreenNode<T>>,
+        out: &mut FxHashMap<GreenId, GreenNode<T>>,
+    ) {
+        let mut stack = vec![green];
+        while let Some(green) = stack.pop() {
+            if out.contains_key(&green) {
+                continue;
+            }
+            let Some(existing) = old.get(&green).cloned() else {
+                let offset = upstream
+                    .green_at_path(&NodePath(vec![]))
+                    .and_then(|root| (root == green).then_some(0))
+                    .unwrap_or(0);
+                self.build_shadow_from_ir2(green, offset, upstream, old, out);
+                continue;
+            };
+            let children = existing.children.clone();
+            out.insert(green, existing);
+            for child in children.into_iter().rev() {
+                if old.contains_key(&child) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
     fn recompute_binding(
         &mut self,
         green: GreenId,
         source_text: &str,
         ops: &mut AstDelta<T>,
         visited: &mut FxHashSet<GreenId>,
+        next_create_id: &mut usize,
     ) {
-        if !visited.insert(green) {
-            return;
-        }
+        let mut stack = vec![(green, false)];
 
-        let children = self.greens[&green].children.clone();
-        for child in children {
-            self.recompute_binding(child, source_text, ops, visited);
-        }
+        while let Some((green, expanded)) = stack.pop() {
+            if expanded {
+                let child_asts: Vec<_> = self.greens[&green]
+                    .children
+                    .iter()
+                    .map(|&child| self.greens[&child].binding)
+                    .collect();
 
-        let child_asts: Vec<_> = self.greens[&green]
-            .children
-            .iter()
-            .map(|&child| self.greens[&child].binding)
-            .collect();
+                let query = GreenQuery {
+                    grammar: self.grammar,
+                    greens: &self.greens,
+                    source_text,
+                    green,
+                };
+                let mapped = self.mapper.map(&query);
 
-        let query = GreenQuery {
-            grammar: self.grammar,
-            greens: &self.greens,
-            source_text,
-            green,
-        };
-        let mapped = self.mapper.map(&query);
+                let old_binding = self.greens[&green].binding;
+                let forward_child_ast = match &mapped.kind {
+                    MapOutputKind::ForwardChild(idx) => child_asts.get(*idx).copied(),
+                    _ => None,
+                };
+                drop(query);
 
-        let old_binding = self.greens[&green].binding;
-        let forward_child_ast = match &mapped.kind {
-            MapOutputKind::ForwardChild(idx) => child_asts.get(*idx).copied(),
-            _ => None,
-        };
-        drop(query);
+                let new_binding = match mapped.kind {
+                    MapOutputKind::Node(erased) => {
+                        let typed = erased.downcast_ref::<T>().cloned();
+                        let id = self.arena.insert_erased(erased).cast::<T>();
+                        if let Some(value) = typed {
+                            let raw = id.into_raw();
+                            let staging_id = *next_create_id;
+                            *next_create_id += 1;
+                            ops.push(scheme::Command::Create {
+                                id: staging_id,
+                                value,
+                            });
+                            ops.push(scheme::Command::Insert {
+                                index: raw,
+                                id: staging_id,
+                            });
+                        }
+                        Some(id)
+                    }
+                    MapOutputKind::Alias(id) => Some(id.cast()),
+                    MapOutputKind::ForwardChild(_) => forward_child_ast.flatten(),
+                    MapOutputKind::Skip => None,
+                };
 
-        let new_binding = match mapped.kind {
-            MapOutputKind::Node(erased) => {
-                let typed = erased.downcast_ref::<T>().cloned();
-                let id = self.arena.insert_erased(erased).cast::<T>();
-                if let Some(value) = typed {
-                    let raw = id.into_raw();
-                    ops.push(scheme::Command::Create { id: raw, value });
-                    ops.push(scheme::Command::Insert {
-                        index: raw,
-                        id: raw,
-                    });
+                if let Some(old_id) = old_binding {
+                    if new_binding != Some(old_id) {
+                        if self.arena.remove_erased(old_id.cast()).is_some() {
+                            ops.push(scheme::Command::Delete {
+                                index: old_id.into_raw(),
+                            });
+                        }
+                    }
                 }
-                Some(id)
-            }
-            MapOutputKind::Alias(id) => Some(id.cast()),
-            MapOutputKind::ForwardChild(_) => forward_child_ast.flatten(),
-            MapOutputKind::Skip => None,
-        };
 
-        if let Some(old_id) = old_binding {
-            if new_binding != Some(old_id) {
-                if self.arena.remove_erased(old_id.cast()).is_some() {
-                    ops.push(scheme::Command::Delete {
-                        index: old_id.into_raw(),
-                    });
+                self.greens.get_mut(&green).unwrap().binding = new_binding;
+                continue;
+            }
+
+            if !visited.insert(green) {
+                continue;
+            }
+
+            stack.push((green, true));
+            let children = self.greens[&green].children.clone();
+            for child in children.into_iter().rev() {
+                if !visited.contains(&child) {
+                    stack.push((child, false));
                 }
             }
         }
-
-        self.greens.get_mut(&green).unwrap().binding = new_binding;
     }
 
     fn compute_root(&self) -> Option<ASTCell<T>> {
@@ -689,11 +742,6 @@ where
         upstream: &RedGreenTreeIR,
         txn: scheme::Transaction<RedGreenTreeIR>,
     ) -> Result<scheme::Transaction<AstArena<T>>, Self::Error> {
-        let source_text = self
-            .source_cell
-            .as_ref()
-            .and_then(|cell| cell.lock().ok().map(|s| s.clone()))
-            .unwrap_or_default();
-        Ok(self.transform_with_source(upstream, txn, &source_text))
+        Ok(self.transform_with_source(upstream, txn, ""))
     }
 }

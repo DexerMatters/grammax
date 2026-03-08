@@ -39,9 +39,11 @@ use super::{
 pub struct ParserPass {
     parser: Parser,
     reparser: Reparser,
-    /// Full current text, kept in sync with the upstream SourceText IR.
-    text: String,
 }
+
+// SAFETY: ParserPass is moved into a single worker thread in the runtime
+// pipeline and not shared concurrently across threads.
+unsafe impl Send for ParserPass {}
 
 impl ParserPass {
     /// Create a pass for `grammar` with default parser/reparser settings.
@@ -50,11 +52,7 @@ impl ParserPass {
         let crate::parsec::Result { root, .. } = parser.parse_text("");
         let alloc = parser.alloc.clone();
         let reparser = Reparser::new(root, alloc);
-        Self {
-            parser,
-            reparser,
-            text: String::new(),
-        }
+        Self { parser, reparser }
     }
 
     /// Create with custom parser and reparser configuration.
@@ -67,11 +65,7 @@ impl ParserPass {
         let crate::parsec::Result { root, .. } = parser.parse_text("");
         let alloc = parser.alloc.clone();
         let reparser = Reparser::new(root, alloc).with_config(reparser_config);
-        Self {
-            parser,
-            reparser,
-            text: String::new(),
-        }
+        Self { parser, reparser }
     }
 }
 
@@ -103,8 +97,7 @@ impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
                 .handle_edit(&mut self.parser, span, new_len, new_text, None);
             match result {
                 Ok(edit_result) => {
-                    self.text = new_text.clone();
-                    return Ok(edit_result.semantic_commands);
+                    return Ok(std::sync::Arc::new(edit_result.semantic_commands));
                 }
                 Err(_) => {
                     // Incremental re-parse failed; fall through to full re-parse.
@@ -115,13 +108,9 @@ impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
         // Full re-parse (first edit, or incremental failure).
         let crate::parsec::Result { root, .. } = self.parser.parse_text(new_text);
         self.reparser.current = std::rc::Rc::new(root.clone());
-        let commands = delta::generate_commands_for_full_tree(
-            &self.parser.alloc,
-            root.green,
-            new_text,
-        );
-        self.text = new_text.clone();
-        Ok(commands)
+        let commands =
+            delta::generate_commands_for_full_tree(&self.parser.alloc, root.green, new_text);
+        Ok(std::sync::Arc::new(commands))
     }
 }
 

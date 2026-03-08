@@ -46,9 +46,18 @@ pub(crate) struct StrategyCandidate {
     pub score: CandidateScore,
     pub green: usize,
     pub messages: Arc<ParserMessages>,
-    pub newly_computed_nodes: Vec<Span>,
-    pub newly_computed_tokens: Vec<Span>,
     pub zipper: Zipper,
+}
+
+impl Clone for StrategyCandidate {
+    fn clone(&self) -> Self {
+        Self {
+            score: self.score,
+            green: self.green,
+            messages: Arc::clone(&self.messages),
+            zipper: self.zipper.clone(),
+        }
+    }
 }
 
 pub(crate) struct StrategyContext<'a> {
@@ -73,8 +82,6 @@ pub(crate) enum EditKind {
 struct MemoizedCandidate {
     green: usize,
     messages: Arc<ParserMessages>,
-    newly_computed_nodes: Vec<Span>,
-    newly_computed_tokens: Vec<Span>,
     errors_inside: usize,
     errors_outside: usize,
 }
@@ -181,8 +188,6 @@ fn evaluate_candidate(
             },
             green: cached.green,
             messages: Arc::clone(&cached.messages),
-            newly_computed_nodes: cached.newly_computed_nodes.clone(),
-            newly_computed_tokens: cached.newly_computed_tokens.clone(),
             zipper: zipper.clone(),
         });
     }
@@ -231,7 +236,18 @@ fn evaluate_candidate(
     let check_end = zipper.offset + new_width;
 
     if enforce_region_end && ctx.config.enforce_region_end {
-        let _ = (ctx.specs, check_end);
+        if let Some(specs) = ctx.specs {
+            if let Some(region) = specs
+                .regions
+                .iter()
+                .find(|region| edit_span.start >= region.start && edit_span.start < region.end)
+            {
+                if zipper.offset < region.start || check_end > region.end {
+                    memo.insert(memo_key, None);
+                    return None;
+                }
+            }
+        }
     }
 
     if let Some(strategy) = ctx.recovery_strategy {
@@ -261,16 +277,12 @@ fn evaluate_candidate(
     let score = CandidateScore::new(errors_outside, errors_inside, zipper.level);
 
     let messages = Arc::new(ctx.parser.messages.clone());
-    let newly_computed_nodes = ctx.parser.newly_computed_nodes();
-    let newly_computed_tokens = ctx.parser.newly_computed_tokens();
 
     memo.insert(
         memo_key,
         Some(MemoizedCandidate {
             green: new_green,
             messages: Arc::clone(&messages),
-            newly_computed_nodes: newly_computed_nodes.clone(),
-            newly_computed_tokens: newly_computed_tokens.clone(),
             errors_inside,
             errors_outside,
         }),
@@ -280,8 +292,6 @@ fn evaluate_candidate(
         score,
         green: new_green,
         messages,
-        newly_computed_nodes,
-        newly_computed_tokens,
         zipper: zipper.clone(),
     })
 }

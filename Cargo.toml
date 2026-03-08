@@ -2,6 +2,7 @@
 name = "grammax"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [dependencies]
 internment = { version = "0.8.6", features = ["arena"] }

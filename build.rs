@@ -2,7 +2,7 @@ use std::process::Command;
 
 fn main() {
     // Build frontend if it exists
-    if std::path::Path::new("frontend").exists() {
+    if cfg!(feature = "webui") && std::path::Path::new("frontend").exists() {
         println!("cargo:warning=Building frontend...");
 
         let status = Command::new("npm")

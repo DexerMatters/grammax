@@ -1,0 +1,142 @@
+/* Dark theme (default) - vibrant, high-contrast palette */
+:root,
+:root.dark {
+  /* Token colors - warm gold/orange for code tokens */
+  --color-token: 255 168 80;
+  --color-token-border: 255 168 80;
+  --color-token-light: 255 168 80;
+  --color-token-shadow: 255 168 80;
+
+  /* Error states - vivid and distinct */
+  --color-error-unexpected: 255 85 85;
+  --color-error-unexpected-border: 255 85 85;
+  --color-error-unexpected-border-hover: 255 120 120;
+  --color-error-unexpected-shadow: 255 85 85;
+  --color-error-missing: 255 230 0;
+  --color-error-incomplete: 0 230 255;
+
+  /* Branch/Rule lines - vibrant emerald green */
+  --color-branch: 93 221 131;
+  --color-branch-light: 93 221 131;
+  --color-branch-border: 93 221 131;
+  --color-branch-border-light: 93 221 131;
+
+  /* Field colors - bright electric cyan */
+  --color-field: 29 217 255;
+  --color-field-border: 29 217 255;
+  --color-field-border-hover: 100 235 255;
+  --color-field-border-light: 29 217 255;
+  --color-field-bg: 26 26 26;
+
+  /* Background colors */
+  --color-bg-base: 26 26 26;
+  --color-bg-base-hover: 36 36 36;
+  --color-bg-darker: 42 42 42;
+
+  /* Text colors */
+  --color-text-muted: 160 160 160;
+  --color-text-subtle: 110 110 110;
+  --color-text-success: 93 221 131;
+}
+
+/* Light theme - refined, sophisticated palette */
+:root.light {
+  /* Token colors - deep bronze for code tokens */
+  --color-token: 184 127 84;
+  --color-token-border: 184 127 84;
+  --color-token-light: 184 127 84;
+  --color-token-shadow: 184 127 84;
+
+  /* Error states - bold but not harsh */
+  --color-error-unexpected: 211 47 47;
+  --color-error-unexpected-border: 211 47 47;
+  --color-error-unexpected-border-hover: 229 57 53;
+  --color-error-unexpected-shadow: 211 47 47;
+  --color-error-missing: 245 127 23;
+  --color-error-incomplete: 0 150 136;
+
+  /* Branch/Rule lines - deep forest green */
+  --color-branch: 46 125 50;
+  --color-branch-light: 46 125 50;
+  --color-branch-border: 46 125 50;
+  --color-branch-border-light: 46 125 50;
+
+  /* Field colors - rich teal blue */
+  --color-field: 0 150 150;
+  --color-field-border: 0 150 150;
+  --color-field-border-hover: 0 180 180;
+  --color-field-border-light: 0 150 150;
+  --color-field-bg: 224 242 254;
+
+  /* Background colors */
+  --color-bg-base: 248 249 250;
+  --color-bg-base-hover: 240 244 248;
+  --color-bg-darker: 238 237 238;
+
+  /* Text colors */
+  --color-text-muted: 95 99 104;
+  --color-text-subtle: 158 158 158;
+  --color-text-success: 46 125 50;
+}
+
+/* Warm accent color - refined copper and rust tones */
+:root[data-accent-color="warm"],
+:root.dark[data-accent-color="warm"] {
+  --color-branch: 230 145 80;
+  --color-branch-light: 230 145 80;
+  --color-branch-border: 230 145 80;
+  --color-branch-border-light: 230 145 80;
+  --color-text-success: 230 145 80;
+}
+
+:root.light[data-accent-color="warm"] {
+  --color-branch: 180 95 60;
+  --color-branch-light: 180 95 60;
+  --color-branch-border: 180 95 60;
+  --color-branch-border-light: 180 95 60;
+  --color-text-success: 180 95 60;
+}
+
+/* Cool accent color - balanced and sophisticated blues */
+:root[data-accent-color="cool"],
+:root.dark[data-accent-color="cool"] {
+  --color-branch: 100 180 255;
+  --color-branch-light: 100 180 255;
+  --color-branch-border: 100 180 255;
+  --color-branch-border-light: 100 180 255;
+  --color-text-success: 100 180 255;
+}
+
+:root.light[data-accent-color="cool"] {
+  --color-branch: 51 103 214;
+  --color-branch-light: 51 103 214;
+  --color-branch-border: 51 103 214;
+  --color-branch-border-light: 51 103 214;
+  --color-text-success: 51 103 214;
+}
+
+/* Font size adjustments */
+:root[data-font-size="small"] {
+  font-size: 12px;
+}
+
+:root[data-font-size="medium"] {
+  font-size: 14px;
+}
+
+:root[data-font-size="large"] {
+  font-size: 16px;
+}
+
+:root[data-font-size="xlarge"] {
+  font-size: 20px;
+}
+
+/* Smooth transitions for theme changes */
+:root {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}
+
+body {
+  transition: background-color 0.3s ease, color 0.3s ease;
+}

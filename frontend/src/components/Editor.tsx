@@ -67,21 +67,21 @@ const Editor: React.FC<EditorProps> = ({
   }, [value]);
 
   return (
-    <div className="flex flex-col w-full h-full bg-[#1e1e1e] rounded-lg overflow-hidden border border-[#333]">
-      <div className="flex w-full h-full relative font-mono text-sm leading-relaxed text-[#e0e0e0]">
+    <div className="flex h-full w-full flex-col overflow-hidden rounded-2xl border border-zinc-300/60 bg-white dark:bg-[#1e1e1e] dark:border-white/10">
+      <div className="flex w-full h-full relative font-mono text-sm leading-relaxed text-gray-800 dark:text-[#e0e0e0]">
         <div
           ref={lineNumbersRef}
-          className="flex flex-col bg-[#252526] border-r border-[#3e3e42] py-3 pl-0 pr-4 text-right select-none overflow-hidden min-w-[50px]"
+          className="flex min-w-12.5 select-none flex-col overflow-hidden border-r border-zinc-300/50 bg-gray-100 dark:bg-[#252526] py-3 pl-0 pr-4 text-right text-gray-500 dark:text-[#858585] dark:border-white/10"
         >
           {Array.from({ length: lineCount }, (_, i) => (
-            <div key={i + 1} className="h-[1.6em] text-[#858585] text-sm leading-relaxed">
+            <div key={i + 1} className="h-[1.6em] text-sm leading-relaxed">
               {i + 1}
             </div>
           ))}
         </div>
         <textarea
           ref={textareaRef}
-          className="flex-1 p-3 bg-transparent border-0 outline-none text-[#e0e0e0] font-mono text-sm leading-relaxed resize-none overflow-y-scroll overflow-x-auto whitespace-pre break-normal appearance-none placeholder-[#555] disabled:opacity-60 disabled:cursor-not-allowed focus:outline-none"
+          className="flex-1 p-3 bg-transparent border-0 outline-none font-mono text-sm leading-relaxed resize-none overflow-y-scroll overflow-x-auto whitespace-pre break-normal appearance-none text-gray-800 placeholder-gray-400 dark:text-[#e0e0e0] dark:placeholder-[#555] disabled:opacity-60 disabled:cursor-not-allowed focus:outline-none"
           value={value}
           onChange={handleChange}
           onKeyDown={handleKeyDown}

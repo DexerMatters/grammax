@@ -5,41 +5,39 @@
   padding: 0;
 }
 
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: filter 300ms;
+body {
+  background-color: rgb(var(--color-bg-base));
+  color: rgb(var(--color-text-muted));
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
-.logo:hover {
-  filter: drop-shadow(0 0 2em #646cffaa);
+/* Scrollbar styling for better theming */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
 }
 
-.logo.react:hover {
-  filter: drop-shadow(0 0 2em #61dafbaa);
+::-webkit-scrollbar-track {
+  background: rgb(var(--color-bg-darker) / 0.3);
 }
 
-@keyframes logo-spin {
-  from {
-    transform: rotate(0deg);
-  }
-
-  to {
-    transform: rotate(360deg);
-  }
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--color-branch-border-light));
+  border-radius: 4px;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  a:nth-of-type(2) .logo {
-    animation: logo-spin infinite 20s linear;
-  }
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--color-branch-border));
 }
 
-.card {
-  padding: 2em;
+/* Firefox scrollbar */
+* {
+  scrollbar-color: rgb(var(--color-branch-border-light)) rgb(var(--color-bg-darker) / 0.3);
+  scrollbar-width: thin;
 }
 
-.read-the-docs {
-  color: #888;
+/* Smooth selection colors */
+::selection {
+  background-color: rgb(var(--color-branch) / 0.3);
+  color: inherit;
 }

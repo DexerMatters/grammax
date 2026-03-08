@@ -1,16 +1,20 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import Editor from './components/Editor';
 import { TreeViewer, useTreeReducer } from './components/Tree';
+import { SettingsDialog } from './components/SettingsDialog';
+import { useTheme } from './context/ThemeContext';
 import { diffToActions, mergeAdjacentActions } from './utils/diffToActions';
 import { submitAction, getSource, getTree, fetchRuleInfos, fetchTerminalInfos } from './Fetch';
 import type { RuleInfo, TerminalInfo } from './Fetch';
-import './App.css'
+import './App.css';
 
 function App() {
   const [code, setCode] = useState('');
   const [tree, applyBatch] = useTreeReducer(null);
   const [rules, setRules] = useState<Map<number, RuleInfo>>(new Map());
   const [terminals, setTerminals] = useState<Map<number, TerminalInfo>>(new Map());
+  const [showSettings, setShowSettings] = useState(false);
+  const { config } = useTheme();
   const prevCodeRef = useRef('');
   const submitQueueRef = useRef<Promise<void>>(Promise.resolve());
 
@@ -91,23 +95,40 @@ function App() {
   }, [applyCodeChange, recoverFromBackend]);
 
   return (
-    <div className="flex w-full h-screen bg-[#1a1a1a]">
-      {/* Editor (Left Half) */}
-      <div className="w-1/2 h-full p-4 border-r border-[#333]">
-        <Editor
-          value={code}
-          onChange={handleCodeChange}
-          placeholder="// Write your code here..."
-          language="javascript"
-        />
+    <div className="flex h-screen w-full flex-col overflow-hidden bg-bg-darker dark:border-white/10 text-text-muted">
+      {/* Header */}
+      <div className="flex w-full shrink-0 items-center justify-between px-5 py-4">
+        <h1 className="text-2xl font-semibold text-branch">Grammax Parser</h1>
+        <button
+          onClick={() => setShowSettings(true)}
+          className="rounded-lg border border-zinc-300/70 px-3 py-1.5 text-sm font-medium text-text-muted transition-colors hover:bg-bg-base-hover dark:border-white/10"
+        >
+          Settings
+        </button>
       </div>
 
-      {/* Parse Tree Viewer (Right Half) */}
-      <div className="w-1/2 h-full p-4 border-l border-[#333] flex flex-col bg-[#1e1e1e] overflow-hidden">
-        <div className="flex-1 overflow-y-auto">
-          <TreeViewer tree={tree} rules={rules} terminals={terminals} />
+      {/* Main Content */}
+      <div className="flex min-h-0 w-full flex-1 gap-4 p-4 rounded-t-3xl bg-bg-base">
+        {/* Editor (Left Half) */}
+        <div className="h-full w-1/2 min-h-0">
+          <Editor
+            value={code}
+            onChange={handleCodeChange}
+            placeholder="// Write your code here..."
+            language="javascript"
+          />
+        </div>
+
+        {/* Parse Tree Viewer (Right Half) */}
+        <div className="flex h-full w-1/2 min-h-0 flex-col">
+          <div className="flex-1 overflow-y-auto rounded-2xl border border-zinc-300/60 bg-bg-base p-4 dark:border-white/10">
+            <TreeViewer tree={tree} rules={rules} terminals={terminals} foldRelayNodes={config.foldRelayNodes} />
+          </div>
         </div>
       </div>
+
+      {/* Settings Dialog */}
+      <SettingsDialog isOpen={showSettings} onClose={() => setShowSettings(false)} />
     </div>
   )
 }

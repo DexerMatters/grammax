@@ -19,9 +19,9 @@ use crate::{
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CandidateScore {
     /// Error count outside the edit region (prioritized over inside errors).
-    errors_outside: usize,
+    pub(crate) errors_outside: usize,
     /// Error count inside the edit region.
-    errors_inside: usize,
+    pub(crate) errors_inside: usize,
     /// Zipper level wrapped in Reverse: deeper zippers (higher level) sort lower,
     /// naturally preferring narrow reparses over shallow ones.
     level: std::cmp::Reverse<usize>,
@@ -296,7 +296,7 @@ fn evaluate_candidate(
     })
 }
 
-fn count_errors(messages: &ParserMessages, edit_span: Span) -> (usize, usize) {
+pub(crate) fn count_errors(messages: &ParserMessages, edit_span: Span) -> (usize, usize) {
     let mut inside = 0usize;
     let mut outside = 0usize;
 

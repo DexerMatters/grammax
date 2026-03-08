@@ -375,6 +375,17 @@ impl Parser {
                     }
                 }
 
+                if let Some(boundary_term) = self.current_recovery_boundary(&open_scope_stack) {
+                    if self.try_insert_missing_before_boundary(
+                        &self.grammar.analysis,
+                        boundary_term,
+                        &mut state_stack,
+                        &mut node_stack,
+                    ) {
+                        continue;
+                    }
+                }
+
                 // CPCT+ error recovery: find minimum cost repair sequences and apply the first.
                 let repairs = recover(
                     &self.grammar.analysis,
@@ -1079,12 +1090,34 @@ impl Parser {
         state_stack: &mut Vec<usize>,
         node_stack: &mut Vec<StackEntry>,
     ) -> bool {
+        let analysis = Arc::clone(&self.grammar.analysis);
+        self.apply_terminal_with_analysis(
+            term,
+            len,
+            token_node,
+            consume_input,
+            state_stack,
+            node_stack,
+            analysis.as_ref(),
+        )
+    }
+
+    fn apply_terminal_with_analysis(
+        &mut self,
+        term: usize,
+        len: usize,
+        token_node: GreenId,
+        consume_input: bool,
+        state_stack: &mut Vec<usize>,
+        node_stack: &mut Vec<StackEntry>,
+        analysis: &GrammarStateAnalysis,
+    ) -> bool {
         loop {
             let current_state_idx = *state_stack.last().unwrap();
-            let action = {
-                let current_state = &self.grammar.analysis.states[current_state_idx];
-                current_state.actions.get(&term).cloned()
-            };
+            let action = analysis.states[current_state_idx]
+                .actions
+                .get(&term)
+                .cloned();
 
             match action {
                 Some(Action::Shift(next_state)) => {
@@ -1102,7 +1135,12 @@ impl Parser {
                     return true;
                 }
                 Some(Action::Reduce(prod_idx)) => {
-                    if !self.perform_reduce(prod_idx, state_stack, node_stack) {
+                    if !self.perform_reduce_with_analysis(
+                        prod_idx,
+                        state_stack,
+                        node_stack,
+                        analysis,
+                    ) {
                         return false;
                     }
                 }
@@ -1457,6 +1495,121 @@ impl Parser {
             .copied()
             .filter(|id| !exclude_eof || *id != EOF_TOKEN)
             .collect()
+    }
+
+    fn current_recovery_boundary(&self, open_scope_stack: &[OpenScopeToken]) -> Option<usize> {
+        let rest = self.text.get(self.pos..)?;
+
+        let mut candidates = self.grammar.recovery_delimiters.clone();
+        for open in open_scope_stack.iter().rev() {
+            if let Some(close) = self
+                .grammar
+                .bridge_specs
+                .iter()
+                .find(|bridge| bridge.open == open.term_idx)
+                .map(|bridge| bridge.close)
+            {
+                if !candidates.contains(&close) {
+                    candidates.push(close);
+                }
+            }
+        }
+
+        candidates.into_iter().find(|&term_ix| {
+            self.grammar
+                .table
+                .terminals
+                .get(term_ix)
+                .and_then(|m| m.preview())
+                .is_some_and(|preview| rest.starts_with(preview))
+        })
+    }
+
+    fn try_insert_missing_before_boundary(
+        &mut self,
+        analysis: &GrammarStateAnalysis,
+        boundary_term: usize,
+        state_stack: &mut Vec<usize>,
+        node_stack: &mut Vec<StackEntry>,
+    ) -> bool {
+        let current_state_idx = *state_stack.last().unwrap();
+        let mut expected = self.expected_ids_for_analysis(analysis, current_state_idx, true);
+        if expected.is_empty() {
+            return false;
+        }
+
+        expected.sort_by_key(|term_ix| {
+            let preview = self
+                .grammar
+                .table
+                .terminals
+                .get(*term_ix)
+                .and_then(|m| m.preview());
+            (
+                preview.is_some(),
+                preview.map(str::len).unwrap_or(0),
+                *term_ix,
+            )
+        });
+
+        let chosen = expected.into_iter().find(|&candidate| {
+            let mut sim_state_stack = state_stack.clone();
+            let mut sim_node_stack = node_stack.clone();
+            let missing = self.alloc.alloc(
+                Tag::new_error(ParsecError::MissingToken {
+                    expected: vec![candidate],
+                }),
+                vec![],
+                0,
+            );
+            if !self.apply_terminal_with_analysis(
+                candidate,
+                0,
+                missing,
+                false,
+                &mut sim_state_stack,
+                &mut sim_node_stack,
+                analysis,
+            ) {
+                return false;
+            }
+
+            let boundary = self.alloc.alloc_token(Tag::new_token(boundary_term), 0);
+            self.apply_terminal_with_analysis(
+                boundary_term,
+                0,
+                boundary,
+                false,
+                &mut sim_state_stack,
+                &mut sim_node_stack,
+                analysis,
+            )
+        });
+
+        let Some(chosen) = chosen else {
+            return false;
+        };
+
+        self.messages.push(ParserMessage::new_missing(
+            Span::new(self.pos, self.pos),
+            vec![chosen],
+        ));
+        let missing = self.alloc.alloc(
+            Tag::new_error(ParsecError::MissingToken {
+                expected: vec![chosen],
+            }),
+            vec![],
+            0,
+        );
+        self.apply_terminal_with_analysis(
+            chosen,
+            0,
+            missing,
+            false,
+            state_stack,
+            node_stack,
+            analysis,
+        )
     }
 
     fn push_unexpected_trimmed(&mut self, start: usize, end: usize, expected: Vec<usize>) {

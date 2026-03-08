@@ -320,7 +320,7 @@ function FoldedNodeGroup({
 
   return (
     <div
-      className={`flex items-center shrink-0 min-w-0 ${onClick ? 'cursor-pointer' : ''}`}
+      className={`flex items-center shrink-0 min-w-0 h-6 ${onClick ? 'cursor-pointer' : ''}`}
       onClick={onClick}
       style={{ display: 'flex', alignItems: 'center' }}
     >
@@ -405,6 +405,10 @@ const InternalNodeDisplay: React.FC<InternalNodeDisplayProps> = ({
   const ruleName = rules.get(node.ruleIx)?.name || `rule_${node.ruleIx}`;
   const hasChildren = node.children.length > 0;
 
+  // When headerNodes is provided (relay chain), use the first node for field detection
+  const fieldNode = headerNodes?.[0] || node;
+  const fieldValue = fieldNode.type === 'node' ? fieldNode.field : null;
+
   return (
     <div className="select-none inline-flex flex-row items-stretch">
       <div className="flex flex-col">
@@ -471,11 +475,25 @@ const InternalNodeDisplay: React.FC<InternalNodeDisplayProps> = ({
                           headerNodes={[...relayChain, terminalNode]}
                         />
                       ) : relayChain.length > 0 ? (
-                        <FoldedNodeGroup
-                          nodes={[...relayChain, terminalNode]}
-                          rules={rules}
-                          terminals={terminals}
-                        />
+                        <div className="inline-flex flex-row items-stretch">
+                          <FoldedNodeGroup
+                            nodes={[...relayChain, terminalNode]}
+                            rules={rules}
+                            terminals={terminals}
+                          />
+                          {relayChain[0].type === 'node' && relayChain[0].field && (
+                            <div className="ml-1 flex items-stretch self-stretch shrink-0">
+                              <div className="flex items-start px-1 text-field text-sm font-mono font-bold">
+                                &lt;
+                              </div>
+                              <div className="self-center flex items-center justify-center px-1 py-0.5 border-2 border-field-border rounded bg-transparent">
+                                <span className="text-field text-xs font-mono font-bold">
+                                  {relayChain[0].field}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
                       ) : (
                         <TreeNodeDisplay
                           node={terminalNode}
@@ -493,12 +511,12 @@ const InternalNodeDisplay: React.FC<InternalNodeDisplayProps> = ({
         )}
       </div>
 
-      {node.field && (
+      {fieldValue && (
         <div className="ml-1 flex items-stretch self-stretch shrink-0">
           <div className="w-1.5 self-stretch border-r-2 border-t-2 border-b-2 border-field-border rounded-tr-lg rounded-br-lg" />
-          <div className="self-center flex items-center justify-center px-1 py-2 border-2 border-l-0 border-field-border rounded-r-lg bg-transparent">
-            <span className="text-field text-xs font-mono font-bold [writing-mode:vertical-rl] [text-orientation:mixed]">
-              {node.field}
+          <div className="self-center flex items-center justify-center px-1 py-1 border-2 border-l-0 border-field-border rounded-r-lg bg-transparent">
+            <span className="text-field text-xs font-mono font-bold">
+              {fieldValue}
             </span>
           </div>
         </div>

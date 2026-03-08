@@ -104,7 +104,9 @@ fn test_json() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = r#"{"key": 42, "arr": [true, false, null]}"#;
+    let text = r#"{
+"a": [1, s, 22]
+}"#;
     let result = parser.parse_text(text);
 
     let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());

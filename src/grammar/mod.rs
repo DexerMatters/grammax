@@ -3,6 +3,7 @@ pub(crate) mod bridge;
 pub(crate) mod cache;
 pub mod display;
 pub mod dsl;
+pub mod edsl;
 pub(crate) mod ir;
 pub(crate) mod norm;
 pub(crate) mod recovery;
@@ -28,7 +29,7 @@ fn grammar_cache() -> &'static Mutex<FxHashMap<u64, &'static Grammar>> {
 #[macro_export]
 macro_rules! r {
     ($fn:ident) => {
-        $crate::grammar::dsl::r($fn, stringify!($fn))
+        $crate::grammar::edsl::r($fn, stringify!($fn))
     };
 }
 
@@ -74,7 +75,7 @@ macro_rules! new_grammar {
 	($start: ident where $($name: ident -> $node: expr)*) => {
 		{
 			#[allow(unused_imports)]
-			use $crate::{grammar::dsl::*, r};
+			use $crate::{grammar::edsl::*, r};
 			$(fn $name() -> GrammarNode { $node })*
 			$crate::grammar::Grammar::new($start(), stringify!($start))
 		}
@@ -95,6 +96,9 @@ pub struct Grammar {
     /// Delimiter terminals (e.g. `,`, `;`, `:`) derived at grammar-analysis time.
     /// Scope recovery may stop at these terminals to resume parsing earlier.
     pub(crate) recovery_delimiters: Vec<usize>,
+    /// Terminals with matching delimiters on both ends (e.g., strings with `"` on both sides).
+    /// Used to skip these terminals during string parsing context in recovery.
+    pub(crate) bracketed_terminals: Vec<usize>,
 }
 
 impl Grammar {
@@ -102,7 +106,7 @@ impl Grammar {
     ///
     /// The grammar is cached and returned as a static reference. If it has not changed since
     /// the last time it was created, it will be loaded from the cache instead of being reprocessed.
-    pub fn new(node: dsl::GrammarNode, start_rule: &'static str) -> &'static Self {
+    pub fn new(node: edsl::GrammarNode, start_rule: &'static str) -> &'static Self {
         let cache_key = Self::cache_key_from_dsl(&node, start_rule);
 
         let cache = grammar_cache().lock().unwrap();
@@ -126,7 +130,7 @@ impl Grammar {
     }
 
     /// Create a new grammar without using the cache.
-    pub fn new_uncached(node: dsl::GrammarNode, start_rule: &'static str) -> &'static Self {
+    pub fn new_uncached(node: edsl::GrammarNode, start_rule: &'static str) -> &'static Self {
         let table = norm::RuleTable::normalize(node, start_rule);
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
@@ -135,6 +139,7 @@ impl Grammar {
         let rule_analyses = Self::build_rule_analyses(&table);
         let bridge_specs = bridge::derive_bridge_specs(&table);
         let recovery_delimiters = bridge::derive_recovery_delimiters(&table);
+        let bracketed_terminals = bridge::derive_bracketed_terminals(&table);
 
         let grammar = Self {
             table,
@@ -142,6 +147,42 @@ impl Grammar {
             rule_analyses,
             bridge_specs,
             recovery_delimiters,
+            bracketed_terminals,
+        };
+
+        Box::leak(Box::new(grammar))
+    }
+
+    pub(crate) fn new_with_registry(
+        node: edsl::GrammarNode,
+        start_rule: &'static str,
+        registry: edsl::GrammarRegistry,
+    ) -> &'static Self {
+        Self::new_uncached_with_registry(node, start_rule, registry)
+    }
+
+    pub(crate) fn new_uncached_with_registry(
+        node: edsl::GrammarNode,
+        start_rule: &'static str,
+        registry: edsl::GrammarRegistry,
+    ) -> &'static Self {
+        let table = norm::RuleTable::normalize_with_registry(node, start_rule, Some(registry));
+        let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
+            &table,
+            table.start_rule,
+        ));
+        let rule_analyses = Self::build_rule_analyses(&table);
+        let bridge_specs = bridge::derive_bridge_specs(&table);
+        let recovery_delimiters = bridge::derive_recovery_delimiters(&table);
+        let bracketed_terminals = bridge::derive_bracketed_terminals(&table);
+
+        let grammar = Self {
+            table,
+            analysis,
+            rule_analyses,
+            bridge_specs,
+            recovery_delimiters,
+            bracketed_terminals,
         };
 
         Box::leak(Box::new(grammar))
@@ -181,7 +222,7 @@ impl Grammar {
         map
     }
 
-    fn cache_key_from_dsl(node: &dsl::GrammarNode, start_rule: &'static str) -> u64 {
+    fn cache_key_from_dsl(node: &edsl::GrammarNode, start_rule: &'static str) -> u64 {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         start_rule.hash(&mut hasher);
         Self::hash_dsl_node(node, &mut hasher);
@@ -190,10 +231,10 @@ impl Grammar {
     }
 
     fn hash_dsl_node(
-        node: &dsl::GrammarNode,
+        node: &edsl::GrammarNode,
         hasher: &mut std::collections::hash_map::DefaultHasher,
     ) {
-        use dsl::GrammarNode;
+        use edsl::GrammarNode;
 
         match node {
             GrammarNode::Terminal(matcher) => {
@@ -219,6 +260,10 @@ impl Grammar {
             }
             GrammarNode::Reference(_, name) => {
                 3u8.hash(hasher);
+                name.hash(hasher);
+            }
+            GrammarNode::UnboundReference(name) => {
+                8u8.hash(hasher);
                 name.hash(hasher);
             }
             GrammarNode::Field(name, inner) => {

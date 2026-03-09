@@ -106,13 +106,107 @@ pub const ALPHANUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>
         Repeat(|c: char| c.is_ascii_alphanumeric() || c == '_', 1..),
     );
 
-const fn string_char(c: char) -> bool {
-    c != '"' && c != '\n' && c != '\r'
+/// A matcher for identifiers accepted by most programming languages.
+/// Starts with a letter or underscore, followed by letters, digits, or underscores.
+#[derive(Debug, Clone, Copy)]
+pub struct IdentMatcher;
+
+impl Matcher for IdentMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+
+        // First character must be letter or underscore
+        if let Some(first_char) = input[*pos..].chars().next() {
+            if !first_char.is_ascii_alphabetic() && first_char != '_' {
+                return None;
+            }
+            *pos += first_char.len_utf8();
+        } else {
+            return None;
+        }
+
+        // Additional characters can be alphanumeric or underscore
+        while *pos < input.len() {
+            if let Some(c) = input[*pos..].chars().next() {
+                if c.is_ascii_alphanumeric() || c == '_' {
+                    *pos += c.len_utf8();
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Some(*pos - start)
+    }
+
+    fn display(&self) -> String {
+        String::from("identifier")
+    }
+
+    fn is_nullable(&self) -> bool {
+        false
+    }
+
+    fn is_consuming(&self) -> bool {
+        true
+    }
 }
 
-/// A predefined matcher that matches a JSON string literal, which is a sequence of characters enclosed in double quotes, excluding unescaped double quotes and newlines.
-pub const STRING: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
-    NamedMatcher::new("json_string", Repeat(string_char, 0..));
+/// A predefined matcher that matches identifiers accepted by most programming languages.
+/// Identifiers must start with a letter or underscore, followed by zero or more letters, digits, or underscores.
+pub const IDENT: NamedMatcher<IdentMatcher> = NamedMatcher::new("ident", IdentMatcher);
+
+/// A matcher for string content that handles escape sequences (e.g., \n, \t, \\, \").
+/// Matches a sequence where each character is either:
+/// - A regular character (not ", \, newline)
+/// - An escape sequence starting with \ followed by any character
+#[derive(Debug, Clone, Copy)]
+pub struct StringMatcher;
+
+impl Matcher for StringMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        while *pos < input.len() {
+            if let Some(c) = input[*pos..].chars().next() {
+                match c {
+                    '"' | '\n' | '\r' => break,
+                    '\\' => {
+                        // Skip escape character
+                        *pos += '\\'.len_utf8();
+                        // Skip the escaped character
+                        if *pos < input.len() {
+                            if let Some(escaped_char) = input[*pos..].chars().next() {
+                                *pos += escaped_char.len_utf8();
+                            }
+                        }
+                    }
+                    _ => {
+                        *pos += c.len_utf8();
+                    }
+                }
+            }
+        }
+        Some(*pos - start)
+    }
+
+    fn display(&self) -> String {
+        String::from("string_content")
+    }
+
+    fn is_nullable(&self) -> bool {
+        true
+    }
+
+    fn is_consuming(&self) -> bool {
+        false
+    }
+}
+
+/// A predefined matcher that matches string content with support for escape sequences.
+/// Matches characters in a string literal, including escaped sequences like \n, \t, \\, \", etc.
+pub const STRING: NamedMatcher<StringMatcher> = NamedMatcher::new("string", StringMatcher);
 
 /// A predefined matcher that matches a sequence of whitespace characters, which can be used to skip irrelevant spaces in the input.
 pub const WHITESPACES: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =

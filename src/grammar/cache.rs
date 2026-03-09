@@ -44,7 +44,7 @@ pub(crate) mod serde_fxhashmap {
     }
 }
 
-const CACHE_FORMAT_VERSION: u32 = 4;
+const CACHE_FORMAT_VERSION: u32 = 6;
 
 static CACHE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
@@ -106,6 +106,9 @@ struct GrammarCacheFile {
     bridge_specs: Vec<bridge::BridgeSpec>,
     /// Delimiter terminals used as stop points by scope recovery.
     recovery_delimiters: Vec<usize>,
+    /// Terminals with matching delimiters on both ends (e.g., strings, comments).
+    /// Stored as terminal indices that have the same delimiter opening and closing.
+    bracketed_terminals: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -172,6 +175,7 @@ pub(crate) fn load(cache_key: u64) -> Option<Grammar> {
             .collect(),
         bridge_specs: cache.bridge_specs,
         recovery_delimiters: cache.recovery_delimiters,
+        bracketed_terminals: cache.bracketed_terminals,
     })
 }
 
@@ -197,6 +201,7 @@ pub(crate) fn store(cache_key: u64, grammar: &Grammar) -> io::Result<()> {
             .collect(),
         bridge_specs: grammar.bridge_specs.clone(),
         recovery_delimiters: grammar.recovery_delimiters.clone(),
+        bracketed_terminals: grammar.bracketed_terminals.clone(),
     };
 
     let bytes = bincode::serialize(&cache)
@@ -386,9 +391,8 @@ fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
     }
 
     match display.as_str() {
-        "number" | "identifier" | "alphanum" | "json_string" | "whitespaces" => {
-            Some(CachedTerminal::Named(display))
-        }
+        "number" | "identifier" | "alphanum" | "string" | "ident" | "json_string"
+        | "whitespaces" => Some(CachedTerminal::Named(display)),
         _ => None,
     }
 }
@@ -402,7 +406,9 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
             "number" => Ok(Arc::new(words::NUMS)),
             "identifier" => Ok(Arc::new(words::ALPHAS)),
             "alphanum" => Ok(Arc::new(words::ALPHANUMS)),
-            "json_string" => Ok(Arc::new(words::STRING)),
+            "string" => Ok(Arc::new(words::STRING)),
+            "ident" => Ok(Arc::new(words::IDENT)),
+            "json_string" => Ok(Arc::new(words::STRING)), // Backward compatibility
             "whitespaces" => Ok(Arc::new(words::WHITESPACES)),
             _ => Err(format!("unsupported named matcher in cache: {}", name)),
         },
@@ -445,6 +451,7 @@ pub(crate) fn serialize_grammar_file(grammar: &Grammar) -> Result<Vec<u8>, io::E
             .collect(),
         bridge_specs: grammar.bridge_specs.clone(),
         recovery_delimiters: grammar.recovery_delimiters.clone(),
+        bracketed_terminals: grammar.bracketed_terminals.clone(),
     };
 
     bincode::serialize(&file)
@@ -468,6 +475,7 @@ pub(crate) fn deserialize_grammar_file(bytes: &[u8]) -> Result<Grammar, io::Erro
             .collect(),
         bridge_specs: cache.bridge_specs,
         recovery_delimiters: cache.recovery_delimiters,
+        bracketed_terminals: cache.bracketed_terminals,
     })
 }
 

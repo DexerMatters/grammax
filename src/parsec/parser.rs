@@ -102,7 +102,8 @@ pub struct Parser {
 }
 
 impl Parser {
-    pub fn new(grammar: &'static Grammar) -> Self {
+    pub fn new(grammar: impl Into<&'static Grammar>) -> Self {
+        let grammar = grammar.into();
         Self {
             grammar,
             alloc: TreeAllocRef::create(),
@@ -391,6 +392,7 @@ impl Parser {
                     &self.grammar.analysis,
                     &self.grammar.table.productions,
                     &self.grammar.table.terminals,
+                    &self.grammar.bracketed_terminals,
                     &self.text,
                     self.pos,
                     &state_stack,
@@ -832,7 +834,7 @@ impl Parser {
         let mut best_match: Option<(usize, usize)> = None;
 
         let mut consider = |idx: usize, matcher: &crate::parsec::words::MatcherRef| {
-            if self.is_json_string_terminal(idx) && !self.string_opened {
+            if self.is_bracketed_terminal(idx) && !self.string_opened {
                 return;
             }
             let mut probe = self.pos;
@@ -917,7 +919,7 @@ impl Parser {
             return false;
         }
         for (idx, matcher) in self.grammar.table.terminals.iter().enumerate() {
-            if self.is_json_string_terminal(idx) && !self.string_opened {
+            if self.is_bracketed_terminal(idx) && !self.string_opened {
                 continue;
             }
             let mut probe = pos;
@@ -952,7 +954,7 @@ impl Parser {
                     // (EOF / trailing whitespace) for truncated-input completion.
                     let at_boundary =
                         self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty();
-                    if self.is_json_string_terminal(term_ix) && !at_boundary {
+                    if self.is_bracketed_terminal(term_ix) && !at_boundary {
                         return false;
                     }
                     // If the terminal actually matches at the current position
@@ -1648,12 +1650,7 @@ impl Parser {
             .is_some_and(|preview| preview == "\"")
     }
 
-    fn is_json_string_terminal(&self, term_ix: usize) -> bool {
-        self.grammar
-            .table
-            .terminals
-            .get(term_ix)
-            .map(|m| m.display().contains("json_string"))
-            .unwrap_or(false)
+    fn is_bracketed_terminal(&self, term_ix: usize) -> bool {
+        self.grammar.bracketed_terminals.contains(&term_ix)
     }
 }

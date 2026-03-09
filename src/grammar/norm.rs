@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 
-use crate::grammar::dsl::GrammarNode;
+use crate::grammar::edsl::{GrammarNode, GrammarRegistry};
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::parsec::words::MatcherRef;
 
@@ -17,7 +17,19 @@ pub struct RuleTable {
 impl RuleTable {
     /// Normalizes a grammar from DSL representation
     pub fn normalize(start: GrammarNode, start_name: &'static str) -> Self {
+        Self::normalize_with_registry(start, start_name, None)
+    }
+
+    /// Normalizes a grammar with optional unbound reference registry
+    pub fn normalize_with_registry(
+        start: GrammarNode,
+        start_name: &'static str,
+        registry: Option<GrammarRegistry>,
+    ) -> Self {
         let mut normalizer = Normalizer::new();
+        if let Some(reg) = registry {
+            normalizer = normalizer.with_registry(reg);
+        }
 
         // Phase 1: Discover all rules and desugar
         let user_start_ix = normalizer.discover_rule(start, start_name);
@@ -277,6 +289,7 @@ struct Normalizer {
     rules: Vec<RuleInfo>,
     rule_map: FxHashMap<String, usize>, // name -> index
     pending_drops: FxHashMap<(usize, usize), usize>, // (target_rule_ix, drop_count) -> helper_rule_ix
+    registry: Option<GrammarRegistry>,               // For resolving UnboundReference nodes
 }
 
 impl Normalizer {
@@ -285,7 +298,13 @@ impl Normalizer {
             rules: Vec::new(),
             rule_map: FxHashMap::default(),
             pending_drops: FxHashMap::default(),
+            registry: None,
         }
+    }
+
+    fn with_registry(mut self, registry: GrammarRegistry) -> Self {
+        self.registry = Some(registry);
+        self
     }
 
     /// Discovers all rules recursively from the start rule
@@ -336,6 +355,21 @@ impl Normalizer {
                 let rule_node = f();
                 let ix = self.discover_rule(rule_node, name);
                 NormalizedNode::Reference(ix)
+            }
+
+            GrammarNode::UnboundReference(name) => {
+                // Resolve from registry
+                if let Some(registry) = &self.registry {
+                    if let Some(rule_node) = registry.get(&name) {
+                        let name_leaked = name.leak();
+                        let ix = self.discover_rule(rule_node.clone(), name_leaked);
+                        NormalizedNode::Reference(ix)
+                    } else {
+                        panic!("UnboundReference '{}' not found in registry", name);
+                    }
+                } else {
+                    panic!("UnboundReference '{}' requires a GrammarRegistry", name);
+                }
             }
 
             GrammarNode::Field(name, inner) => {

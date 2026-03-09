@@ -112,6 +112,20 @@ impl Tag {
     pub fn is_error(&self) -> bool {
         matches!(self, Tag::Error(_))
     }
+    pub fn rule_ix(&self) -> Option<usize> {
+        match self {
+            Tag::Rule { rule_ix, .. } => Some(*rule_ix),
+            Tag::Token { rule_ix } => Some(*rule_ix),
+            Tag::Field { rule_ix, .. } => Some(*rule_ix),
+            Tag::Error(_) => None,
+        }
+    }
+    pub fn unwrap_error(&self) -> &ParsecError {
+        match self {
+            Tag::Error(err) => err,
+            _ => panic!("Expected an error tag, got: {:?}", self),
+        }
+    }
 }
 
 /// Red nodes are the nodes in the "red" syntax tree,

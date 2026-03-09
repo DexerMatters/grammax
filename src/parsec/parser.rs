@@ -6,11 +6,13 @@ use crate::grammar::Grammar;
 use crate::grammar::analysis::{Action, EOF_TOKEN, GrammarStateAnalysis};
 use crate::grammar::ir::Symbol;
 use crate::grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs};
+use crate::parsec::display::{format_ast, format_messages};
 use crate::parsec::msg::{ParserMessage, ParserMessages};
 use crate::parsec::recovery::{
     OpenScopeToken, RecoveryCache, RecoveryConfig, RepairOp, ScopeStop, recover, scope_recover,
 };
 use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
+use crate::parsec::view::View;
 use crate::runtime;
 use crate::utils::{LruCache, Span};
 
@@ -43,10 +45,27 @@ pub struct ParserListener {
     // Callbacks
 }
 
-pub struct Result {
+pub struct Result<'a> {
+    alloc: TreeAllocRef,
+    grammar: &'static Grammar,
+    source: &'a str,
     pub root: RedNode,
     pub messages: ParserMessages,
     pub semantic_commands: Vec<runtime::Command>,
+}
+
+impl<'a> Result<'a> {
+    pub fn format_messages(&self) -> String {
+        format_messages(&self.grammar, &self.messages)
+    }
+
+    pub fn format_ast(&self) -> String {
+        format_ast(&self.grammar, &self.root, &self.alloc, self.source)
+    }
+
+    pub fn view(self) -> View<'a> {
+        View::new(self.grammar, self.alloc, self.source, self.root.green, 0)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -139,7 +158,7 @@ impl Parser {
         &self.text
     }
 
-    pub fn recovery_specs(&mut self) -> Option<&RecoverySpecs> {
+    pub(crate) fn recovery_specs(&mut self) -> Option<&RecoverySpecs> {
         if self.recovery_specs_cache.is_none() {
             let strategy = self.build_recovery_strategy();
             self.recovery_specs_cache =
@@ -148,28 +167,33 @@ impl Parser {
         self.recovery_specs_cache.as_ref()
     }
 
-    pub fn recovery_strategy(&mut self) -> Option<&ErrorRecoveryStrategy> {
+    pub(crate) fn recovery_strategy(&mut self) -> Option<&ErrorRecoveryStrategy> {
         self.recovery_specs().map(|specs| &specs.strategy)
     }
 
-    pub fn newly_computed_nodes(&self) -> Vec<Span> {
+    pub(crate) fn newly_computed_nodes(&self) -> Vec<Span> {
         self.newly_computed_nodes.clone()
     }
 
-    pub fn newly_computed_tokens(&self) -> Vec<Span> {
+    pub(crate) fn newly_computed_tokens(&self) -> Vec<Span> {
         self.newly_computed_tokens.clone()
     }
 
-    pub fn set_insert_pos(&mut self, pos: Option<usize>) {
+    pub(crate) fn set_insert_pos(&mut self, pos: Option<usize>) {
         self.inc_insert_pos = pos;
     }
 
-    pub fn set_text(&mut self, text: &str) {
+    pub(crate) fn set_text(&mut self, text: &str) {
         self.text = text.to_string();
         self.recovery_specs_cache = None;
     }
 
-    pub fn configure_reuse(&mut self, enabled: bool, cache_capacity: usize, cache_failures: bool) {
+    pub(crate) fn configure_reuse(
+        &mut self,
+        enabled: bool,
+        cache_capacity: usize,
+        cache_failures: bool,
+    ) {
         self.reuse_enabled = enabled;
         self.reuse_cache_failures = cache_failures;
 
@@ -179,19 +203,19 @@ impl Parser {
         }
     }
 
-    pub fn clear_reuse_cache(&mut self) {
+    pub(crate) fn clear_reuse_cache(&mut self) {
         self.reuse_cache.clear();
     }
 
-    pub fn reset_reuse_stats(&mut self) {
+    pub(crate) fn reset_reuse_stats(&mut self) {
         self.reuse_stats = IncrementalReuseStats::default();
     }
 
-    pub fn reuse_stats(&self) -> IncrementalReuseStats {
+    fn reuse_stats(&self) -> IncrementalReuseStats {
         self.reuse_stats
     }
 
-    pub fn parse_text(&mut self, text: &str) -> Result {
+    pub fn parse_text<'a>(&'a mut self, text: &'a str) -> Result<'a> {
         self.text = text.to_string();
         self.recovery_specs_cache = None;
         self.pos = 0;
@@ -438,6 +462,9 @@ impl Parser {
         self.prime_reuse_from_tree(root_green, 0);
 
         Result {
+            source: &self.text,
+            grammar: self.grammar,
+            alloc: self.alloc.clone(),
             root: RedNode::root(root_green),
             messages: self.messages.clone(),
             semantic_commands: Vec::new(),

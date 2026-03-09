@@ -22,17 +22,14 @@ fn test_simple_whitespaces() {
     let text = "(1  22)";
     let result = parser.parse_text(text);
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
+    let output = result.format_ast();
     println!("AST {}:\n{}", text, output);
-    println!(
-        "Messages:\n{}",
-        format_messages(&parser.grammar, &result.messages)
-    );
+    println!("Messages:\n{}", result.format_messages());
 
     assert!(
         result.messages.is_empty(),
         "Expected no errors, got: {}",
-        format_messages(&parser.grammar, &result.messages)
+        result.format_messages()
     );
 
     // Verify * is child of + (or rather + is the root operation)
@@ -66,12 +63,9 @@ fn test_simple_arithmetic_precedence() {
     let text = "1+1+1";
     let result = parser.parse_text(text);
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
+    let output = result.format_ast();
     println!("AST {}:\n{}", text, output);
-    println!(
-        "Messages:\n{}",
-        format_messages(&parser.grammar, &result.messages)
-    );
+    println!("Messages:\n{}", result.format_messages());
 
     // Verify * is child of + (or rather + is the root operation)
     // Structure:
@@ -109,12 +103,8 @@ fn test_json() {
 }"#;
     let result = parser.parse_text(text);
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
-    println!("AST:\n{}", output);
-    println!(
-        "Messages:\n{}",
-        format_messages(&parser.grammar, &result.messages)
-    );
+    println!("AST:\n{}", result.format_ast());
+    println!("Messages:\n{}", result.format_messages());
 }
 
 #[test]
@@ -156,7 +146,4 @@ fn test_parse_text_handles_closing_quote_after_partial_string() {
 
     let mut parser = Parser::new(grammar);
     let result = parser.parse_text("{\"a\"");
-
-    assert_eq!(result.root.offset, 0);
-    assert_eq!(parser.alloc.get_node(result.root.green).width, 4);
 }

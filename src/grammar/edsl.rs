@@ -190,7 +190,7 @@ impl ops::BitOr for GrammarNode {
 
 #[derive(Clone, Debug)]
 pub(crate) struct GrammarRegistry {
-    rules: FxHashMap<String, GrammarNode>,
+    rules: FxHashMap<&'static str, GrammarNode>,
 }
 
 impl GrammarRegistry {
@@ -202,7 +202,7 @@ impl GrammarRegistry {
     }
 
     /// Create a registry from a HashMap of rules
-    pub fn from_map(rules: FxHashMap<String, GrammarNode>) -> Self {
+    pub fn from_map(rules: FxHashMap<&'static str, GrammarNode>) -> Self {
         GrammarRegistry { rules }
     }
 
@@ -217,8 +217,8 @@ impl GrammarRegistry {
     }
 
     /// Iterate over all rules
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &GrammarNode)> {
-        self.rules.iter()
+    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &GrammarNode)> {
+        self.rules.iter().map(|(name, node)| (*name, node))
     }
 }
 
@@ -236,8 +236,8 @@ impl Default for GrammarRegistry {
     }
 }
 
-impl FromIterator<(String, GrammarNode)> for GrammarRegistry {
-    fn from_iter<T: IntoIterator<Item = (String, GrammarNode)>>(iter: T) -> Self {
+impl FromIterator<(&'static str, GrammarNode)> for GrammarRegistry {
+    fn from_iter<T: IntoIterator<Item = (&'static str, GrammarNode)>>(iter: T) -> Self {
         GrammarRegistry {
             rules: iter.into_iter().collect(),
         }

@@ -77,9 +77,16 @@ macro_rules! new_grammar {
 			#[allow(unused_imports)]
 			use $crate::{grammar::edsl::*, r};
 			$(fn $name() -> GrammarNode { $node })*
-			$crate::grammar::Grammar::new($start(), stringify!($start))
+			$crate::grammar::Grammar::new($start(), stringify!($start)).expect("failed to create grammar")
 		}
 	};
+}
+
+#[derive(Debug)]
+pub enum GrammarError {
+    UnboundRuleReference(String),
+    DuplicateRuleName(String),
+    NoStartRule,
 }
 
 /// The grammar structure, which contains the normalized rule table and analyses for parsing and error recovery.
@@ -90,14 +97,8 @@ pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,
     pub(crate) rule_analyses: FxHashMap<usize, Arc<analysis::GrammarStateAnalysis>>,
-    /// Bracket pairs derived at grammar-analysis time (§3 of Nilsson-Nyman 2009).
-    /// Used by the scope-recovery layer to skip malformed scope bodies.
     pub(crate) bridge_specs: Vec<bridge::BridgeSpec>,
-    /// Delimiter terminals (e.g. `,`, `;`, `:`) derived at grammar-analysis time.
-    /// Scope recovery may stop at these terminals to resume parsing earlier.
     pub(crate) recovery_delimiters: Vec<usize>,
-    /// Terminals with matching delimiters on both ends (e.g., strings with `"` on both sides).
-    /// Used to skip these terminals during string parsing context in recovery.
     pub(crate) bracketed_terminals: Vec<usize>,
 }
 
@@ -106,12 +107,15 @@ impl Grammar {
     ///
     /// The grammar is cached and returned as a static reference. If it has not changed since
     /// the last time it was created, it will be loaded from the cache instead of being reprocessed.
-    pub fn new(node: edsl::GrammarNode, start_rule: &'static str) -> &'static Self {
+    pub fn new(
+        node: edsl::GrammarNode,
+        start_rule: &'static str,
+    ) -> Result<&'static Self, GrammarError> {
         let cache_key = Self::cache_key_from_dsl(&node, start_rule);
 
         let cache = grammar_cache().lock().unwrap();
         if let Some(grammar) = cache.get(&cache_key) {
-            return grammar;
+            return Ok(grammar);
         }
         drop(cache);
 
@@ -119,19 +123,22 @@ impl Grammar {
         let grammar = if let Some(grammar) = cache::load(cache_key) {
             Box::leak(Box::new(grammar))
         } else {
-            let grammar = Self::new_uncached(node, start_rule);
+            let grammar = Self::new_uncached(node, start_rule)?;
             let _ = cache::store(cache_key, grammar);
             grammar
         };
 
         grammar_cache().lock().unwrap().insert(cache_key, grammar);
 
-        grammar
+        Ok(grammar)
     }
 
     /// Create a new grammar without using the cache.
-    pub fn new_uncached(node: edsl::GrammarNode, start_rule: &'static str) -> &'static Self {
-        let table = norm::RuleTable::normalize(node, start_rule);
+    pub fn new_uncached(
+        node: edsl::GrammarNode,
+        start_rule: &'static str,
+    ) -> Result<&'static Self, GrammarError> {
+        let table = norm::RuleTable::normalize(node, start_rule)?;
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
             table.start_rule,
@@ -150,23 +157,26 @@ impl Grammar {
             bracketed_terminals,
         };
 
-        Box::leak(Box::new(grammar))
+        Ok(Box::leak(Box::new(grammar)))
     }
 
     pub(crate) fn new_with_registry(
-        node: edsl::GrammarNode,
         start_rule: &'static str,
         registry: edsl::GrammarRegistry,
-    ) -> &'static Self {
-        Self::new_uncached_with_registry(node, start_rule, registry)
+    ) -> Result<&'static Self, GrammarError> {
+        Self::new_uncached_with_registry(start_rule, registry)
     }
 
     pub(crate) fn new_uncached_with_registry(
-        node: edsl::GrammarNode,
         start_rule: &'static str,
         registry: edsl::GrammarRegistry,
-    ) -> &'static Self {
-        let table = norm::RuleTable::normalize_with_registry(node, start_rule, Some(registry));
+    ) -> Result<&'static Self, GrammarError> {
+        let node = registry
+            .get(start_rule)
+            .cloned()
+            .ok_or_else(|| GrammarError::UnboundRuleReference(start_rule.to_string()))?;
+
+        let table = norm::RuleTable::normalize_with_registry(node, start_rule, Some(registry))?;
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
             table.start_rule,
@@ -185,7 +195,7 @@ impl Grammar {
             bracketed_terminals,
         };
 
-        Box::leak(Box::new(grammar))
+        Ok(Box::leak(Box::new(grammar)))
     }
 
     /// Build incremental LR analyses for every non-start rule.
@@ -327,10 +337,16 @@ impl Grammar {
     }
 
     /// Save this grammar to a .gmx file.
-    pub fn save_to(&self, path: &Path) -> io::Result<()> {
+    pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        let path = path.as_ref();
         let bytes = cache::serialize_grammar_file(self)?;
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
         fs::write(path, bytes)
+    }
+
+    pub fn load_from_binary(bytes: impl AsRef<[u8]>) -> io::Result<&'static Self> {
+        let grammar = cache::deserialize_grammar_file(bytes.as_ref())?;
+        Ok(Box::leak(Box::new(grammar)))
     }
 }
 

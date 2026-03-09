@@ -6,7 +6,7 @@ use crate::grammar::Grammar;
 use crate::grammar::analysis::{Action, EOF_TOKEN, GrammarStateAnalysis};
 use crate::grammar::ir::Symbol;
 use crate::grammar::recovery::{ErrorRecoveryStrategy, RecoverySpecs};
-use crate::parsec::display::{format_ast, format_messages};
+use crate::parsec::display::format_ast;
 use crate::parsec::msg::{ParserMessage, ParserMessages};
 use crate::parsec::recovery::{
     OpenScopeToken, RecoveryCache, RecoveryConfig, RepairOp, ScopeStop, recover, scope_recover,
@@ -56,7 +56,11 @@ pub struct Result<'a> {
 
 impl<'a> Result<'a> {
     pub fn format_messages(&self) -> String {
-        format_messages(&self.grammar, &self.messages)
+        crate::parsec::display::format_messages_with_source(
+            &self.grammar,
+            &self.messages,
+            self.source,
+        )
     }
 
     pub fn format_ast(&self) -> String {
@@ -211,7 +215,7 @@ impl Parser {
         self.reuse_stats = IncrementalReuseStats::default();
     }
 
-    fn reuse_stats(&self) -> IncrementalReuseStats {
+    pub(crate) fn reuse_stats(&self) -> IncrementalReuseStats {
         self.reuse_stats
     }
 

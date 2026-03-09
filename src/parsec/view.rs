@@ -1,6 +1,12 @@
+use std::vec;
+
 use crate::{
     grammar::Grammar,
-    parsec::tree::{GreenId, ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
+    parsec::{
+        display::format_ast,
+        tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
+    },
+    utils::LineIndex,
 };
 
 struct ViewProps<'a> {
@@ -15,6 +21,8 @@ pub struct View<'a> {
     props: &'a ViewProps<'a>,
     pub(crate) node: GreenId,
     pub(crate) offset: usize,
+    pub(crate) parent: Option<GreenId>,
+    pub(crate) sibling_index: usize,
 }
 
 impl<'a> View<'a> {
@@ -34,6 +42,8 @@ impl<'a> View<'a> {
             props,
             node,
             offset,
+            parent: None,
+            sibling_index: 0,
         }
     }
 
@@ -53,136 +63,225 @@ impl<'a> View<'a> {
         &self.props.source[self.offset()..self.offset() + self.width()]
     }
 
+    pub fn span_bytes(&self) -> (usize, usize) {
+        (self.offset(), self.offset() + self.width())
+    }
+
+    pub fn start_line_col(&self) -> (usize, usize) {
+        let index = LineIndex::new(self.props.source);
+        let line_col = index.byte_to_line_col_with_text(self.offset(), self.props.source);
+        (line_col.line, line_col.col)
+    }
+
+    pub fn end_line_col(&self) -> (usize, usize) {
+        let index = LineIndex::new(self.props.source);
+        let end_offset = self.offset() + self.width();
+        let line_col = index.byte_to_line_col_with_text(end_offset, self.props.source);
+        (line_col.line, line_col.col)
+    }
+
+    pub fn line_col_range(&self) -> ((usize, usize), (usize, usize)) {
+        (self.start_line_col(), self.end_line_col())
+    }
+
     pub fn is_error(&self) -> bool {
         matches!(self.props.alloc.get_node(self.current()).tag, Tag::Error(_))
     }
 
-    /// Move into the first child (non-backward, chainable navigation)
     pub fn into(self) -> Option<View<'a>> {
-        let node = self.props.alloc.get_node(self.current());
+        self.into_each().next()
+    }
 
-        if node.children.is_empty() {
+    pub fn next(self) -> Option<View<'a>> {
+        let parent_id = self.parent?;
+        let parent = self.props.alloc.get_node(parent_id);
+        let next_index = self.sibling_index + 1;
+        if next_index >= parent.children.len() {
             return None;
         }
 
         Some(View {
             props: self.props,
-            node: node.children[0],
-            offset: self.offset(),
+            node: parent.children[next_index],
+            offset: self.offset() + self.width(),
+            parent: Some(parent_id),
+            sibling_index: next_index,
         })
     }
 
-    /// Move to the next sibling (chainable navigation)
-    pub fn next(self) -> Option<View<'a>> {
-        let current_width = self.props.alloc.get_node(self.current()).width;
-
-        Some(View {
-            props: self.props,
-            node: self.node,
-            offset: self.offset() + current_width,
-        })
-    }
-
-    /// Move to the next field matching the given name (chainable)
     pub fn next_field(self, field_name: &str) -> Option<View<'a>> {
-        let mut current = self;
+        let mut cursor = if self.sibling_index == 0 {
+            Some(self)
+        } else {
+            self.next()
+        };
 
-        loop {
+        while let Some(current) = cursor {
             let node = current.props.alloc.get_node(current.current());
-
-            // Check if this node has the matching field name
-            if let Tag::Field { name, .. } = &node.tag {
-                if *name == field_name {
-                    return Some(current);
-                }
+            if matches!(&node.tag, Tag::Field { name, .. } if *name == field_name) {
+                return Some(current);
             }
-
-            // Move to next sibling
-            let next_offset = current.offset() + node.width;
-            // If we've moved beyond reasonable bounds, stop
-            if next_offset >= current.props.source.len() {
-                return None;
-            }
-
-            current = View {
-                props: current.props,
-                node: current.node,
-                offset: next_offset,
-            };
-
-            if current.offset() >= current.props.source.len() {
-                return None;
-            }
+            cursor = current.next();
         }
+
+        None
     }
 
-    /// Get the rule index if this is a rule or field node
     fn rule_ix(&self) -> Option<usize> {
-        let node = self.props.alloc.get_node(self.current());
-        match &node.tag {
-            Tag::Rule { rule_ix, .. } => Some(*rule_ix),
-            Tag::Token { rule_ix } => Some(*rule_ix),
-            Tag::Field { rule_ix, .. } => Some(*rule_ix),
-            Tag::Error(_) => None,
-        }
+        self.props.alloc.get_node(self.current()).tag.rule_ix()
     }
 
-    /// Move to the next node matching the given rule name (chainable)
-    pub fn next_rule(self, rule_name: &str) -> Option<View<'a>> {
-        let mut current = self;
-
-        loop {
-            let node = current.props.alloc.get_node(current.current());
-
-            // Check if this node has the matching rule name
-            if let Some(rule_ix) = current.rule_ix() {
-                if rule_ix < current.props.grammar.table.rules.len() {
-                    if current.props.grammar.table.rules[rule_ix].name == rule_name {
-                        return Some(current);
-                    }
-                }
-            }
-
-            // Move to next sibling
-            let next_offset = current.offset() + node.width;
-            // If we've moved beyond reasonable bounds, stop
-            if next_offset >= current.props.source.len() {
-                return None;
-            }
-
-            current = View {
-                props: current.props,
-                node: current.node,
-                offset: next_offset,
-            };
-
-            if current.offset() >= current.props.source.len() {
-                return None;
-            }
-        }
+    fn raw_rule_name(&self) -> Option<&'static str> {
+        self.rule_ix()
+            .and_then(|ix| self.props.grammar.table.rules.get(ix))
+            .map(|rule| rule.name)
     }
 
-    /// Get all children as a vector
-    pub fn all_children(&self) -> Vec<View<'a>> {
+    fn is_generated_rule_name(rule_name: &str) -> bool {
+        rule_name.contains('@')
+    }
+
+    fn is_generated_rule(&self) -> bool {
+        self.raw_rule_name()
+            .map(Self::is_generated_rule_name)
+            .unwrap_or(false)
+    }
+
+    fn raw_children(&self) -> Vec<View<'a>> {
         let node = self.props.alloc.get_node(self.current());
         let mut children = Vec::new();
         let mut offset = self.offset();
-        for child in &node.children {
-            children.push(View {
+        for (ix, child) in node.children.iter().enumerate() {
+            let child_view = View {
                 props: self.props,
                 node: *child,
                 offset,
-            });
+                parent: Some(self.current()),
+                sibling_index: ix,
+            };
             offset += self.props.alloc.get_node(*child).width;
+            children.push(child_view);
         }
         children
     }
 
-    /// Get error information if this is an error node
+    fn collect_visible_children(&self, candidate: View<'a>, out: &mut Vec<View<'a>>) {
+        if candidate.is_generated_rule() {
+            let raw_children = candidate.raw_children();
+            if raw_children.is_empty() {
+                if !candidate.text().trim().is_empty() {
+                    out.push(candidate);
+                }
+                return;
+            }
+
+            for child in raw_children {
+                self.collect_visible_children(child, out);
+            }
+            return;
+        }
+
+        out.push(candidate);
+    }
+
+    pub fn rule_name(&self) -> Option<&'static str> {
+        let raw_name = self.raw_rule_name()?;
+        if raw_name.starts_with('@') {
+            return None;
+        }
+        raw_name.split('@').next()
+    }
+
+    pub fn next_rule(self, rule_name: &str) -> Option<View<'a>> {
+        let mut cursor = if self.sibling_index == 0 {
+            Some(self)
+        } else {
+            self.next()
+        };
+
+        while let Some(current) = cursor {
+            if current.rule_name() == Some(rule_name) {
+                return Some(current);
+            }
+            cursor = current.next();
+        }
+
+        None
+    }
+
+    pub fn into_each(&self) -> vec::IntoIter<View<'a>> {
+        let mut children = Vec::new();
+        for child in self.raw_children() {
+            self.collect_visible_children(child, &mut children);
+        }
+        children.into_iter()
+    }
+
+    pub fn into_each_field(&self, field_name: &str) -> vec::IntoIter<View<'a>> {
+        let node = self.props.alloc.get_node(self.current());
+        let mut children = Vec::new();
+        let mut offset = self.offset();
+        for (ix, child) in node.children.iter().enumerate() {
+            let child_node = self.props.alloc.get_node(*child);
+            if matches!(&child_node.tag, Tag::Field { name, .. } if *name == field_name) {
+                children.push(View {
+                    props: self.props,
+                    node: *child,
+                    offset,
+                    parent: Some(self.current()),
+                    sibling_index: ix,
+                });
+            }
+            offset += child_node.width;
+        }
+        children.into_iter()
+    }
+
+    pub fn into_each_rule(&self, rule_name: &str) -> vec::IntoIter<View<'a>> {
+        let node = self.props.alloc.get_node(self.current());
+        let mut children = Vec::new();
+        let mut offset = self.offset();
+        for (ix, child) in node.children.iter().enumerate() {
+            let child_node = self.props.alloc.get_node(*child);
+            if child_node.tag.rule_ix().and_then(|ix| {
+                self.props
+                    .grammar
+                    .table
+                    .rules
+                    .get(ix)
+                    .map(|rule| rule.name == rule_name)
+            }) == Some(true)
+            {
+                children.push(View {
+                    props: self.props,
+                    node: *child,
+                    offset,
+                    parent: Some(self.current()),
+                    sibling_index: ix,
+                });
+            }
+            offset += child_node.width;
+        }
+        children.into_iter()
+    }
+
     pub fn error_kind(&self) -> Option<ParsecError> {
         match &self.props.alloc.get_node(self.current()).tag {
             Tag::Error(e) => Some(e.clone()),
             _ => None,
         }
+    }
+
+    pub fn display(&self) -> String {
+        format_ast(
+            self.props.grammar,
+            &RedNode {
+                parent: None,
+                green: self.current(),
+                offset: self.offset(),
+            },
+            &self.props.alloc,
+            self.props.source,
+        )
     }
 }

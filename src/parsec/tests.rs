@@ -99,7 +99,7 @@ fn test_json() {
     println!("Grammar:\n{}", parser.grammar.table);
 
     let text = r#"{
-"a": [1, s, 22]
+"a": [1, 2, 22]
 }"#;
     let result = parser.parse_text(text);
 

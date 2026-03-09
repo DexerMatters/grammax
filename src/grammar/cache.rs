@@ -44,7 +44,7 @@ pub(crate) mod serde_fxhashmap {
     }
 }
 
-const CACHE_FORMAT_VERSION: u32 = 6;
+const CACHE_FORMAT_VERSION: u32 = 7;
 
 static CACHE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
@@ -52,6 +52,7 @@ static CACHE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 enum CachedTerminal {
     Literal(String),
     TokenLiteral(String),
+    Token(Box<CachedTerminal>),
     Char(char),
     Named(String),
     Eof,
@@ -114,6 +115,11 @@ struct GrammarCacheFile {
 #[derive(Debug)]
 struct OwnedLiteral(String);
 
+#[derive(Debug, Clone)]
+struct TokenizedMatcher {
+    inner: MatcherRef,
+}
+
 impl Matcher for OwnedLiteral {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
@@ -139,6 +145,35 @@ impl Matcher for OwnedLiteral {
 
     fn preview(&self) -> Option<&str> {
         Some(&self.0)
+    }
+}
+
+impl Matcher for TokenizedMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        let _ = words::token(()).0.matches(input, pos).or_else(|| Some(0));
+        if self.inner.matches(input, pos).is_some() {
+            Some(*pos - start)
+        } else {
+            *pos = start;
+            None
+        }
+    }
+
+    fn display(&self) -> String {
+        format!("char_predicate* {}", self.inner.display())
+    }
+
+    fn is_nullable(&self) -> bool {
+        self.inner.is_nullable()
+    }
+
+    fn is_consuming(&self) -> bool {
+        self.inner.is_consuming()
+    }
+
+    fn preview(&self) -> Option<&str> {
+        self.inner.preview()
     }
 }
 
@@ -369,6 +404,26 @@ fn decode_node(node: CachedNode, terminals: &[MatcherRef]) -> Result<NormalizedN
 fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
     let display = matcher.display();
 
+    if let Some(inner_display) = display.strip_prefix("char_predicate* ") {
+        let inner = cached_terminal_from_display(inner_display.trim())?;
+        return Some(CachedTerminal::Token(Box::new(inner)));
+    }
+
+    cached_terminal_from_display(&display).or_else(|| {
+        if let Some(preview) = matcher.preview() {
+            let quoted = format!("\"{}\"", preview);
+            if display == quoted {
+                return Some(CachedTerminal::Literal(preview.to_string()));
+            }
+            if display.contains(&quoted) {
+                return Some(CachedTerminal::TokenLiteral(preview.to_string()));
+            }
+        }
+        None
+    })
+}
+
+fn cached_terminal_from_display(display: &str) -> Option<CachedTerminal> {
     if display == "EOF" {
         return Some(CachedTerminal::Eof);
     }
@@ -376,23 +431,19 @@ fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
         return Some(CachedTerminal::Sof);
     }
 
-    if let Some(ch) = parse_char_display(&display) {
+    if let Some(ch) = parse_char_display(display) {
         return Some(CachedTerminal::Char(ch));
     }
 
-    if let Some(preview) = matcher.preview() {
-        let quoted = format!("\"{}\"", preview);
-        if display == quoted {
-            return Some(CachedTerminal::Literal(preview.to_string()));
-        }
-        if display.contains(&quoted) {
-            return Some(CachedTerminal::TokenLiteral(preview.to_string()));
-        }
+    if display.starts_with('"') && display.ends_with('"') && display.len() >= 2 {
+        return Some(CachedTerminal::Literal(
+            display[1..display.len() - 1].to_string(),
+        ));
     }
 
-    match display.as_str() {
+    match display {
         "number" | "identifier" | "alphanum" | "string" | "ident" | "json_string"
-        | "whitespaces" => Some(CachedTerminal::Named(display)),
+        | "whitespaces" => Some(CachedTerminal::Named(display.to_string())),
         _ => None,
     }
 }
@@ -401,6 +452,9 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
     match spec {
         CachedTerminal::Literal(s) => Ok(Arc::new(OwnedLiteral(s.clone()))),
         CachedTerminal::TokenLiteral(s) => Ok(Arc::new(token(OwnedLiteral(s.clone())))),
+        CachedTerminal::Token(inner) => Ok(Arc::new(TokenizedMatcher {
+            inner: cached_to_terminal(inner)?,
+        })),
         CachedTerminal::Char(c) => Ok(Arc::new(*c)),
         CachedTerminal::Named(name) => match name.as_str() {
             "number" => Ok(Arc::new(words::NUMS)),
@@ -515,6 +569,7 @@ impl PartialEq for CachedTerminal {
         match (self, other) {
             (Literal(a), Literal(b)) => a == b,
             (TokenLiteral(a), TokenLiteral(b)) => a == b,
+            (Token(a), Token(b)) => a == b,
             (Char(a), Char(b)) => a == b,
             (Named(a), Named(b)) => a == b,
             (Eof, Eof) => true,
@@ -538,16 +593,20 @@ impl Hash for CachedTerminal {
                 1u8.hash(state);
                 s.hash(state);
             }
-            Char(c) => {
+            Token(inner) => {
                 2u8.hash(state);
+                inner.hash(state);
+            }
+            Char(c) => {
+                3u8.hash(state);
                 c.hash(state);
             }
             Named(s) => {
-                3u8.hash(state);
+                4u8.hash(state);
                 s.hash(state);
             }
-            Eof => 4u8.hash(state),
-            Sof => 5u8.hash(state),
+            Eof => 5u8.hash(state),
+            Sof => 6u8.hash(state),
         }
     }
 }
@@ -558,6 +617,7 @@ impl fmt::Display for CachedTerminal {
         match self {
             Literal(s) => write!(f, "\"{}\"", s),
             TokenLiteral(s) => write!(f, "token(\"{}\")", s),
+            Token(inner) => write!(f, "token({})", inner),
             Char(c) => write!(f, "'{}'", c),
             Named(n) => write!(f, "{}", n),
             Eof => write!(f, "EOF"),

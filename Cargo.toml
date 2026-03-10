@@ -29,7 +29,7 @@ features = ["runtime-agnostic"]
 
 
 [features]
-webui = ["dep:rouille", "dep:mime_guess", "dep:rust-embed", "dep:webbrowser"]
+webui = ["dep:rouille", "dep:mime_guess", "dep:webbrowser"]
 vsclsp = ["dep:tower-lsp"]
 
 [[bin]]

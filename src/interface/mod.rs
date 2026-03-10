@@ -2,11 +2,11 @@ use crossbeam::channel;
 
 use crate::{grammar, runtime, scheme::LayerName, utils};
 
-#[cfg(feature = "webui")]
-pub mod webui;
-
+pub mod cli;
 #[cfg(feature = "vsclsp")]
 pub mod vsclsp;
+#[cfg(feature = "webui")]
+pub mod webui;
 
 #[cfg(test)]
 mod tests;
@@ -81,23 +81,32 @@ impl BasicInterface {
         self.update_with_policy(start, end, "", runtime::CompletionPolicy::Settled)
     }
 
-    pub fn submit_top_txn(
+    pub fn submit_top_txn<T>(
         &self,
-        txn: serde_json::Value,
+        txn: T,
         completion: runtime::CompletionPolicy,
-    ) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::ApplyTopTxn { txn, completion })
+    ) -> runtime::RuntimeResult
+    where
+        T: serde::Serialize + Send + Sync + 'static,
+    {
+        self.request(runtime::RuntimeRequest::ApplyTopTxn {
+            txn: runtime::Payload::new(txn),
+            completion,
+        })
     }
 
-    pub fn query_layer(
+    pub fn query_layer<I>(
         &self,
         layer: LayerName,
-        index: serde_json::Value,
-    ) -> runtime::RuntimeResult<serde_json::Value> {
+        index: I,
+    ) -> runtime::RuntimeResult<runtime::Payload>
+    where
+        I: serde::Serialize + Send + Sync + 'static,
+    {
         let expected_layer = layer;
         let signal = self.request(runtime::RuntimeRequest::QueryLayer {
             layer: expected_layer.clone(),
-            index,
+            index: runtime::Payload::new(index),
         })?;
 
         match signal {
@@ -119,15 +128,12 @@ impl BasicInterface {
     }
 
     pub fn query_source_text(&self, span: utils::Span) -> runtime::RuntimeResult<String> {
-        let value = self.query_layer(
-            LayerName::root(),
-            serde_json::to_value(span).map_err(|err| runtime::RuntimeError::InvalidRequest {
-                message: format!("failed to encode span query: {err}"),
-            })?,
-        )?;
+        let payload = self.query_layer(LayerName::root(), span)?;
 
-        serde_json::from_value(value).map_err(|err| runtime::RuntimeError::InvalidRequest {
-            message: format!("failed to decode source text query result: {err}"),
+        payload.downcast_ref::<String>().cloned().ok_or_else(|| {
+            runtime::RuntimeError::InvalidRequest {
+                message: "source text query result was not a String".to_string(),
+            }
         })
     }
 

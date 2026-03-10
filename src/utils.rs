@@ -205,27 +205,39 @@ pub struct Span {
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
+    pub const fn new(start: usize, end: usize) -> Self {
         Span { start, end }
     }
-    pub fn new_len(offset: usize, len: usize) -> Self {
+    pub const fn new_len(offset: usize, len: usize) -> Self {
         Span {
             start: offset,
             end: offset + len,
         }
     }
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Span { start: 0, end: 0 }
     }
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         if self.end >= self.start {
             self.end - self.start
         } else {
             0
         }
     }
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start == self.end
+    }
+
+    pub fn start_line_col(&self, text: &str) -> (usize, usize) {
+        let index = LineIndex::new(text);
+        let line_col = index.byte_to_line_col_with_text(self.start, text);
+        (line_col.line, line_col.col)
+    }
+
+    pub fn end_line_col(&self, text: &str) -> (usize, usize) {
+        let index = LineIndex::new(text);
+        let line_col = index.byte_to_line_col_with_text(self.end, text);
+        (line_col.line, line_col.col)
     }
 }
 
@@ -243,5 +255,74 @@ impl ops::Add for Span {
 impl From<Span> for ops::Range<usize> {
     fn from(span: Span) -> Self {
         span.start..span.end
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct LineIndex {
+    line_starts: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LineCol {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl LineIndex {
+    pub fn new(text: &str) -> Self {
+        let mut line_starts = vec![0];
+        let mut line_utf16_offsets = vec![0];
+        let mut utf16_offset = 0;
+
+        let mut chars = text.char_indices().peekable();
+        while let Some((_byte_pos, ch)) = chars.next() {
+            let ch_utf16_len = ch.len_utf16();
+            utf16_offset += ch_utf16_len;
+
+            if ch == '\n' {
+                // Next line starts after this \n
+                if let Some(&(next_byte_pos, _)) = chars.peek() {
+                    line_starts.push(next_byte_pos);
+                    line_utf16_offsets.push(utf16_offset);
+                }
+            }
+        }
+
+        LineIndex { line_starts }
+    }
+
+    pub fn byte_to_line_col_with_text(&self, byte_pos: usize, text: &str) -> LineCol {
+        // Binary search for the line containing this byte offset
+        let line_idx = self
+            .line_starts
+            .binary_search(&byte_pos)
+            .unwrap_or_else(|next_idx| next_idx.saturating_sub(1));
+
+        let line = line_idx + 1; // Convert to 1-indexed
+        let line_start_byte = self.line_starts[line_idx];
+
+        // Find the end of this line
+        let line_end_byte = self
+            .line_starts
+            .get(line_idx + 1)
+            .copied()
+            .unwrap_or(text.len());
+
+        // Get the line text
+        let line_text = &text[line_start_byte..line_end_byte];
+
+        // Compute UTF-16 column: count UTF-16 code units from line start to the position within the line
+        let offset_in_line = byte_pos.saturating_sub(line_start_byte);
+        let mut col = 0;
+
+        for (byte_offset, ch) in line_text.char_indices() {
+            if byte_offset >= offset_in_line {
+                break;
+            }
+            col += ch.len_utf16();
+        }
+
+        LineCol { line, col }
     }
 }

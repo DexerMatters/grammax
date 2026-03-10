@@ -180,23 +180,55 @@ fn handle_request(
             LoopControl::Continue
         }
         RuntimeRequest::ApplySourceTxn { txn, completion } => {
-            finish_submit(compiler.submit_source(txn), completion, reply, pending);
+            let typed = txn
+                .downcast_ref::<crate::scheme::Transaction<crate::scheme::layers::SourceText>>()
+                .cloned();
+
+            let result = if let Some(txn) = typed {
+                compiler.submit_source(txn)
+            } else if let Some(json) = txn.downcast_ref::<serde_json::Value>() {
+                serde_json::from_value::<
+                    crate::scheme::Transaction<crate::scheme::layers::SourceText>,
+                >(json.clone())
+                .map_err(|e| RuntimeError::InvalidRequest {
+                    message: e.to_string(),
+                })
+                .and_then(|t| compiler.submit_source(t))
+            } else {
+                Err(RuntimeError::InvalidRequest {
+                    message: "applySourceTxn payload type mismatch".to_string(),
+                })
+            };
+
+            finish_submit(result, completion, reply, pending);
             LoopControl::Continue
         }
         RuntimeRequest::ApplyTopTxn { txn, completion } => {
-            let result = serde_json::from_value::<
-                crate::scheme::Transaction<crate::scheme::layers::SourceText>,
-            >(txn)
-            .map_err(|e| RuntimeError::InvalidRequest {
-                message: e.to_string(),
-            })
-            .and_then(|t| compiler.submit_source(t));
+            let typed = txn
+                .downcast_ref::<crate::scheme::Transaction<crate::scheme::layers::SourceText>>()
+                .cloned();
+
+            let result = if let Some(txn) = typed {
+                compiler.submit_source(txn)
+            } else if let Some(json) = txn.downcast_ref::<serde_json::Value>() {
+                serde_json::from_value::<
+                    crate::scheme::Transaction<crate::scheme::layers::SourceText>,
+                >(json.clone())
+                .map_err(|e| RuntimeError::InvalidRequest {
+                    message: e.to_string(),
+                })
+                .and_then(|t| compiler.submit_source(t))
+            } else {
+                Err(RuntimeError::InvalidRequest {
+                    message: "applyTopTxn payload type mismatch".to_string(),
+                })
+            };
             finish_submit(result, completion, reply, pending);
             LoopControl::Continue
         }
         RuntimeRequest::QueryLayer { layer, index } => {
             let response = compiler
-                .query_json(layer.clone(), index)
+                .query(layer.clone(), index)
                 .map(|value| RuntimeSignal::QueryResult { layer, value });
             let _ = reply.send(response);
             LoopControl::Continue
@@ -350,6 +382,7 @@ fn signal_error_message(signal: &RuntimeSignal) -> Option<String> {
 
     event
         .payload
+        .to_json()
         .get("message")
         .and_then(|message| message.as_str())
         .map(ToString::to_string)

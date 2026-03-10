@@ -7,6 +7,7 @@ use crate::grammar::analysis::EOF_TOKEN;
 use crate::grammar::ir::Symbol;
 use crate::parsec::msg::{ErrorMessage, ParserMessage};
 use crate::parsec::tree::{GreenId, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
+use crate::utils::Span;
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -33,6 +34,8 @@ pub fn format_ast(grammar: &Grammar, root: &RedNode, alloc: &TreeAllocRef, sourc
 }
 
 pub fn format_messages(grammar: &Grammar, messages: &[ParserMessage]) -> String {
+    // Note: This function doesn't have access to source text, so we'll just show byte offsets
+    // To get line:col, call format_messages_with_source instead
     let mut out = String::new();
 
     for (idx, msg) in messages.iter().enumerate() {
@@ -68,6 +71,164 @@ pub fn format_messages(grammar: &Grammar, messages: &[ParserMessage]) -> String 
     }
 
     out
+}
+
+pub fn format_messages_with_source(
+    grammar: &Grammar,
+    messages: &[ParserMessage],
+    source: &str,
+) -> String {
+    use std::collections::BTreeMap;
+
+    let mut out = String::new();
+    let lines: Vec<&str> = source.lines().collect();
+
+    // Group errors by (span, error_type) to accumulate expected tokens
+    let mut grouped: BTreeMap<(usize, usize, &str), (bool, Vec<usize>)> = BTreeMap::new();
+
+    for msg in messages {
+        let (msg_type, is_missing) = match &msg.message {
+            ErrorMessage::UnexpectedToken { .. } => ("unexpected", false),
+            ErrorMessage::MissingToken { .. } => ("missing", true),
+            ErrorMessage::Custom(_) => ("custom", false),
+        };
+
+        let key = (msg.span.start, msg.span.end, msg_type);
+
+        match &msg.message {
+            ErrorMessage::UnexpectedToken { expected }
+            | ErrorMessage::MissingToken { expected } => {
+                let entry = grouped.entry(key).or_insert((is_missing, Vec::new()));
+                entry.1.extend(expected.iter().copied());
+            }
+            ErrorMessage::Custom(_) => {
+                grouped.entry(key).or_insert((is_missing, Vec::new()));
+            }
+        }
+    }
+
+    // Print accumulated errors
+    let mut first = true;
+    for ((start_pos, _end_pos, msg_type), (is_missing, mut expected)) in grouped {
+        if !first {
+            out.push_str("\n\n");
+        }
+        first = false;
+
+        let (start_line, start_col) = Span {
+            start: start_pos,
+            end: start_pos,
+        }
+        .start_line_col(source);
+        let (end_line, end_col) = Span {
+            start: start_pos,
+            end: start_pos,
+        }
+        .end_line_col(source);
+
+        let display_type = match msg_type {
+            "unexpected" => "error: unexpected token",
+            "missing" => "error: missing token",
+            _ => "error",
+        };
+
+        let _ = write!(
+            out,
+            "{}{}{} at {}:{}",
+            RED, display_type, RESET, start_line, start_col
+        );
+
+        // Show context lines
+        format_error_context(
+            &mut out, &lines, start_line, end_line, start_col, end_col, is_missing,
+        );
+
+        // Show expected tokens (deduplicated)
+        if !expected.is_empty() {
+            expected.sort_unstable();
+            expected.dedup();
+            let expected_str = format_expected_friendly(grammar, &expected);
+            let _ = write!(out, "\n  {}expected:{} {}", YELLOW, RESET, expected_str);
+        }
+    }
+
+    out
+}
+
+fn format_error_context(
+    out: &mut String,
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+    start_col: usize,
+    end_col: usize,
+    is_missing: bool,
+) {
+    if lines.is_empty() || start_line == 0 {
+        return;
+    }
+
+    let line_idx = start_line - 1; // Convert to 0-indexed
+    let context_before = if line_idx > 0 { 1 } else { 0 };
+    let context_after = if line_idx + 1 < lines.len() { 1 } else { 0 };
+
+    let first_line = line_idx.saturating_sub(context_before);
+    let last_line = (line_idx + context_after).min(lines.len() - 1);
+    let gutter_width = format!("{}", last_line + 1).len().max(1);
+
+    // Show lines before
+    for i in first_line..line_idx {
+        let _ = write!(
+            out,
+            "\n{:>width$} | {}",
+            i + 1,
+            lines[i],
+            width = gutter_width
+        );
+    }
+
+    // Show error line with red coloring
+    let _ = write!(
+        out,
+        "\n{}{:>width$} | {}{}",
+        RED,
+        line_idx + 1,
+        lines[line_idx],
+        RESET,
+        width = gutter_width
+    );
+
+    // Show underline/arrow
+    let underline_indent = gutter_width + 3; // gutter + " | "
+    let _ = write!(out, "\n{}", " ".repeat(underline_indent));
+    let _ = write!(out, "{}", " ".repeat(start_col));
+
+    if is_missing {
+        // For missing tokens, show single arrow
+        let _ = write!(out, "{}^{}", RED, RESET);
+    } else {
+        // For unexpected tokens, show underline spanning the error
+        if start_line == end_line && start_col < end_col {
+            let len = end_col - start_col;
+            let _ = write!(out, "{}", RED);
+            let _ = write!(out, "{}", "~".repeat(len));
+            let _ = write!(out, "{}", RESET);
+        } else {
+            let _ = write!(out, "{}", RED);
+            let _ = write!(out, "^{}", RESET);
+        }
+    }
+
+    // Show lines after
+    for i in (line_idx + 1)..=last_line {
+        let _ = write!(
+            out,
+            "\n{:>width$} | {}",
+            i + 1,
+            lines[i],
+            width = gutter_width
+        );
+    }
 }
 
 fn display_with_indent(
@@ -269,6 +430,52 @@ fn format_label(
             let err_desc = format!("{:?}", errors);
             (format!("{}[{}]{}", RED, err_desc, RESET), String::new())
         }
+    }
+}
+
+fn format_expected_friendly(grammar: &Grammar, expected: &[usize]) -> String {
+    if expected.is_empty() {
+        return "<unknown>".to_string();
+    }
+
+    let mut names = Vec::new();
+
+    for &id in expected {
+        if id == EOF_TOKEN {
+            names.push("end of input".to_string());
+        } else if let Some(matcher) = grammar.table.terminals.get(id) {
+            let mut display = matcher.display();
+
+            // Strip "char_predicate* " prefix (implementation detail)
+            if display.starts_with("char_predicate* ") {
+                display = display
+                    .strip_prefix("char_predicate* ")
+                    .unwrap_or(&display)
+                    .to_string();
+            }
+
+            // Show friendly names
+            names.push(match display.as_str() {
+                "string" => "string literal".to_string(),
+                "ident" => "identifier".to_string(),
+                "number" => "number".to_string(),
+                "identifier" => "identifier".to_string(),
+                "whitespaces" => "whitespace".to_string(),
+                s if s.starts_with('"') && s.ends_with('"') => display, // Already quoted
+                s if s.starts_with('\'') && s.ends_with('\'') => display, // Already quoted
+                s => s.to_string(),
+            });
+        }
+    }
+
+    // Deduplicate and join
+    names.sort();
+    names.dedup();
+    if names.len() > 1 {
+        let last = names.pop().unwrap();
+        format!("{} or {}", names.join(", "), last)
+    } else {
+        names.join(", ")
     }
 }
 

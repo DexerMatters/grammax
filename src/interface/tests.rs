@@ -28,6 +28,48 @@ fn test_tap_prints_cst_commands() {
         null    -> tt("null")
     );
 
+    let (layer, source_observer) = CompilerBuilder::new().tap();
+    thread::spawn(move || {
+        while let Some(transaction) = source_observer.recv() {
+            println!("======Received Source transaction:");
+            for cmd in transaction.iter() {
+                println!("Source Command: {:?}", cmd);
+            }
+        }
+    });
+    let (pass, observer) = layer
+        .then_pass(ParserPass::new(grammar))
+        .then_layer(RedGreenTreeIR::default())
+        .tap();
+
+    thread::spawn(move || {
+        while let Some(transaction) = observer.recv() {
+            println!("======Received CST transaction:");
+            for cmd in transaction.iter() {
+                println!("CST Command: {:?}", cmd);
+            }
+        }
+    });
+
+    let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
+        ComposedCompiler::from_pass_with_events(pass, evt_tx)
+    });
+
+    runtime.run().expect("runtime failed");
+}
+
+#[cfg(feature = "webui")]
+#[test]
+fn test_arith_commands() {
+    let grammar = new_grammar!(
+        start where
+        start -> r!(expr) + tt(EndOfInput)
+        expr -> r!(add) | r!(mul) | r!(primary)
+        add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
+        mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
+        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
+    );
+
     let (pass, observer) = CompilerBuilder::new()
         .then_pass(ParserPass::new(grammar))
         .then_layer(RedGreenTreeIR::default())

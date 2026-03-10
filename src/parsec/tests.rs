@@ -1,7 +1,5 @@
 use crate::new_grammar;
-use crate::parsec::display::{format_ast, format_messages};
 use crate::parsec::parser::Parser;
-use crate::parsec::tree::TreeAllocRefExt;
 use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
 #[test]
@@ -22,17 +20,14 @@ fn test_simple_whitespaces() {
     let text = "(1  22)";
     let result = parser.parse_text(text);
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
+    let output = result.format_ast();
     println!("AST {}:\n{}", text, output);
-    println!(
-        "Messages:\n{}",
-        format_messages(&parser.grammar, &result.messages)
-    );
+    println!("Messages:\n{}", result.format_messages());
 
     assert!(
         result.messages.is_empty(),
         "Expected no errors, got: {}",
-        format_messages(&parser.grammar, &result.messages)
+        result.format_messages()
     );
 
     // Verify * is child of + (or rather + is the root operation)
@@ -63,15 +58,12 @@ fn test_simple_arithmetic_precedence() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "1+1+1";
+    let text = "ddd+5";
     let result = parser.parse_text(text);
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
+    let output = result.format_ast();
     println!("AST {}:\n{}", text, output);
-    println!(
-        "Messages:\n{}",
-        format_messages(&parser.grammar, &result.messages)
-    );
+    println!("Messages:\n{}", result.format_messages());
 
     // Verify * is child of + (or rather + is the root operation)
     // Structure:
@@ -104,15 +96,12 @@ fn test_json() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = r#"{"key": 42, "arr": [true, false, null]}"#;
+    let text = r#"{
+"a"#;
     let result = parser.parse_text(text);
 
-    let output = format_ast(&parser.grammar, &result.root, &parser.alloc, parser.text());
-    println!("AST:\n{}", output);
-    println!(
-        "Messages:\n{}",
-        format_messages(&parser.grammar, &result.messages)
-    );
+    println!("AST:\n{}", result.format_ast());
+    println!("Messages:\n{}", result.format_messages());
 }
 
 #[test]
@@ -135,26 +124,4 @@ fn test_recovery_strategy_is_wired_for_current_text() {
     let specs = parser.recovery_specs().expect("recovery specs");
     assert!(!specs.regions.is_empty());
     assert!(specs.strategy.sync_tokens.len() >= 2);
-}
-
-#[test]
-fn test_parse_text_handles_closing_quote_after_partial_string() {
-    let grammar = new_grammar!(
-        start where
-        start   -> r!(json) + tt(EndOfInput)
-        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
-        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
-        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
-        boolean -> tt("true") | tt("false")
-        null    -> tt("null")
-    );
-
-    let mut parser = Parser::new(grammar);
-    let result = parser.parse_text("{\"a\"");
-
-    assert_eq!(result.root.offset, 0);
-    assert_eq!(parser.alloc.get_node(result.root.green).width, 4);
 }

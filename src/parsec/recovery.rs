@@ -236,6 +236,7 @@ pub fn recover(
     analysis: &GrammarStateAnalysis,
     productions: &[Production],
     terminals: &[MatcherRef],
+    bracketed_terminals: &[usize],
     text: &str,
     pos: usize,
     stack: &[usize],
@@ -286,7 +287,7 @@ pub fn recover(
     let mut successful: Vec<Config> = Vec::new();
     let mut min_cost: Option<usize> = None;
 
-    let token_stream = TokenStream::new(terminals, text);
+    let token_stream = TokenStream::new(terminals, bracketed_terminals, text);
     let insert_candidates = build_insert_candidates(analysis, terminals);
 
     // Breadth-first search by cost
@@ -610,7 +611,7 @@ struct TokenStream {
 }
 
 impl TokenStream {
-    fn new(terminals: &[MatcherRef], text: &str) -> Self {
+    fn new(terminals: &[MatcherRef], bracketed_terminals: &[usize], text: &str) -> Self {
         let mut tokens = Vec::new();
         let mut index_by_start = FxHashMap::default();
         let mut pos = 0usize;
@@ -628,7 +629,7 @@ impl TokenStream {
                 break;
             }
 
-            let (term, len) = lex_at_text(terminals, text, pos, string_opened);
+            let (term, len) = lex_at_text(terminals, bracketed_terminals, text, pos, string_opened);
             if term == EOF_TOKEN && len == 0 {
                 break;
             }
@@ -804,6 +805,7 @@ fn reduce_stack(
 // Lex the next terminal at a position
 fn lex_at_text(
     terminals: &[MatcherRef],
+    bracketed_terminals: &[usize],
     text: &str,
     pos: usize,
     string_opened: bool,
@@ -817,7 +819,7 @@ fn lex_at_text(
         #[cfg(test)]
         let trace_recover = std::env::var("TRACE_RECOVER_LEX").is_ok();
 
-        if !string_opened && matcher.display().contains("json_string") {
+        if !string_opened && bracketed_terminals.contains(&idx) {
             continue;
         }
         // Inside a string, skip "opening-quote" style terminals (those with a
@@ -873,7 +875,7 @@ fn lex_at_text(
         (EOF_TOKEN, 0)
     } else {
         // Unknown token
-        let len = unknown_token_len(terminals, text, pos, string_opened);
+        let len = unknown_token_len(terminals, bracketed_terminals, text, pos, string_opened);
         (UNKNOWN_TOKEN, len)
     }
 }
@@ -888,6 +890,7 @@ fn is_quote_terminal(terminals: &[MatcherRef], term_ix: usize) -> bool {
 // Calculate length of unknown token
 fn unknown_token_len(
     terminals: &[MatcherRef],
+    bracketed_terminals: &[usize],
     text: &str,
     pos: usize,
     string_opened: bool,
@@ -898,7 +901,7 @@ fn unknown_token_len(
     let rest = &text[pos..];
     for (offset, _) in rest.char_indices().skip(1) {
         let abs = pos + offset;
-        if any_terminal_matches_at(terminals, text, abs, string_opened) {
+        if any_terminal_matches_at(terminals, bracketed_terminals, text, abs, string_opened) {
             return offset;
         }
     }
@@ -907,6 +910,7 @@ fn unknown_token_len(
 
 fn any_terminal_matches_at(
     terminals: &[MatcherRef],
+    bracketed_terminals: &[usize],
     text: &str,
     pos: usize,
     string_opened: bool,
@@ -915,8 +919,8 @@ fn any_terminal_matches_at(
         return false;
     }
     let rest = &text[pos..];
-    for (_idx, matcher) in terminals.iter().enumerate() {
-        if !string_opened && matcher.display().contains("json_string") {
+    for (idx, matcher) in terminals.iter().enumerate() {
+        if !string_opened && bracketed_terminals.contains(&idx) {
             continue;
         }
         let mut test_pos = 0;

@@ -1,187 +1,346 @@
-use std::{
-    ops::{self, RangeBounds},
-    sync::Arc,
+use std::sync::Arc;
+
+use rust_embed::Embed;
+use rustc_hash::FxHashMap;
+
+use crate::{
+    grammar::{
+        Grammar, GrammarError,
+        edsl::{self, GrammarNode},
+    },
+    new_grammar,
+    parsec::{
+        self,
+        view::View,
+        words::{self, EndOfInput, IDENT, Matcher, NUMS, STRING},
+    },
+    utils::Span,
 };
 
-use crate::parsec::words::{Matcher, MatcherRef, token};
-
-/// Grammar DSL node representing the user-defined grammar structure
-///
-/// It is recommended to use the provided helper functions and operator overloads for more ergonomic grammar definitions, rather than constructing `GrammarNode` variants directly.
-#[derive(Clone)]
-pub enum GrammarNode {
-    Terminal(MatcherRef),
-    Alternative(Vec<GrammarNode>),
-    Sequence(Vec<GrammarNode>),
-    Reference(fn() -> GrammarNode, &'static str),
-    Field(&'static str, Box<GrammarNode>),
-    Drop {
-        node: Box<GrammarNode>,
-        count: usize,
-    },
-    Repetition {
-        node: Box<GrammarNode>,
-        min: usize,
-        max: Option<usize>,
-    },
-    SeparatedRepetition {
-        node: Box<GrammarNode>,
-        separator: Box<GrammarNode>,
-        min: usize,
-        max: Option<usize>,
-    },
+thread_local! {
+    #[allow(dead_code)]
+    static GRAMMAX_DSL_GRAMMAR_PROTOTYPE: &'static Grammar = new_grammar! {
+        table where
+        table -> sep(r!(rule), t('\n')) + tt(EndOfInput)
+        rule -> field("name", tt(IDENT)) + tt("->") + field("definition", r!(expr))
+        expr -> r!(alternative) | r!(sequence) | r!(fields) | r!(drop) | r!(some) | r!(many) | r!(terminal) | r!(reference)
+        alternative -> r!(expr).drop(1) + tt("|") + r!(expr)
+        sequence -> r!(expr).drop(2) + t(" ") + r!(expr).drop(1)
+        fields -> field("field_name", tt(IDENT)) + tt(":") + r!(expr).drop(3)
+        drop -> r!(expr).drop(4) + t("/") + tt(NUMS)
+        many -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("*")
+        some -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("+")
+        reference -> tt(IDENT)
+        terminal -> (tt("(") + r!(expr) + tt(")")) | r!(literal) | r!(token)
+        token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMS") | tt("ALPHABETS") | tt("EOF")
+        literal -> tt('"') + tt(STRING) + tt('"')
+    };
 }
 
-impl GrammarNode {
-    pub fn drop(self, count: usize) -> Self {
-        GrammarNode::Drop {
-            node: Box::new(self),
-            count,
+#[inline(always)]
+pub fn grammax_dsl_grammar() -> &'static Grammar {
+    // SAFE: The grammar is loaded from a precompiled binary, which is guaranteed to be valid and immutable.
+    Grammar::load_from_binary(Asset::get("grammax.gmx.bin").unwrap().data)
+        .expect("Failed to load grammar")
+}
+
+impl Grammar {
+    pub fn interpret(dsl: impl AsRef<str>) -> Result<&'static Self, GrammarError> {
+        let mut parser = parsec::Parser::new(grammax_dsl_grammar());
+        let result = parser.parse_text(dsl.as_ref());
+        translate_dsl_grammar(result)
+    }
+
+    pub fn interpret_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<&'static Self, GrammarError> {
+        let text = std::fs::read_to_string(path).map_err(|e| GrammarError::IoError(e))?;
+        Self::interpret(&text)
+    }
+}
+
+#[derive(Embed)]
+#[folder = "grammars/"]
+#[include = "grammax.gmx.bin"]
+struct Asset;
+
+fn translate_dsl_grammar(result: parsec::Result<'_>) -> Result<&'static Grammar, GrammarError> {
+    let view: View = result.view();
+    let mut registry_map = FxHashMap::default();
+    let mut start_rule = None;
+    for rule_view in view
+        .into_each()
+        .into_iter()
+        .filter(|v| v.rule_name() == Some("rule"))
+    {
+        let (name, node) = view_rule(rule_view.into().unwrap());
+        if start_rule.is_none() {
+            start_rule = Some(name);
+        }
+        registry_map.insert(name, node);
+    }
+
+    let registry = edsl::GrammarRegistry::from_map(registry_map);
+    start_rule
+        .map(|start| Grammar::new_uncached_with_registry(start, registry))
+        .unwrap_or_else(|| Err(GrammarError::NoStartRule(Span::empty())))
+}
+
+fn view_rule(view: View) -> (&'static str, GrammarNode) {
+    let name = view.next_field("name").map(|n| n.text().trim()).unwrap();
+    let name = Box::leak(name.to_string().into_boxed_str());
+
+    let node = view
+        .next_field("definition")
+        .and_then(|d| d.into())
+        .map(view_expr)
+        .unwrap();
+    (name, node)
+}
+
+fn view_expr(view: View) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
+    match view.rule_name().unwrap_or("") {
+        "expr" => view
+            .into()
+            .map(view_expr)
+            .unwrap_or_else(|| view_leaf_expr(view)),
+        "alternative" => {
+            let exprs: Vec<_> = view.into_each_rule("expr").map(view_expr).collect();
+            let mut flattened = Vec::new();
+            for expr in exprs {
+                match expr {
+                    GrammarNode::Alternative(inner, _) => flattened.extend(inner),
+                    node => flattened.push(node),
+                }
+            }
+
+            match flattened.len() {
+                1 => flattened.into_iter().next().unwrap(),
+                _ => GrammarNode::Alternative(flattened, span),
+            }
+        }
+        "sequence" => {
+            let exprs: Vec<_> = view.into_each_rule("expr").map(view_expr).collect();
+            let mut flattened = Vec::new();
+            for expr in exprs {
+                match expr {
+                    GrammarNode::Sequence(inner, _) => flattened.extend(inner),
+                    node => flattened.push(node),
+                }
+            }
+            match flattened.len() {
+                1 => flattened.into_iter().next().unwrap(),
+                _ => GrammarNode::Sequence(flattened, span),
+            }
+        }
+        "fields" => {
+            let field_name = view
+                .into_each_field("field_name")
+                .next()
+                .and_then(|field| field.into())
+                .map(|n| n.text().trim())
+                .unwrap_or("");
+            let field_name = Box::leak(field_name.to_string().into_boxed_str()) as &'static str;
+
+            let expr = view
+                .into_each_rule("expr")
+                .next()
+                .map(view_expr)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "Missing field expression in fields node: {}",
+                        view.display()
+                    )
+                });
+
+            GrammarNode::Field(field_name, Box::new(expr), span)
+        }
+        "drop" => {
+            let expr = view
+                .into_each_rule("expr")
+                .next()
+                .map(view_expr)
+                .unwrap_or_else(|| panic!("Missing expression in drop node: {}", view.display()));
+            let count = view
+                .into_each()
+                .find_map(|child| child.text().trim().parse::<usize>().ok())
+                .unwrap_or_else(|| panic!("Missing drop count in drop node: {}", view.display()));
+
+            GrammarNode::Drop {
+                node: Box::new(expr),
+                count,
+                span,
+            }
+        }
+        "some" => view_repetition_expr(view, 1),
+        "many" => view_repetition_expr(view, 0),
+        "terminal" => view_terminal(view),
+        "reference" => {
+            let ident = Box::leak(view.text().trim().to_string().into_boxed_str());
+            GrammarNode::UnboundReference(ident.to_string(), span)
+        }
+        "token" => view_token(view),
+        "literal" => view_literal(view),
+        _ => unimplemented!(
+            "Unsupported expression type: {}",
+            view.rule_name().unwrap_or("")
+        ),
+    }
+}
+
+fn view_repetition_expr(view: View, min: usize) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
+    let expr = view
+        .into_each_rule("expr")
+        .next()
+        .map(view_expr)
+        .unwrap_or_else(|| panic!("Missing repeated expression in node: {}", view.display()));
+
+    let sep = view.into_each_field("sep").next().and_then(|field| {
+        field
+            .into()
+            .and_then(|value| value.into_each_rule("expr").next())
+            .map(view_expr)
+    });
+
+    if let Some(separator) = sep {
+        GrammarNode::SeparatedRepetition {
+            node: Box::new(expr),
+            separator: Box::new(separator),
+            min,
+            max: None,
+            span,
+        }
+    } else {
+        GrammarNode::Repetition {
+            node: Box::new(expr),
+            min,
+            max: None,
+            span,
         }
     }
 }
+fn view_leaf_expr(view: View) -> GrammarNode {
+    let text = view.text().trim();
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
+    assert!(
+        !text.is_empty(),
+        "Expected concrete expr leaf, got empty text"
+    );
 
-// Helper functions for DSL
-
-/// Defines a named rule reference in the grammar.
-///
-/// Use the `r!` macro for more ergonomic syntax when defining rules.
-pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
-    GrammarNode::Reference(f, name)
-}
-
-/// Defines a terminal matcher in the grammar.
-pub fn t<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Arc::new(matcher))
-}
-
-/// Defines a terminal matcher which skips leading trivia (whitespace/newlines).
-pub fn tt<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Arc::new(token(matcher)))
-}
-
-/// Defines a sequence of grammar nodes.
-///
-/// Use the `+` operator for more ergonomic syntax when defining sequences.
-pub fn seq(nodes: Vec<GrammarNode>) -> GrammarNode {
-    GrammarNode::Sequence(nodes)
-}
-
-/// Defines an alternative between grammar nodes.
-///
-/// Use the `|` operator for more ergonomic syntax when defining alternatives.
-pub fn alt(nodes: Vec<GrammarNode>) -> GrammarNode {
-    GrammarNode::Alternative(nodes)
-}
-
-/// Defines an optional grammar node (zero or one occurrence).
-///
-/// It is equivalent to `repeat(node, 0..=1)` or `node | seq(vec![])`.
-pub fn opt(node: GrammarNode) -> GrammarNode {
-    GrammarNode::Repetition {
-        node: Box::new(node),
-        min: 0,
-        max: Some(1),
+    if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
+        let inner = text.trim_matches('"');
+        let inner = Box::leak(inner.to_string().into_boxed_str()) as &'static str;
+        return GrammarNode::Terminal(Arc::new(words::token(inner)), span);
     }
+
+    if text.chars().all(|c| c.is_ascii_digit()) {
+        return GrammarNode::Terminal(Arc::new(words::token(words::NUMS)), span);
+    }
+
+    if let Some(node) = match text {
+        "IDENT" | "STRING" | "NUMBER" | "ALPHANUMS" | "ALPHABETS" | "EOF" => Some(view_token(view)),
+        _ => None,
+    } {
+        return node;
+    }
+
+    GrammarNode::UnboundReference(text.to_string(), span)
 }
 
-/// Defines a grammar node that can be repeated with specified bounds.
-///
-/// The `range` parameter specifies the minimum and maximum number of occurrences. For example:
-/// - `0..` means zero or more occurrences (equivalent to `many`)
-/// - `1..` means one or more occurrences (equivalent to `some`)
-/// - `0..=1` means zero or one occurrence (equivalent to `opt`)
-pub fn repeat<R: RangeBounds<usize>>(node: GrammarNode, range: R) -> GrammarNode {
-    let min = match range.start_bound() {
-        std::ops::Bound::Included(&n) => n,
-        std::ops::Bound::Excluded(&n) => n + 1,
-        std::ops::Bound::Unbounded => 0,
+fn view_token(view: View) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
+    let token_name = view.text().trim();
+    let matcher: Arc<dyn Matcher + Send + Sync> = match token_name {
+        "IDENT" => Arc::new(words::token(words::IDENT)),
+        "STRING" => Arc::new(words::token(words::STRING)),
+        "NUMBER" => Arc::new(words::token(words::NUMS)),
+        "ALPHANUMS" => Arc::new(words::token(words::ALPHANUMS)),
+        "ALPHABETS" => Arc::new(words::token(words::ALPHAS)),
+        "EOF" => Arc::new(words::token(words::EndOfInput)),
+        _ => panic!("Unsupported token type: {}", token_name),
     };
-    let max = match range.end_bound() {
-        std::ops::Bound::Included(&n) => Some(n),
-        std::ops::Bound::Excluded(&n) => Some(n.saturating_sub(1)),
-        std::ops::Bound::Unbounded => None,
-    };
-    GrammarNode::Repetition {
-        node: Box::new(node),
-        min,
-        max,
+    GrammarNode::Terminal(matcher, span)
+}
+
+fn view_literal(view: View) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
+    let text = view
+        .into_each()
+        .find(|child| {
+            let raw = child.text().trim();
+            !raw.is_empty() && raw != "\""
+        })
+        .map(|child| child.text().trim())
+        .unwrap_or("");
+
+    let text = Box::leak(text.to_string().into_boxed_str()) as &'static str;
+    GrammarNode::Terminal(Arc::new(words::token(text)), span)
+}
+
+fn view_terminal(view: View) -> GrammarNode {
+    if let Some(expr) = view.into_each_rule("expr").next() {
+        return view_expr(expr);
     }
-}
 
-/// Defines a grammar node that can be repeated zero or more times.
-///
-/// It is equivalent to `repeat(node, 0..)`.
-pub fn many(node: GrammarNode) -> GrammarNode {
-    GrammarNode::Repetition {
-        node: Box::new(node),
-        min: 0,
-        max: None,
+    if let Some(token) = view.into_each_rule("token").next() {
+        return view_token(token);
     }
-}
 
-/// Defines a grammar node that can be repeated one or more times.
-///
-/// It is equivalent to `repeat(node, 1..)`.
-pub fn some(node: GrammarNode) -> GrammarNode {
-    GrammarNode::Repetition {
-        node: Box::new(node),
-        min: 1,
-        max: None,
+    if let Some(literal) = view.into_each_rule("literal").next() {
+        return view_literal(literal);
     }
+
+    panic!("Unsupported terminal shape: {}", view.display())
 }
 
-/// Defines a grammar node that can be repeated zero or more times with a separator between occurrences.
-pub fn sep(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
-    GrammarNode::SeparatedRepetition {
-        node: Box::new(node),
-        separator: Box::new(separator),
-        min: 0,
-        max: None,
-    }
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parsec::Parser;
 
-/// Defines a grammar node that can be repeated one or more times with a separator between occurrences.
-pub fn sep1(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
-    GrammarNode::SeparatedRepetition {
-        node: Box::new(node),
-        separator: Box::new(separator),
-        min: 1,
-        max: None,
-    }
-}
+    #[test]
+    fn test_dsl_grammar() {
+        let grammar = Grammar::load_from_binary(Asset::get("grammax.gmx.bin").unwrap().data)
+            .expect("Failed to load grammar");
+        // let (pass, _) = CompilerBuilder::new()
+        //     .then_pass(ParserPass::new(grammar))
+        //     .then_layer(RedGreenTreeIR::default())
+        //     .tap();
 
-/// Defines a named field in the grammar, which is convenient for AST construction and semantic analysis.
-pub fn field(name: &'static str, node: GrammarNode) -> GrammarNode {
-    GrammarNode::Field(name, Box::new(node))
-}
+        // let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
+        //     ComposedCompiler::from_pass_with_events(pass, evt_tx)
+        // });
+        // runtime.run().expect("runtime failed");
 
-// Operator overloading for ergonomic DSL
+        let mut parser = Parser::new(grammar);
 
-impl ops::Add for GrammarNode {
-    type Output = GrammarNode;
+        println!("Grammar:\n{}", parser.grammar.table);
 
-    fn add(self, rhs: GrammarNode) -> Self::Output {
-        match self {
-            GrammarNode::Sequence(mut nodes) => {
-                nodes.push(rhs);
-                GrammarNode::Sequence(nodes)
+        let text = r#"
+start -> expr EOF
+expr -> add | mul | primary
+add -> lhs:expr "+" rhs:expr/1
+mul -> lhs:expr/1 "*" rhs:expr/2
+primary -> NUMBER | "(" expr ")"
+"#;
+
+        let result = parser.parse_text(text);
+
+        let output = result.format_ast();
+
+        println!("AST {}:\n{}", text, output);
+        println!("Messages:\n{}", result.format_messages());
+
+        let result = translate_dsl_grammar(result);
+        match result {
+            Ok(translated_grammar) => {
+                println!("Translated Grammar:\n{}", translated_grammar.table);
             }
-            _ => GrammarNode::Sequence(vec![self, rhs]),
-        }
-    }
-}
-
-impl ops::BitOr for GrammarNode {
-    type Output = GrammarNode;
-
-    fn bitor(self, rhs: GrammarNode) -> Self::Output {
-        match self {
-            GrammarNode::Alternative(mut nodes) => {
-                nodes.push(rhs);
-                GrammarNode::Alternative(nodes)
+            Err(e) => {
+                println!("Error translating grammar: {:?}", e);
             }
-            _ => GrammarNode::Alternative(vec![self, rhs]),
         }
     }
 }

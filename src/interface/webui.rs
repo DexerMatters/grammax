@@ -156,8 +156,8 @@ fn is_port_free(host: &str, port: u16) -> bool {
 
 fn signal_to_response(signal: &runtime::RuntimeSignal) -> serde_json::Value {
     match signal {
-        runtime::RuntimeSignal::Event { event } => event.payload.clone(),
-        runtime::RuntimeSignal::QueryResult { value, .. } => value.clone(),
+        runtime::RuntimeSignal::Event { event } => event.payload.to_json(),
+        runtime::RuntimeSignal::QueryResult { value, .. } => value.to_json(),
         runtime::RuntimeSignal::Accepted { .. } | runtime::RuntimeSignal::Ack => {
             serde_json::json!({})
         }
@@ -282,11 +282,12 @@ fn build_tree_snapshot(this: &WebPreviewInterface) -> runtime::RuntimeResult<ser
 fn extract_source_text(signal: &runtime::RuntimeSignal) -> runtime::RuntimeResult<String> {
     match signal {
         runtime::RuntimeSignal::QueryResult { value, .. } => {
-            serde_json::from_value::<String>(value.clone()).map_err(|err| {
-                runtime::RuntimeError::InvalidRequest {
-                    message: format!("failed to decode source text query result: {err}"),
-                }
-            })
+            value
+                .downcast_ref::<String>()
+                .cloned()
+                .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
+                    message: "source text query result was not a String".to_string(),
+                })
         }
         other => Err(runtime::RuntimeError::InvalidRequest {
             message: format!("unexpected signal for source query: {other:?}"),

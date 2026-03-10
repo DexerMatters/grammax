@@ -205,31 +205,18 @@ pub(crate) struct GrammarRegistry {
 }
 
 impl GrammarRegistry {
-    /// Create a new empty registry
     pub fn new() -> Self {
         GrammarRegistry {
             rules: FxHashMap::default(),
         }
     }
 
-    /// Create a registry from a HashMap of rules
     pub fn from_map(rules: FxHashMap<&'static str, GrammarNode>) -> Self {
         GrammarRegistry { rules }
     }
 
-    /// Get a rule by name
     pub fn get(&self, name: &str) -> Option<&GrammarNode> {
         self.rules.get(name)
-    }
-
-    /// Check if a rule exists
-    pub fn contains(&self, name: &str) -> bool {
-        self.rules.contains_key(name)
-    }
-
-    /// Iterate over all rules
-    pub fn iter(&self) -> impl Iterator<Item = (&'static str, &GrammarNode)> {
-        self.rules.iter().map(|(name, node)| (*name, node))
     }
 }
 

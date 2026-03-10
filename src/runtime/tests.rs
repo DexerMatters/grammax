@@ -98,7 +98,7 @@ fn test_service_subscription_uses_same_selector_logic_as_completion() {
     match signal {
         RuntimeSignal::Event { event } => {
             assert_eq!(event.revision, 1);
-            assert!(event.payload.is_array());
+            assert!(event.payload.to_json().is_array());
         }
         other => panic!("expected event signal, got {other:?}"),
     }
@@ -106,7 +106,7 @@ fn test_service_subscription_uses_same_selector_logic_as_completion() {
     match response {
         RuntimeSignal::Event { event } => {
             assert_eq!(event.revision, 1);
-            assert!(event.payload.is_array());
+            assert!(event.payload.to_json().is_array());
         }
         other => panic!("expected event signal, got {other:?}"),
     }

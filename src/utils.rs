@@ -261,7 +261,6 @@ impl From<Span> for ops::Range<usize> {
 #[derive(Debug, Clone)]
 pub(crate) struct LineIndex {
     line_starts: Vec<usize>,
-    line_utf16_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,38 +289,7 @@ impl LineIndex {
             }
         }
 
-        LineIndex {
-            line_starts,
-            line_utf16_offsets,
-        }
-    }
-
-    pub fn byte_to_line_col(&self, byte_pos: usize) -> LineCol {
-        // Binary search for the line containing this byte offset
-        let line_idx = self
-            .line_starts
-            .binary_search(&byte_pos)
-            .unwrap_or_else(|next_idx| next_idx.saturating_sub(1));
-
-        let line = line_idx + 1; // Convert to 1-indexed
-        let line_start_byte = self.line_starts[line_idx];
-        let _line_start_utf16 = self.line_utf16_offsets[line_idx];
-
-        // Compute UTF-16 column: count UTF-16 code units from line start to byte_pos
-        let mut col = 0;
-        let text_slice = &self.source_for_line(line_idx);
-        for (byte_offset, ch) in text_slice.char_indices() {
-            if line_start_byte + byte_offset >= byte_pos {
-                break;
-            }
-            col += ch.len_utf16();
-        }
-
-        LineCol { line, col }
-    }
-
-    fn source_for_line(&self, _line_idx: usize) -> &'static str {
-        ""
+        LineIndex { line_starts }
     }
 
     pub fn byte_to_line_col_with_text(&self, byte_pos: usize, text: &str) -> LineCol {
@@ -356,10 +324,5 @@ impl LineIndex {
         }
 
         LineCol { line, col }
-    }
-
-    /// Get the byte length of a text in UTF-16 code units.
-    pub fn text_len_utf16(text: &str) -> usize {
-        text.chars().map(|ch| ch.len_utf16()).sum()
     }
 }

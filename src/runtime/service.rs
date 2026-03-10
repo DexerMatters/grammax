@@ -196,7 +196,7 @@ fn handle_request(
         }
         RuntimeRequest::QueryLayer { layer, index } => {
             let response = compiler
-                .query_json(layer.clone(), index)
+                .query(layer.clone(), index)
                 .map(|value| RuntimeSignal::QueryResult { layer, value });
             let _ = reply.send(response);
             LoopControl::Continue
@@ -350,6 +350,7 @@ fn signal_error_message(signal: &RuntimeSignal) -> Option<String> {
 
     event
         .payload
+        .to_json()
         .get("message")
         .and_then(|message| message.as_str())
         .map(ToString::to_string)

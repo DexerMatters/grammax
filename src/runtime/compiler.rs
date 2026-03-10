@@ -12,16 +12,19 @@ use std::{
 
 use crossbeam::channel;
 use serde::{Serialize, de::DeserializeOwned};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::protocol::{RevisionId, RuntimeError, RuntimeEvent, RuntimeResult};
+use super::{
+    payload::Payload,
+    protocol::{RevisionId, RuntimeError, RuntimeEvent, RuntimeResult},
+};
 use crate::{
     scheme::{self, IR, LayerName, PassId, Pipeline, QueryHandle, layers::SourceText},
     utils::Span,
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
-type QueryFn = Arc<dyn Fn(Value) -> RuntimeResult<Value> + Send + Sync>;
+type QueryFn = Arc<dyn Fn(Value) -> RuntimeResult<Payload> + Send + Sync>;
 type SubmitTopFn = Arc<dyn Fn(RevisionId, SourceTxn) -> RuntimeResult<()> + Send + Sync>;
 type ShutdownHook = Box<dyn FnOnce() + Send>;
 type SharedQueries = Arc<Mutex<HashMap<LayerName, QueryFn>>>;
@@ -423,7 +426,7 @@ where
     }
     core.insert_query(
         upstream_layer_name,
-        Arc::new(move |index| query_handle_json::<U>(&upstream_query, index)),
+        Arc::new(move |index| query_handle_any::<U>(&upstream_query, index)),
     );
 
     let downstream_query = pipeline.downstream.query_handle();
@@ -431,7 +434,7 @@ where
         downstream_layer_name.clone(),
         Arc::new({
             let dq = downstream_query.clone();
-            move |index| query_handle_json::<D>(&dq, index)
+            move |index| query_handle_any::<D>(&dq, index)
         }),
     );
 
@@ -622,7 +625,8 @@ impl ComposedCompiler {
         Ok(revision)
     }
 
-    pub fn query_json(&self, layer: impl Into<LayerName>, index: Value) -> RuntimeResult<Value> {
+    /// Query a layer and return the result as a type-erased [`Payload`].
+    pub fn query(&self, layer: impl Into<LayerName>, index: Value) -> RuntimeResult<Payload> {
         let layer = layer.into();
         let query = self
             .queries
@@ -634,11 +638,19 @@ impl ComposedCompiler {
         query(index)
     }
 
+    /// Query a layer and return the serialized JSON value.
+    ///
+    /// Convenience wrapper around [`query`][Self::query] for callers that need
+    /// a [`serde_json::Value`] rather than a typed [`Payload`].
+    pub fn query_json(&self, layer: impl Into<LayerName>, index: Value) -> RuntimeResult<Value> {
+        self.query(layer, index).map(|p| p.to_json())
+    }
+
     pub fn source_text(&self) -> Option<String> {
         let span = Span::new(0, self.source_len);
-        let query = serde_json::to_value(span).ok()?;
-        let value = self.query_json(self.source_layer.clone(), query).ok()?;
-        serde_json::from_value(value).ok()
+        let index = serde_json::to_value(span).ok()?;
+        let payload = self.query(self.source_layer.clone(), index).ok()?;
+        payload.downcast_ref::<String>().cloned()
     }
 
     pub fn layer_names(&self) -> Vec<LayerName> {
@@ -682,11 +694,11 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn query_handle_json<R>(handle: &QueryHandle<R>, index: Value) -> RuntimeResult<Value>
+fn query_handle_any<R>(handle: &QueryHandle<R>, index: Value) -> RuntimeResult<Payload>
 where
     R: IR,
     R::Ix: DeserializeOwned,
-    R::Value: Serialize,
+    R::Value: Serialize + Send + Sync,
     R::Error: fmt::Debug,
 {
     let typed_index: R::Ix = serde_json::from_value(index)
@@ -698,8 +710,7 @@ where
 
     let value = result.map_err(|err| runtime_invalid(format!("query failed: {err:?}")))?;
 
-    serde_json::to_value(value)
-        .map_err(|err| runtime_invalid(format!("query encode failed: {err}")))
+    Ok(Payload::new(value))
 }
 
 fn clone_event_sender(shared: &SharedEventSender) -> Option<channel::Sender<RuntimeEvent>> {
@@ -714,30 +725,24 @@ fn send_layer_event<R>(
     txn: &scheme::Transaction<R>,
 ) where
     R: IR,
-    R::Ix: Serialize,
-    R::Value: Serialize,
+    R::Ix: Serialize + Clone + Send + Sync,
+    R::Value: Serialize + Clone + Send + Sync,
 {
     let Some(sender) = clone_event_sender(sender) else {
         return;
     };
 
-    match serde_json::to_value(txn) {
-        Ok(payload) => {
-            let _ = sender.send(RuntimeEvent {
-                revision,
-                layer,
-                milestone,
-                payload,
-            });
-        }
-        Err(err) => {
-            send_runtime_error_text(
-                &Some(sender),
-                revision,
-                format!("failed to encode layer event payload: {err}"),
-            );
-        }
-    }
+    // Clone the commands field-by-field; this only needs R::Ix: Clone and
+    // R::Value: Clone (not R: Clone).
+    let commands: Vec<scheme::Command<R>> =
+        txn.as_ref().iter().map(|cmd| cmd.clone_fields()).collect();
+    let payload = Payload::new(commands);
+    let _ = sender.send(RuntimeEvent {
+        revision,
+        layer,
+        milestone,
+        payload,
+    });
 }
 
 fn send_runtime_error(sender: &SharedEventSender, revision: RevisionId, err: &RuntimeError) {
@@ -757,13 +762,12 @@ fn send_runtime_error_text(
         return;
     };
 
+    let msg = message.into();
     let _ = sender.send(RuntimeEvent {
         revision,
         layer: LayerName::runtime(),
         milestone: PassId::runtime_error(),
-        payload: json!({
-            "message": message.into(),
-        }),
+        payload: Payload::new(serde_json::json!({ "message": msg })),
     });
 }
 

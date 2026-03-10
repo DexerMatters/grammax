@@ -16,11 +16,20 @@ enum Commands {
     /// Compile a grammar file into a binary format
     Compile {
         /// Path to the input grammar file (e.g. my_grammar.gmx)
-        #[clap(short, long)]
         input: PathBuf,
         /// Path to the output binary file (e.g. my_grammar.gmx.bin)
-        #[clap(short, long)]
+        #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Interactively test a grammar against input strings
+    Cli {
+        /// Path to the compiled grammar file (e.g. my_grammar.gmx.bin)
+        grammar: PathBuf,
+
+        /// Whether to start in web-based interactive mode (default: false)
+        #[arg(short, long, default_value_t = false)]
+        webui: bool,
     },
 }
 
@@ -56,6 +65,12 @@ pub fn main() {
                     println!("{}", format_grammar_error(&e, source));
                 }
             }
+        }
+        Some(Commands::Cli { grammar, webui }) => {
+            cprintln!(
+                "Interactive CLI mode is not implemented yet. (webui: {})",
+                webui
+            );
         }
         None => {
             println!("No command provided. Use --help for usage information.");

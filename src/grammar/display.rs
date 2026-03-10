@@ -6,7 +6,6 @@ use std::fmt;
 
 const RESET: &str = "\x1b[0m";
 const RED: &str = "\x1b[31m";
-const YELLOW: &str = "\x1b[33m";
 
 impl RuleTable {
     fn get_rule_name(&self, idx: usize) -> String {

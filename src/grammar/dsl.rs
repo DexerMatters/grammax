@@ -14,10 +14,12 @@ use crate::{
         view::View,
         words::{self, EndOfInput, IDENT, Matcher, NUMS, STRING},
     },
+    utils::Span,
 };
 
 thread_local! {
-    pub static GRAMMAX_DSL_GRAMMAR: &'static Grammar = new_grammar! {
+    #[allow(dead_code)]
+    static GRAMMAX_DSL_GRAMMAR_PROTOTYPE: &'static Grammar = new_grammar! {
         table where
         table -> sep(r!(rule), t('\n')) + tt(EndOfInput)
         rule -> field("name", tt(IDENT)) + tt("->") + field("definition", r!(expr))
@@ -33,6 +35,28 @@ thread_local! {
         token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMS") | tt("ALPHABETS") | tt("EOF")
         literal -> tt('"') + tt(STRING) + tt('"')
     };
+}
+
+#[inline(always)]
+pub fn grammax_dsl_grammar() -> &'static Grammar {
+    // SAFE: The grammar is loaded from a precompiled binary, which is guaranteed to be valid and immutable.
+    Grammar::load_from_binary(Asset::get("grammax.gmx.bin").unwrap().data)
+        .expect("Failed to load grammar")
+}
+
+impl Grammar {
+    pub fn interpret(dsl: impl AsRef<str>) -> Result<&'static Self, GrammarError> {
+        let mut parser = parsec::Parser::new(grammax_dsl_grammar());
+        let result = parser.parse_text(dsl.as_ref());
+        translate_dsl_grammar(result)
+    }
+
+    pub fn interpret_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<&'static Self, GrammarError> {
+        let text = std::fs::read_to_string(path).map_err(|e| GrammarError::IoError(e))?;
+        Self::interpret(&text)
+    }
 }
 
 #[derive(Embed)]
@@ -59,7 +83,7 @@ fn translate_dsl_grammar(result: parsec::Result<'_>) -> Result<&'static Grammar,
     let registry = edsl::GrammarRegistry::from_map(registry_map);
     start_rule
         .map(|start| Grammar::new_uncached_with_registry(start, registry))
-        .unwrap_or_else(|| Err(GrammarError::NoStartRule))
+        .unwrap_or_else(|| Err(GrammarError::NoStartRule(Span::empty())))
 }
 
 fn view_rule(view: View) -> (&'static str, GrammarNode) {
@@ -71,13 +95,11 @@ fn view_rule(view: View) -> (&'static str, GrammarNode) {
         .and_then(|d| d.into())
         .map(view_expr)
         .unwrap();
-
-    println!("Parsed rule: {} -> {:?}", name, node);
-
     (name, node)
 }
 
 fn view_expr(view: View) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     match view.rule_name().unwrap_or("") {
         "expr" => view
             .into()
@@ -88,21 +110,28 @@ fn view_expr(view: View) -> GrammarNode {
             let mut flattened = Vec::new();
             for expr in exprs {
                 match expr {
-                    GrammarNode::Alternative(inner) => flattened.extend(inner),
+                    GrammarNode::Alternative(inner, _) => flattened.extend(inner),
                     node => flattened.push(node),
                 }
             }
 
             match flattened.len() {
                 1 => flattened.into_iter().next().unwrap(),
-                _ => GrammarNode::Alternative(flattened),
+                _ => GrammarNode::Alternative(flattened, span),
             }
         }
         "sequence" => {
             let exprs: Vec<_> = view.into_each_rule("expr").map(view_expr).collect();
-            match exprs.len() {
-                1 => exprs.into_iter().next().unwrap(),
-                _ => GrammarNode::Sequence(exprs),
+            let mut flattened = Vec::new();
+            for expr in exprs {
+                match expr {
+                    GrammarNode::Sequence(inner, _) => flattened.extend(inner),
+                    node => flattened.push(node),
+                }
+            }
+            match flattened.len() {
+                1 => flattened.into_iter().next().unwrap(),
+                _ => GrammarNode::Sequence(flattened, span),
             }
         }
         "fields" => {
@@ -125,7 +154,7 @@ fn view_expr(view: View) -> GrammarNode {
                     )
                 });
 
-            GrammarNode::Field(field_name, Box::new(expr))
+            GrammarNode::Field(field_name, Box::new(expr), span)
         }
         "drop" => {
             let expr = view
@@ -141,6 +170,7 @@ fn view_expr(view: View) -> GrammarNode {
             GrammarNode::Drop {
                 node: Box::new(expr),
                 count,
+                span,
             }
         }
         "some" => view_repetition_expr(view, 1),
@@ -148,7 +178,7 @@ fn view_expr(view: View) -> GrammarNode {
         "terminal" => view_terminal(view),
         "reference" => {
             let ident = Box::leak(view.text().trim().to_string().into_boxed_str());
-            GrammarNode::UnboundReference(ident.to_string())
+            GrammarNode::UnboundReference(ident.to_string(), span)
         }
         "token" => view_token(view),
         "literal" => view_literal(view),
@@ -160,6 +190,7 @@ fn view_expr(view: View) -> GrammarNode {
 }
 
 fn view_repetition_expr(view: View, min: usize) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     let expr = view
         .into_each_rule("expr")
         .next()
@@ -179,17 +210,20 @@ fn view_repetition_expr(view: View, min: usize) -> GrammarNode {
             separator: Box::new(separator),
             min,
             max: None,
+            span,
         }
     } else {
         GrammarNode::Repetition {
             node: Box::new(expr),
             min,
             max: None,
+            span,
         }
     }
 }
 fn view_leaf_expr(view: View) -> GrammarNode {
     let text = view.text().trim();
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     assert!(
         !text.is_empty(),
         "Expected concrete expr leaf, got empty text"
@@ -198,11 +232,11 @@ fn view_leaf_expr(view: View) -> GrammarNode {
     if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
         let inner = text.trim_matches('"');
         let inner = Box::leak(inner.to_string().into_boxed_str()) as &'static str;
-        return GrammarNode::Terminal(Arc::new(words::token(inner)));
+        return GrammarNode::Terminal(Arc::new(words::token(inner)), span);
     }
 
     if text.chars().all(|c| c.is_ascii_digit()) {
-        return GrammarNode::Terminal(Arc::new(words::token(words::NUMS)));
+        return GrammarNode::Terminal(Arc::new(words::token(words::NUMS)), span);
     }
 
     if let Some(node) = match text {
@@ -212,10 +246,11 @@ fn view_leaf_expr(view: View) -> GrammarNode {
         return node;
     }
 
-    GrammarNode::UnboundReference(text.to_string())
+    GrammarNode::UnboundReference(text.to_string(), span)
 }
 
 fn view_token(view: View) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     let token_name = view.text().trim();
     let matcher: Arc<dyn Matcher + Send + Sync> = match token_name {
         "IDENT" => Arc::new(words::token(words::IDENT)),
@@ -226,10 +261,11 @@ fn view_token(view: View) -> GrammarNode {
         "EOF" => Arc::new(words::token(words::EndOfInput)),
         _ => panic!("Unsupported token type: {}", token_name),
     };
-    GrammarNode::Terminal(matcher)
+    GrammarNode::Terminal(matcher, span)
 }
 
 fn view_literal(view: View) -> GrammarNode {
+    let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     let text = view
         .into_each()
         .find(|child| {
@@ -240,7 +276,7 @@ fn view_literal(view: View) -> GrammarNode {
         .unwrap_or("");
 
     let text = Box::leak(text.to_string().into_boxed_str()) as &'static str;
-    GrammarNode::Terminal(Arc::new(words::token(text)))
+    GrammarNode::Terminal(Arc::new(words::token(text)), span)
 }
 
 fn view_terminal(view: View) -> GrammarNode {

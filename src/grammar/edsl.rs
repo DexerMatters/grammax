@@ -4,33 +4,37 @@ use std::{
 };
 
 use crate::parsec::words::{Matcher, MatcherRef, token};
+use crate::utils::Span;
 use rustc_hash::FxHashMap;
 
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub enum GrammarNode {
-    Terminal(MatcherRef),
-    Alternative(Vec<GrammarNode>),
-    Sequence(Vec<GrammarNode>),
+    Terminal(MatcherRef, Span),
+    Alternative(Vec<GrammarNode>, Span),
+    Sequence(Vec<GrammarNode>, Span),
     /// Bound reference resolved at compile-time via function pointer
-    Reference(fn() -> GrammarNode, &'static str),
+    Reference(fn() -> GrammarNode, &'static str, Span),
     /// Unbound reference resolved at runtime via GrammarRegistry
-    UnboundReference(String),
-    Field(&'static str, Box<GrammarNode>),
+    UnboundReference(String, Span),
+    Field(&'static str, Box<GrammarNode>, Span),
     Drop {
         node: Box<GrammarNode>,
         count: usize,
+        span: Span,
     },
     Repetition {
         node: Box<GrammarNode>,
         min: usize,
         max: Option<usize>,
+        span: Span,
     },
     SeparatedRepetition {
         node: Box<GrammarNode>,
         separator: Box<GrammarNode>,
         min: usize,
         max: Option<usize>,
+        span: Span,
     },
 }
 
@@ -39,6 +43,7 @@ impl GrammarNode {
         GrammarNode::Drop {
             node: Box::new(self),
             count,
+            span: Span::empty(),
         }
     }
 }
@@ -49,31 +54,31 @@ impl GrammarNode {
 ///
 /// Use the `r!` macro for more ergonomic syntax when defining rules.
 pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
-    GrammarNode::Reference(f, name)
+    GrammarNode::Reference(f, name, Span::empty())
 }
 
 /// Defines a terminal matcher in the grammar.
 pub fn t<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Arc::new(matcher))
+    GrammarNode::Terminal(Arc::new(matcher), Span::empty())
 }
 
 /// Defines a terminal matcher which skips leading trivia (whitespace/newlines).
 pub fn tt<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Arc::new(token(matcher)))
+    GrammarNode::Terminal(Arc::new(token(matcher)), Span::empty())
 }
 
 /// Defines a sequence of grammar nodes.
 ///
 /// Use the `+` operator for more ergonomic syntax when defining sequences.
 pub fn seq(nodes: Vec<GrammarNode>) -> GrammarNode {
-    GrammarNode::Sequence(nodes)
+    GrammarNode::Sequence(nodes, Span::empty())
 }
 
 /// Defines an alternative between grammar nodes.
 ///
 /// Use the `|` operator for more ergonomic syntax when defining alternatives.
 pub fn alt(nodes: Vec<GrammarNode>) -> GrammarNode {
-    GrammarNode::Alternative(nodes)
+    GrammarNode::Alternative(nodes, Span::empty())
 }
 
 /// Defines an optional grammar node (zero or one occurrence).
@@ -84,6 +89,7 @@ pub fn opt(node: GrammarNode) -> GrammarNode {
         node: Box::new(node),
         min: 0,
         max: Some(1),
+        span: Span::empty(),
     }
 }
 
@@ -108,6 +114,7 @@ pub fn repeat<R: RangeBounds<usize>>(node: GrammarNode, range: R) -> GrammarNode
         node: Box::new(node),
         min,
         max,
+        span: Span::empty(),
     }
 }
 
@@ -119,6 +126,7 @@ pub fn many(node: GrammarNode) -> GrammarNode {
         node: Box::new(node),
         min: 0,
         max: None,
+        span: Span::empty(),
     }
 }
 
@@ -130,6 +138,7 @@ pub fn some(node: GrammarNode) -> GrammarNode {
         node: Box::new(node),
         min: 1,
         max: None,
+        span: Span::empty(),
     }
 }
 
@@ -140,6 +149,7 @@ pub fn sep(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
         separator: Box::new(separator),
         min: 0,
         max: None,
+        span: Span::empty(),
     }
 }
 
@@ -150,12 +160,13 @@ pub fn sep1(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
         separator: Box::new(separator),
         min: 1,
         max: None,
+        span: Span::empty(),
     }
 }
 
 /// Defines a named field in the grammar, which is convenient for AST construction and semantic analysis.
 pub fn field(name: &'static str, node: GrammarNode) -> GrammarNode {
-    GrammarNode::Field(name, Box::new(node))
+    GrammarNode::Field(name, Box::new(node), Span::empty())
 }
 
 // Operator overloading for ergonomic DSL
@@ -165,11 +176,11 @@ impl ops::Add for GrammarNode {
 
     fn add(self, rhs: GrammarNode) -> Self::Output {
         match self {
-            GrammarNode::Sequence(mut nodes) => {
+            GrammarNode::Sequence(mut nodes, span) => {
                 nodes.push(rhs);
-                GrammarNode::Sequence(nodes)
+                GrammarNode::Sequence(nodes, span)
             }
-            _ => GrammarNode::Sequence(vec![self, rhs]),
+            _ => GrammarNode::Sequence(vec![self, rhs], Span::empty()),
         }
     }
 }
@@ -179,11 +190,11 @@ impl ops::BitOr for GrammarNode {
 
     fn bitor(self, rhs: GrammarNode) -> Self::Output {
         match self {
-            GrammarNode::Alternative(mut nodes) => {
+            GrammarNode::Alternative(mut nodes, span) => {
                 nodes.push(rhs);
-                GrammarNode::Alternative(nodes)
+                GrammarNode::Alternative(nodes, span)
             }
-            _ => GrammarNode::Alternative(vec![self, rhs]),
+            _ => GrammarNode::Alternative(vec![self, rhs], Span::empty()),
         }
     }
 }

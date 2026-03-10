@@ -16,6 +16,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
 
+use crate::utils::Span;
+
 /// Static storage for cached grammars
 /// Maps cache key to static reference of Grammar
 static GRAMMAR_CACHE: OnceLock<Mutex<FxHashMap<u64, &'static Grammar>>> = OnceLock::new();
@@ -84,9 +86,12 @@ macro_rules! new_grammar {
 
 #[derive(Debug)]
 pub enum GrammarError {
-    UnboundRuleReference(String),
-    DuplicateRuleName(String),
-    NoStartRule,
+    UnboundRuleReference(Span, String),
+    DuplicateRuleName(Span, String),
+    NoStartRule(Span),
+    DropCountExceedsNodeLength(Span),
+    DropOnNonReference(Span),
+    IoError(io::Error),
 }
 
 /// The grammar structure, which contains the normalized rule table and analyses for parsing and error recovery.
@@ -160,21 +165,13 @@ impl Grammar {
         Ok(Box::leak(Box::new(grammar)))
     }
 
-    pub(crate) fn new_with_registry(
-        start_rule: &'static str,
-        registry: edsl::GrammarRegistry,
-    ) -> Result<&'static Self, GrammarError> {
-        Self::new_uncached_with_registry(start_rule, registry)
-    }
-
     pub(crate) fn new_uncached_with_registry(
         start_rule: &'static str,
         registry: edsl::GrammarRegistry,
     ) -> Result<&'static Self, GrammarError> {
-        let node = registry
-            .get(start_rule)
-            .cloned()
-            .ok_or_else(|| GrammarError::UnboundRuleReference(start_rule.to_string()))?;
+        let node = registry.get(start_rule).cloned().ok_or_else(|| {
+            GrammarError::UnboundRuleReference(Span::empty(), start_rule.to_string())
+        })?;
 
         let table = norm::RuleTable::normalize_with_registry(node, start_rule, Some(registry))?;
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
@@ -247,46 +244,46 @@ impl Grammar {
         use edsl::GrammarNode;
 
         match node {
-            GrammarNode::Terminal(matcher) => {
+            GrammarNode::Terminal(matcher, _) => {
                 0u8.hash(hasher);
                 matcher.display().hash(hasher);
                 matcher.preview().hash(hasher);
                 matcher.is_nullable().hash(hasher);
                 matcher.is_consuming().hash(hasher);
             }
-            GrammarNode::Alternative(nodes) => {
+            GrammarNode::Alternative(nodes, _) => {
                 1u8.hash(hasher);
                 nodes.len().hash(hasher);
                 for child in nodes {
                     Self::hash_dsl_node(child, hasher);
                 }
             }
-            GrammarNode::Sequence(nodes) => {
+            GrammarNode::Sequence(nodes, _) => {
                 2u8.hash(hasher);
                 nodes.len().hash(hasher);
                 for child in nodes {
                     Self::hash_dsl_node(child, hasher);
                 }
             }
-            GrammarNode::Reference(_, name) => {
+            GrammarNode::Reference(_, name, _) => {
                 3u8.hash(hasher);
                 name.hash(hasher);
             }
-            GrammarNode::UnboundReference(name) => {
+            GrammarNode::UnboundReference(name, _) => {
                 8u8.hash(hasher);
                 name.hash(hasher);
             }
-            GrammarNode::Field(name, inner) => {
+            GrammarNode::Field(name, inner, _) => {
                 4u8.hash(hasher);
                 name.hash(hasher);
                 Self::hash_dsl_node(inner, hasher);
             }
-            GrammarNode::Drop { node, count } => {
+            GrammarNode::Drop { node, count, .. } => {
                 5u8.hash(hasher);
                 count.hash(hasher);
                 Self::hash_dsl_node(node, hasher);
             }
-            GrammarNode::Repetition { node, min, max } => {
+            GrammarNode::Repetition { node, min, max, .. } => {
                 6u8.hash(hasher);
                 min.hash(hasher);
                 max.hash(hasher);
@@ -297,6 +294,7 @@ impl Grammar {
                 separator,
                 min,
                 max,
+                ..
             } => {
                 7u8.hash(hasher);
                 min.hash(hasher);

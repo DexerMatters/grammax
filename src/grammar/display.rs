@@ -1,6 +1,12 @@
+use crate::grammar::GrammarError;
 use crate::grammar::ir::{NormalizedNode, Production, Symbol};
 use crate::grammar::norm::RuleTable;
+use crate::utils::Span;
 use std::fmt;
+
+const RESET: &str = "\x1b[0m";
+const RED: &str = "\x1b[31m";
+const YELLOW: &str = "\x1b[33m";
 
 impl RuleTable {
     fn get_rule_name(&self, idx: usize) -> String {
@@ -138,5 +144,166 @@ impl fmt::Display for Symbol {
             Symbol::Terminal(idx) => write!(f, "T{}", idx),
             Symbol::NonTerminal(idx) => write!(f, "N{}", idx),
         }
+    }
+}
+
+/// Format a grammar error with source context showing the problematic span
+pub fn format_grammar_error(error: &GrammarError, source: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::new();
+    let lines: Vec<&str> = source.lines().collect();
+
+    if lines.is_empty() {
+        // No source to display, just show the error message
+        return format_grammar_error_message(error);
+    }
+
+    let span = match error {
+        GrammarError::UnboundRuleReference(span, _)
+        | GrammarError::DuplicateRuleName(span, _)
+        | GrammarError::NoStartRule(span)
+        | GrammarError::DropCountExceedsNodeLength(span)
+        | GrammarError::DropOnNonReference(span) => span,
+        _ => &Span::empty(),
+    };
+
+    // If span is empty (start == end == 0), just show the error message
+    if span.start == 0 && span.end == 0 {
+        return format_grammar_error_message(error);
+    }
+
+    let (start_line, start_col) = Span::new(span.start, span.start).start_line_col(source);
+    let (end_line, end_col) = Span::new(span.end, span.end).end_line_col(source);
+
+    let error_msg = match error {
+        GrammarError::UnboundRuleReference(_, name) => {
+            format!("{}error: unbound rule reference '{}'{}", RED, name, RESET)
+        }
+        GrammarError::DuplicateRuleName(_, name) => {
+            format!("{}error: duplicate rule name '{}'{}", RED, name, RESET)
+        }
+        GrammarError::NoStartRule(_) => {
+            format!("{}error: no start rule defined{}", RED, RESET)
+        }
+        GrammarError::DropCountExceedsNodeLength(_) => {
+            format!("{}error: drop count exceeds node length{}", RED, RESET)
+        }
+        GrammarError::DropOnNonReference(_) => {
+            format!(
+                "{}error: drop can only be applied to references{}",
+                RED, RESET
+            )
+        }
+        GrammarError::IoError(e) => {
+            format!("{}error: I/O error - {}{}", RED, e, RESET)
+        }
+    };
+
+    let _ = write!(out, "{} at {}:{}", error_msg, start_line, start_col);
+
+    // Show context lines
+    if source.is_empty() {
+        return out;
+    }
+    format_error_context(&mut out, &lines, start_line, end_line, start_col, end_col);
+    out
+}
+
+/// Format just the error message without source context
+pub fn format_grammar_error_message(error: &GrammarError) -> String {
+    match error {
+        GrammarError::UnboundRuleReference(_, name) => {
+            format!("{}error: unbound rule reference '{}'{}", RED, name, RESET)
+        }
+        GrammarError::DuplicateRuleName(_, name) => {
+            format!("{}error: duplicate rule name '{}'{}", RED, name, RESET)
+        }
+        GrammarError::NoStartRule(_) => {
+            format!("{}error: no start rule defined{}", RED, RESET)
+        }
+        GrammarError::DropCountExceedsNodeLength(_) => {
+            format!("{}error: drop count exceeds node length{}", RED, RESET)
+        }
+        GrammarError::DropOnNonReference(_) => {
+            format!(
+                "{}error: drop can only be applied to references{}",
+                RED, RESET
+            )
+        }
+        GrammarError::IoError(e) => {
+            format!("{}error: I/O error - {}{}", RED, e, RESET)
+        }
+    }
+}
+
+fn format_error_context(
+    out: &mut String,
+    lines: &[&str],
+    start_line: usize,
+    end_line: usize,
+    start_col: usize,
+    end_col: usize,
+) {
+    use std::fmt::Write;
+
+    if lines.is_empty() || start_line == 0 {
+        return;
+    }
+
+    let line_idx = start_line - 1; // Convert to 0-indexed
+    let context_before = if line_idx > 0 { 1 } else { 0 };
+    let context_after = if line_idx + 1 < lines.len() { 1 } else { 0 };
+
+    let first_line = line_idx.saturating_sub(context_before);
+    let last_line = (line_idx + context_after).min(lines.len() - 1);
+    let gutter_width = format!("{}", last_line + 1).len().max(1);
+
+    // Show lines before
+    for i in first_line..line_idx {
+        let _ = write!(
+            out,
+            "\n{:>width$} | {}",
+            i + 1,
+            lines[i],
+            width = gutter_width
+        );
+    }
+
+    // Show error line with red coloring
+    let _ = write!(
+        out,
+        "\n{}{:>width$} | {}{}",
+        RED,
+        line_idx + 1,
+        lines[line_idx],
+        RESET,
+        width = gutter_width
+    );
+
+    // Show underline/arrow
+    let underline_indent = gutter_width + 3; // gutter + " | "
+    let _ = write!(out, "\n{}", " ".repeat(underline_indent));
+    let _ = write!(out, "{}", " ".repeat(start_col));
+
+    // Show underline spanning the error
+    if start_line == end_line && start_col < end_col {
+        let len = end_col - start_col;
+        let _ = write!(out, "{}", RED);
+        let _ = write!(out, "{}", "~".repeat(len.max(1)));
+        let _ = write!(out, "{}", RESET);
+    } else {
+        let _ = write!(out, "{}^{}", RED, RESET);
+    }
+
+    // Show lines after
+    for i in (line_idx + 1)..=last_line {
+        let _ = write!(
+            out,
+            "\n{:>width$} | {}",
+            i + 1,
+            lines[i],
+            width = gutter_width
+        );
     }
 }

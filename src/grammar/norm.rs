@@ -4,6 +4,7 @@ use crate::grammar::GrammarError;
 use crate::grammar::edsl::{GrammarNode, GrammarRegistry};
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::parsec::words::MatcherRef;
+use crate::utils::Span;
 
 /// Normalized grammar optimized for LR parsing
 #[derive(Debug, Clone)]
@@ -338,9 +339,9 @@ impl Normalizer {
     /// Normalizes a DSL node
     fn normalize_node(&mut self, node: GrammarNode) -> Result<NormalizedNode, GrammarError> {
         match node {
-            GrammarNode::Terminal(m) => Ok(NormalizedNode::Terminal(m)),
+            GrammarNode::Terminal(m, _) => Ok(NormalizedNode::Terminal(m)),
 
-            GrammarNode::Alternative(alts) => {
+            GrammarNode::Alternative(alts, _) => {
                 let normalized: Result<Vec<_>, _> = alts
                     .into_iter()
                     .map(|alt| self.normalize_node(alt))
@@ -348,7 +349,7 @@ impl Normalizer {
                 Ok(NormalizedNode::Alternative(normalized?))
             }
 
-            GrammarNode::Sequence(parts) => {
+            GrammarNode::Sequence(parts, _) => {
                 let normalized: Result<Vec<_>, _> = parts
                     .into_iter()
                     .map(|part| self.normalize_node(part))
@@ -356,13 +357,13 @@ impl Normalizer {
                 Ok(NormalizedNode::Sequence(normalized?))
             }
 
-            GrammarNode::Reference(f, name) => {
+            GrammarNode::Reference(f, name, _) => {
                 let rule_node = f();
                 let ix = self.discover_rule(rule_node, name)?;
                 Ok(NormalizedNode::Reference(ix))
             }
 
-            GrammarNode::UnboundReference(name) => {
+            GrammarNode::UnboundReference(name, span) => {
                 // Resolve from registry
                 if let Some(registry) = &self.registry {
                     if let Some(rule_node) = registry.get(&name) {
@@ -370,29 +371,32 @@ impl Normalizer {
                         let ix = self.discover_rule(rule_node.clone(), name_leaked)?;
                         Ok(NormalizedNode::Reference(ix))
                     } else {
-                        Err(GrammarError::UnboundRuleReference(name))
+                        Err(GrammarError::UnboundRuleReference(span, name))
                     }
                 } else {
-                    Err(GrammarError::UnboundRuleReference(name))
+                    Err(GrammarError::UnboundRuleReference(span, name))
                 }
             }
 
-            GrammarNode::Field(name, inner) => {
+            GrammarNode::Field(name, inner, _) => {
                 let normalized = self.normalize_node(*inner)?;
                 Ok(NormalizedNode::Field(name, Box::new(normalized)))
             }
 
             // Desugar repetitions
-            GrammarNode::Repetition { node, min, max } => self.desugar_repetition(*node, min, max),
+            GrammarNode::Repetition { node, min, max, .. } => {
+                self.desugar_repetition(*node, min, max)
+            }
 
             GrammarNode::SeparatedRepetition {
                 node,
                 separator,
                 min,
                 max,
+                ..
             } => self.desugar_separated_repetition(*node, *separator, min, max),
 
-            GrammarNode::Drop { node, count } => match self.normalize_node(*node)? {
+            GrammarNode::Drop { node, count, span } => match self.normalize_node(*node)? {
                 NormalizedNode::Reference(target_ix) => {
                     if count == 0 {
                         return Ok(NormalizedNode::Reference(target_ix));
@@ -417,9 +421,7 @@ impl Normalizer {
                     self.pending_drops.insert((target_ix, count), helper_ix);
                     Ok(NormalizedNode::Reference(helper_ix))
                 }
-                _ => Err(GrammarError::UnboundRuleReference(
-                    "Drop can only be applied to References".to_string(),
-                )),
+                _ => Err(GrammarError::DropOnNonReference(span)),
             },
         }
     }
@@ -662,22 +664,24 @@ impl Normalizer {
     /// Placeholder for converting normalized back to DSL (for repetition desugaring)
     fn denormalize_node(&self, node: NormalizedNode) -> GrammarNode {
         match node {
-            NormalizedNode::Terminal(m) => GrammarNode::Terminal(m),
+            NormalizedNode::Terminal(m) => GrammarNode::Terminal(m, Span::empty()),
             NormalizedNode::Alternative(alts) => GrammarNode::Alternative(
                 alts.into_iter().map(|a| self.denormalize_node(a)).collect(),
+                Span::empty(),
             ),
             NormalizedNode::Sequence(parts) => GrammarNode::Sequence(
                 parts
                     .into_iter()
                     .map(|p| self.denormalize_node(p))
                     .collect(),
+                Span::empty(),
             ),
             NormalizedNode::Reference(ix) => {
                 let name = self.rules[ix].name;
-                GrammarNode::Reference(|| unreachable!(), name)
+                GrammarNode::Reference(|| unreachable!(), name, Span::empty())
             }
             NormalizedNode::Field(name, inner) => {
-                GrammarNode::Field(name, Box::new(self.denormalize_node(*inner)))
+                GrammarNode::Field(name, Box::new(self.denormalize_node(*inner)), Span::empty())
             }
         }
     }

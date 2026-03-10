@@ -205,26 +205,26 @@ pub struct Span {
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self {
+    pub const fn new(start: usize, end: usize) -> Self {
         Span { start, end }
     }
-    pub fn new_len(offset: usize, len: usize) -> Self {
+    pub const fn new_len(offset: usize, len: usize) -> Self {
         Span {
             start: offset,
             end: offset + len,
         }
     }
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Span { start: 0, end: 0 }
     }
-    pub fn len(&self) -> usize {
+    pub const fn len(&self) -> usize {
         if self.end >= self.start {
             self.end - self.start
         } else {
             0
         }
     }
-    pub fn is_empty(&self) -> bool {
+    pub const fn is_empty(&self) -> bool {
         self.start == self.end
     }
 

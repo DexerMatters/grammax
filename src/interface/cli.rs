@@ -8,10 +8,21 @@ use crossbeam::channel;
 use crossterm::{
     ExecutableCommand, cursor,
     event::{Event, KeyCode, KeyEvent, KeyModifiers, read},
-    terminal::{EnterAlternateScreen, enable_raw_mode},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, enable_raw_mode},
 };
 
-use crate::{grammar, interface::Interface, runtime, utils};
+use crate::{
+    grammar,
+    interface::Interface,
+    parsec::{
+        display::{format_ast, format_messages_with_source},
+        msg::ParserMessages,
+        tree::{RedNode, TreeAllocRef},
+    },
+    runtime,
+    scheme::layers::{NodePath, ParseTreeQuery},
+    utils,
+};
 
 pub struct CliInterface {
     sender: channel::Sender<runtime::RuntimeEnvelope>,
@@ -80,57 +91,84 @@ impl CliInterface {
         })
     }
 
-    /// Submit text to the runtime, query source back, parse and return formatted messages + AST.
-    fn display_result(&self) -> runtime::RuntimeResult<(String, String)> {
-        // Query source text from the runtime's source layer
-        let source_signal = self.query_source()?;
-        let source = match &source_signal {
-            runtime::RuntimeSignal::QueryResult { value, .. } => value
-                .downcast_ref::<String>()
-                .cloned()
-                .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                    message: "source text query result was not a String".to_string(),
-                })?,
+    fn query_tree_payload(
+        &self,
+        layer: runtime::LayerName,
+        index: ParseTreeQuery,
+    ) -> runtime::RuntimeResult<runtime::Payload> {
+        let decode = |signal: runtime::RuntimeSignal| -> runtime::RuntimeResult<runtime::Payload> {
+            match signal {
+                runtime::RuntimeSignal::QueryResult { value, .. } => Ok(value),
+                other => Err(runtime::RuntimeError::InvalidRequest {
+                    message: format!("unexpected signal: {other:?}"),
+                }),
+            }
+        };
+
+        self.request(runtime::RuntimeRequest::QueryLayer {
+            layer,
+            index: runtime::Payload::new(index),
+        })
+        .and_then(decode)
+    }
+
+    fn query_green_id(
+        &self,
+        layer: runtime::LayerName,
+        path: NodePath,
+    ) -> runtime::RuntimeResult<usize> {
+        let payload = self.query_tree_payload(layer, ParseTreeQuery::Path(path))?;
+        payload.downcast_ref::<usize>().copied().ok_or_else(|| {
+            runtime::RuntimeError::InvalidRequest {
+                message: "path query did not return green id".to_string(),
+            }
+        })
+    }
+
+    fn query_allocator(&self, layer: runtime::LayerName) -> runtime::RuntimeResult<TreeAllocRef> {
+        let payload = self.query_tree_payload(layer, ParseTreeQuery::Allocator)?;
+        payload
+            .downcast_ref::<TreeAllocRef>()
+            .cloned()
+            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
+                message: "allocator query did not return tree allocator".to_string(),
+            })
+    }
+
+    fn query_messages(&self, layer: runtime::LayerName) -> runtime::RuntimeResult<ParserMessages> {
+        let payload = self.query_tree_payload(layer, ParseTreeQuery::Message)?;
+        payload
+            .downcast_ref::<ParserMessages>()
+            .cloned()
+            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
+                message: "message query returned unexpected payload".to_string(),
+            })
+    }
+
+    /// Build messages + AST text from the settled RedGreenTreeIR layer.
+    fn display_result(
+        &self,
+        settled_signal: runtime::RuntimeSignal,
+        source: &str,
+    ) -> runtime::RuntimeResult<(String, String)> {
+        let layer = match settled_signal {
+            runtime::RuntimeSignal::Event { event } => event.layer,
             other => {
                 return Err(runtime::RuntimeError::InvalidRequest {
-                    message: format!("unexpected signal: {other:?}"),
+                    message: format!("unexpected settled signal: {other:?}"),
                 });
             }
         };
 
-        let mut parser = crate::parsec::Parser::new(self.grammar);
-        let result = parser.parse_text(&source);
-        Ok((result.format_messages(), result.format_ast()))
-    }
+        let messages = self.query_messages(layer.clone())?;
+        let alloc = self.query_allocator(layer.clone())?;
+        let root_green = self.query_green_id(layer, NodePath::root())?;
+        let message_text = format_messages_with_source(self.grammar, &messages, source);
+        let root = RedNode::root(root_green);
+        let ast_text = format_ast(self.grammar, &root, &alloc, source);
 
-    fn query_source(&self) -> runtime::RuntimeResult {
-        let request = |span: utils::Span| runtime::RuntimeRequest::QueryLayer {
-            layer: runtime::LayerName::root(),
-            index: serde_json::to_value(span).unwrap_or_default(),
-        };
-        match self.request(request(utils::Span::new(0, usize::MAX))) {
-            Ok(signal) => Ok(signal),
-            Err(runtime::RuntimeError::InvalidRequest { message }) => {
-                // Runtime may tell us the actual text length; retry with it
-                let len = parse_usize_after_marker(&message, "text length ")
-                    .or_else(|| parse_usize_after_marker(&message, "text_len:"));
-                match len {
-                    Some(l) => self.request(request(utils::Span::new(0, l))),
-                    None => Err(runtime::RuntimeError::InvalidRequest { message }),
-                }
-            }
-            Err(e) => Err(e),
-        }
+        Ok((message_text, ast_text))
     }
-}
-
-fn parse_usize_after_marker(message: &str, marker: &str) -> Option<usize> {
-    let start = message.find(marker)? + marker.len();
-    let digits: String = message[start..]
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
 }
 
 // Width of the line marker, e.g. "   1 | " = 7 chars
@@ -235,27 +273,29 @@ fn key_event_handler(
     match event.code {
         KeyCode::Char(c) => {
             if event.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                stdout.execute(LeaveAlternateScreen)?;
                 return Ok(false);
             }
 
             if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
                 // Submit to runtime and display results
-                cli.update(&state.buffer).ok();
+                let source = state.buffer.clone();
+                let settled = cli.update(&state.buffer);
 
                 let num_lines = state.buffer.matches('\n').count() as u16 + 1;
                 move_to(stdout, 0, state.origin_row + num_lines)?;
                 write!(stdout, "\r\n")?;
-
-                match cli.display_result() {
+                writeln!(stdout, "----------------------------------\r")?;
+                match settled.and_then(|signal| cli.display_result(signal, &source)) {
                     Ok((messages, ast)) => {
                         if !messages.is_empty() {
-                            write!(stdout, "Messages:\r\n")?;
+                            cwrite!(stdout, "\r\n<bold>Messages:</bold>\r\n")?;
                             for line in messages.lines() {
                                 write!(stdout, "{}\r\n", line)?;
                             }
                             write!(stdout, "\r\n")?;
                         }
-                        write!(stdout, "AST:\r\n")?;
+                        cwrite!(stdout, "<bold>AST:</bold>\r\n")?;
                         for line in ast.lines() {
                             write!(stdout, "{}\r\n", line)?;
                         }
@@ -265,6 +305,7 @@ fn key_event_handler(
                         write!(stdout, "Error: {:?}\r\n", e)?;
                     }
                 }
+                writeln!(stdout, "----------------------------------\r")?;
                 stdout.flush()?;
 
                 // Reset state: new origin is after the output
@@ -369,10 +410,36 @@ fn key_event_handler(
 
 #[cfg(test)]
 mod tests {
+
+    use crate::{
+        new_grammar,
+        parsec::words::{EndOfInput, NUMS},
+        runtime::{CompilerBuilder, ComposedCompiler, ParserPass, RuntimeService},
+        scheme::layers::RedGreenTreeIR,
+    };
+
     use super::*;
 
     #[test]
-    fn test_cli_interface() -> io::Result<()> {
-        Ok(())
+    fn test_cli_interface() {
+        let grammar = new_grammar!(
+            start where
+            start -> r!(expr) + tt(EndOfInput)
+            expr -> r!(add) | r!(mul) | r!(primary)
+            add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
+            mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
+            primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
+        );
+
+        let (pass, _observer) = CompilerBuilder::new()
+            .then_pass(ParserPass::new(grammar))
+            .then_layer(RedGreenTreeIR::default())
+            .tap();
+
+        let runtime = RuntimeService::<CliInterface>::new(grammar, move |evt_tx| {
+            ComposedCompiler::from_pass_with_events(pass, evt_tx)
+        });
+
+        runtime.run().expect("runtime failed");
     }
 }

@@ -19,7 +19,10 @@ use crate::{
     parsec::tree::{GreenId, Tag, TreeAllocRefExt},
     scheme::{
         self,
-        layers::{ASTCell, AstArena, AstDelta, Command, NodePath, ParseNodeValue, RedGreenTreeIR},
+        layers::{
+            ASTCell, AstArena, AstDelta, Command, NodePath, ParseNodeValue, ParseTreeQuery,
+            RedGreenTreeIR,
+        },
     },
 };
 
@@ -487,6 +490,10 @@ where
                 scheme::Command::Insert { index, .. }
                 | scheme::Command::Replace { index, .. }
                 | scheme::Command::Delete { index } => {
+                    let ParseTreeQuery::Path(index) = index else {
+                        continue;
+                    };
+
                     if index.0.is_empty() {
                         if let Some(root) = upstream.root {
                             dirty.insert(root);
@@ -580,7 +587,7 @@ where
 
         let token_text = match upstream.value_of_green(green) {
             ParseNodeValue::Token { text, .. } | ParseNodeValue::Error { text, .. } => Some(text),
-            ParseNodeValue::Node { .. } => None,
+            ParseNodeValue::Node { .. } | ParseNodeValue::Messages { .. } => None,
         };
 
         let binding = old.get(&green).and_then(|n| n.binding);

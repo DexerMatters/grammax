@@ -1,7 +1,7 @@
 use crossbeam::channel;
 
 use crate::{
-    scheme::{self, LayerName, PassId, layers::SourceText},
+    scheme::{LayerName, PassId},
     utils::Span,
 };
 
@@ -39,16 +39,9 @@ pub enum RuntimeSignalKind {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RuntimeSignal {
-    Accepted {
-        revision: RevisionId,
-    },
-    Event {
-        event: RuntimeEvent,
-    },
-    QueryResult {
-        layer: LayerName,
-        value: Payload,
-    },
+    Accepted { revision: RevisionId },
+    Event { event: RuntimeEvent },
+    QueryResult { layer: LayerName, value: Payload },
     Ack,
 }
 
@@ -122,16 +115,16 @@ pub enum RuntimeRequest {
         completion: CompletionPolicy,
     },
     ApplySourceTxn {
-        txn: scheme::Transaction<SourceText>,
+        txn: Payload,
         completion: CompletionPolicy,
     },
     ApplyTopTxn {
-        txn: serde_json::Value,
+        txn: Payload,
         completion: CompletionPolicy,
     },
     QueryLayer {
         layer: LayerName,
-        index: serde_json::Value,
+        index: Payload,
     },
     Shutdown,
 }

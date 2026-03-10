@@ -60,7 +60,7 @@ fn test_simple_arithmetic_precedence() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "1+1+1";
+    let text = "ddd+5";
     let result = parser.parse_text(text);
 
     let output = result.format_ast();
@@ -99,8 +99,7 @@ fn test_json() {
     println!("Grammar:\n{}", parser.grammar.table);
 
     let text = r#"{
-"a": [1, 2, 22]
-}"#;
+"a"#;
     let result = parser.parse_text(text);
 
     println!("AST:\n{}", result.format_ast());

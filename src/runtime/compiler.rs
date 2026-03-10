@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     cell::Cell,
     collections::HashMap,
     fmt,
@@ -24,7 +25,7 @@ use crate::{
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
-type QueryFn = Arc<dyn Fn(Value) -> RuntimeResult<Payload> + Send + Sync>;
+type QueryFn = Arc<dyn Fn(Payload) -> RuntimeResult<Payload> + Send + Sync>;
 type SubmitTopFn = Arc<dyn Fn(RevisionId, SourceTxn) -> RuntimeResult<()> + Send + Sync>;
 type ShutdownHook = Box<dyn FnOnce() + Send>;
 type SharedQueries = Arc<Mutex<HashMap<LayerName, QueryFn>>>;
@@ -439,83 +440,65 @@ where
     );
 
     let pipeline_sender = pipeline.clone_sender();
-    let (fwd_tx, fwd_rx) = channel::unbounded::<(RevisionId, scheme::Transaction<U>)>();
     let (next_output_tx, next_output_rx) =
         channel::unbounded::<(RevisionId, scheme::Transaction<D>)>();
 
-    let (relay_stop_tx, relay_stop_rx) = channel::unbounded::<()>();
-    let relay_handle = thread::spawn(move || {
-        loop {
-            crossbeam::select! {
-                recv(relay_stop_rx) -> _ => {
-                    break;
-                }
-                recv(input_rx) -> msg => {
-                    match msg {
-                        Ok((revision, txn)) => {
-                            if pipeline_sender.send(Arc::clone(&txn)).is_err() {
-                                break;
-                            }
-                            if fwd_tx.send((revision, txn)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-            }
-        }
-    });
-
+    // The relay and bridge threads are tightly coupled in lockstep: relay sends
+    // one txn to the pipeline, bridge waits for the corresponding tap output.
+    // Merging them into a single coordinator thread eliminates one OS context
+    // switch per operation (and the intermediate fwd channel), which meaningfully
+    // reduces round-trip latency for incremental edits.
     let event_sender = Arc::clone(&core.event_sender);
-    let bridge_layer_name = downstream_layer_name.clone();
-    let bridge_milestone = pass_id.clone();
-    let (bridge_stop_tx, bridge_stop_rx) = channel::unbounded::<()>();
-    let bridge_handle = thread::spawn(move || {
+    let coord_layer_name = downstream_layer_name.clone();
+    let coord_milestone = pass_id.clone();
+    let (coord_stop_tx, coord_stop_rx) = channel::unbounded::<()>();
+    let coord_handle = thread::spawn(move || {
         loop {
-            crossbeam::select! {
-                recv(bridge_stop_rx) -> _ => {
-                    break;
-                }
-                recv(tap_rx) -> msg => {
-                    match msg {
-                        Ok(downstream_txn) => {
-                            // tap_rx fires after apply_transaction on the upstream IR,
-                            // so the IR is consistent for querying at this point.
-                            let Ok((revision, upstream_txn)) = fwd_rx.recv() else {
-                                break;
-                            };
+            // Wait for the next input txn (or a stop signal).
+            let (revision, txn) = crossbeam::select! {
+                recv(coord_stop_rx) -> _ => break,
+                recv(input_rx) -> msg => match msg {
+                    Ok(item) => item,
+                    Err(_) => break,
+                },
+            };
 
-                            // Deliver to upstream-layer observers.
-                            for (tx, _) in &upstream_listeners {
-                                let _ = tx.send((revision, Arc::clone(&upstream_txn)));
-                            }
+            // Hand the txn to the pipeline worker.
+            if pipeline_sender.send(Arc::clone(&txn)).is_err() {
+                break;
+            }
 
-                            send_layer_event::<D>(
-                                &event_sender,
-                                revision,
-                                bridge_layer_name.clone(),
-                                bridge_milestone.clone(),
-                                &downstream_txn,
-                            );
+            // Wait for the pipeline to emit its tap output for this txn.
+            // Because the pipeline processes txns in FIFO order, tap_rx always
+            // yields results in the same order we submitted them.
+            let downstream_txn = match tap_rx.recv() {
+                Ok(t) => t,
+                Err(_) => break,
+            };
 
-                            if next_output_tx.send((revision, downstream_txn)).is_err() {
-                                break;
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
+            // Deliver to upstream-layer observers.
+            for (tx, _) in &upstream_listeners {
+                let _ = tx.send((revision, Arc::clone(&txn)));
+            }
+
+            send_layer_event::<D>(
+                &event_sender,
+                revision,
+                coord_layer_name.clone(),
+                coord_milestone.clone(),
+                &downstream_txn,
+            );
+
+            if next_output_tx.send((revision, downstream_txn)).is_err() {
+                break;
             }
         }
     });
 
     core.push_shutdown_hook(Box::new(move || {
-        let _ = relay_stop_tx.send(());
-        let _ = bridge_stop_tx.send(());
+        let _ = coord_stop_tx.send(());
         pipeline.shutdown();
-        let _ = relay_handle.join();
-        let _ = bridge_handle.join();
+        let _ = coord_handle.join();
     }));
 
     core.push_layer(downstream_layer_name.clone());
@@ -626,7 +609,7 @@ impl ComposedCompiler {
     }
 
     /// Query a layer and return the result as a type-erased [`Payload`].
-    pub fn query(&self, layer: impl Into<LayerName>, index: Value) -> RuntimeResult<Payload> {
+    pub fn query(&self, layer: impl Into<LayerName>, index: Payload) -> RuntimeResult<Payload> {
         let layer = layer.into();
         let query = self
             .queries
@@ -643,13 +626,15 @@ impl ComposedCompiler {
     /// Convenience wrapper around [`query`][Self::query] for callers that need
     /// a [`serde_json::Value`] rather than a typed [`Payload`].
     pub fn query_json(&self, layer: impl Into<LayerName>, index: Value) -> RuntimeResult<Value> {
-        self.query(layer, index).map(|p| p.to_json())
+        self.query(layer, Payload::new(index)).map(|p| p.to_json())
     }
 
     pub fn source_text(&self) -> Option<String> {
         let span = Span::new(0, self.source_len);
         let index = serde_json::to_value(span).ok()?;
-        let payload = self.query(self.source_layer.clone(), index).ok()?;
+        let payload = self
+            .query(self.source_layer.clone(), Payload::new(index))
+            .ok()?;
         payload.downcast_ref::<String>().cloned()
     }
 
@@ -694,21 +679,34 @@ fn mix64(mut x: u64) -> u64 {
     x ^ (x >> 31)
 }
 
-fn query_handle_any<R>(handle: &QueryHandle<R>, index: Value) -> RuntimeResult<Payload>
+fn query_handle_any<R>(handle: &QueryHandle<R>, index: Payload) -> RuntimeResult<Payload>
 where
     R: IR,
-    R::Ix: DeserializeOwned,
-    R::Value: Serialize + Send + Sync,
+    R::Ix: DeserializeOwned + Clone + 'static,
+    R::Value: Serialize + Send + Sync + 'static,
     R::Error: fmt::Debug,
 {
-    let typed_index: R::Ix = serde_json::from_value(index)
-        .map_err(|err| runtime_invalid(format!("query index decode failed: {err}")))?;
+    let typed_index: R::Ix = if let Some(ix) = index.downcast_ref::<R::Ix>() {
+        ix.clone()
+    } else if let Some(json) = index.downcast_ref::<Value>() {
+        serde_json::from_value(json.clone())
+            .map_err(|err| runtime_invalid(format!("query index decode failed: {err}")))?
+    } else {
+        return Err(runtime_invalid(
+            "query index type mismatch (expected typed index or serde_json::Value)",
+        ));
+    };
 
     let result = handle
         .query(typed_index)
         .ok_or(RuntimeError::ChannelClosed)?;
 
     let value = result.map_err(|err| runtime_invalid(format!("query failed: {err:?}")))?;
+
+    let any = &value as &dyn Any;
+    if let Some(payload) = any.downcast_ref::<Payload>() {
+        return Ok(payload.clone());
+    }
 
     Ok(Payload::new(value))
 }
@@ -724,9 +722,9 @@ fn send_layer_event<R>(
     milestone: PassId,
     txn: &scheme::Transaction<R>,
 ) where
-    R: IR,
-    R::Ix: Serialize + Clone + Send + Sync,
-    R::Value: Serialize + Clone + Send + Sync,
+    R: IR + 'static,
+    R::Ix: Serialize + Clone + Send + Sync + 'static,
+    R::Value: Serialize + Clone + Send + Sync + 'static,
 {
     let Some(sender) = clone_event_sender(sender) else {
         return;
@@ -793,12 +791,6 @@ fn validate_source_txn_len(
                         index.start, index.end
                     )));
                 }
-                if index.start > len {
-                    return Err(runtime_invalid(format!(
-                        "insert offset {} out of bounds for text length {}",
-                        index.start, len
-                    )));
-                }
                 let frag_len = staged
                     .get(*id)
                     .and_then(|v| *v)
@@ -806,16 +798,16 @@ fn validate_source_txn_len(
                 len = len.saturating_add(frag_len);
             }
             scheme::Command::Delete { index } => {
-                validate_span(*index, len)?;
-                len = len.saturating_sub(index.end - index.start);
+                let span = clamp_span(*index, len);
+                len = len.saturating_sub(span.end - span.start);
             }
             scheme::Command::Replace { index, id } => {
-                validate_span(*index, len)?;
+                let span = clamp_span(*index, len);
                 let frag_len = staged
                     .get(*id)
                     .and_then(|v| *v)
                     .ok_or_else(|| runtime_invalid(format!("unknown staging id: {id}")))?;
-                len = len - (index.end - index.start) + frag_len;
+                len = len - (span.end - span.start) + frag_len;
             }
             scheme::Command::SetRoot { .. } => {}
         }
@@ -824,15 +816,10 @@ fn validate_source_txn_len(
     Ok(len)
 }
 
-fn validate_span(span: Span, len: usize) -> RuntimeResult<()> {
-    if span.start <= span.end && span.end <= len {
-        Ok(())
-    } else {
-        Err(runtime_invalid(format!(
-            "invalid span [{}, {}] for text length {}",
-            span.start, span.end, len
-        )))
-    }
+fn clamp_span(span: Span, len: usize) -> Span {
+    let start = span.start.min(len);
+    let end = span.end.min(len);
+    Span::new(start.min(end), end)
 }
 
 fn runtime_invalid(message: impl Into<String>) -> RuntimeError {

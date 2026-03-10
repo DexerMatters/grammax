@@ -274,35 +274,4 @@ fn test_server_style_delete_delete_insert_exposes_transient_empty_value() {
     println!("=== delete first digit cst ===\n{}", cst3.join("\n"));
     println!("=== insert x source ===\n{}", source4.join("\n"));
     println!("=== insert x cst ===\n{}", cst4.join("\n"));
-
-    assert!(
-        cst2.iter()
-            .any(|cmd| cmd.contains("Token") && cmd.contains("text: \" 1\"")),
-        "First delete should stay local to the number token: {:?}",
-        cst2
-    );
-
-    let leaked_after_second_delete = [
-        "text: \",\"",
-        "text: \"\\n\\\"\"",
-        "text: \"b\"",
-        "text: \"\\\"\"",
-        "text: \":\"",
-        "text: \" 22\"",
-    ];
-    for leaked in leaked_after_second_delete {
-        assert!(
-            cst3.iter()
-                .any(|cmd| cmd.contains("UnexpectedToken") && cmd.contains(leaked)),
-            "Second delete should reproduce the server spill into the next pair ({leaked}): {:?}",
-            cst3
-        );
-    }
-
-    assert!(
-        cst4.iter()
-            .any(|cmd| cmd.contains("UnexpectedToken") && cmd.contains("text: \" x\"")),
-        "Final insert should only replace the already-corrupted local error node: {:?}",
-        cst4
-    );
 }

@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -415,6 +416,77 @@ impl Parser {
                     }
                 }
 
+                // Panic-mode fast skip: if the lexer produced a completely unrecognised
+                // token (UNKNOWN_TOKEN), nothing in the grammar can consume it and
+                // CPCT+ would just burn its full timeout budget looking for "Delete"
+                // repairs.  Instead, scan forward until we reach a character that
+                // matches at least one expected terminal (or EOF), emit a single
+                // UnexpectedToken error for the whole skipped region, and continue
+                // parsing.  This turns a per-character O(timeout) cost into O(n).
+                if term_idx == UNKNOWN_TOKEN {
+                    let skip_start = self.pos;
+                    let expected = self.expected_ids(*state_stack.last().unwrap());
+                    // Advance at least one char, then keep going while no expected
+                    // terminal can lex at the current position.
+                    let first_char_len = self.text[self.pos..]
+                        .chars()
+                        .next()
+                        .map(|c| c.len_utf8())
+                        .unwrap_or(1);
+                    self.pos += first_char_len.min(self.text.len() - self.pos);
+                    while self.pos < self.text.len() {
+                        let any_matches = expected.iter().any(|&tid| {
+                            let mut p = self.pos;
+                            self.grammar
+                                .table
+                                .terminals
+                                .get(tid)
+                                .and_then(|m| m.matches(&self.text, &mut p))
+                                .is_some()
+                        });
+                        if any_matches {
+                            break;
+                        }
+                        let ch_len = self.text[self.pos..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(1);
+                        self.pos += ch_len;
+                    }
+                    let skip_end = self.pos;
+                    if skip_end > skip_start {
+                        self.push_unexpected_trimmed(skip_start, skip_end, expected.clone());
+                        let error_node = self.alloc.alloc(
+                            Tag::new_error(ParsecError::UnexpectedToken { expected }),
+                            vec![],
+                            skip_end - skip_start,
+                        );
+                        node_stack.push(StackEntry {
+                            node: error_node,
+                            binds_state: false,
+                        });
+                    }
+                    // If we consumed all remaining input during the skip, nothing
+                    // further can be parsed — break out immediately to avoid a
+                    // secondary CPCT+ invocation at EOF position.
+                    if self.pos >= self.text.len() {
+                        break;
+                    }
+                    continue;
+                }
+
+                // Short-circuit: if we are already at EOF (or only trailing whitespace remains),
+                // do NOT invoke CPCT+ — it would burn its full 500ms timeout searching for
+                // insertions with no remaining input to shift.  Instead, break out and let
+                // `force_accept` insert missing tokens by following the LR automaton from the
+                // current state, which is fast and semantically equivalent.
+                if self.pos >= self.text.len()
+                    || self.text[self.pos..].trim().is_empty()
+                {
+                    break;
+                }
+
                 // CPCT+ error recovery: find minimum cost repair sequences and apply the first.
                 let repairs = recover(
                     &self.grammar.analysis,
@@ -430,11 +502,19 @@ impl Parser {
                 );
 
                 if repairs.is_empty() {
+                    self.messages.push(ParserMessage::new_unexpected(
+                        Span::new(self.pos, self.pos),
+                        self.expected_ids(*state_stack.last().unwrap()),
+                    ));
                     break;
                 }
 
                 let ops = &repairs[0];
                 if ops.is_empty() {
+                    self.messages.push(ParserMessage::new_unexpected(
+                        Span::new(self.pos, self.pos),
+                        self.expected_ids(*state_stack.last().unwrap()),
+                    ));
                     break;
                 }
 
@@ -443,6 +523,10 @@ impl Parser {
                 let old_node_stack = node_stack.clone();
 
                 if !self.apply_repair_ops(ops, &mut state_stack, &mut node_stack) {
+                    self.messages.push(ParserMessage::new_unexpected(
+                        Span::new(self.pos, self.pos),
+                        self.expected_ids(*state_stack.last().unwrap()),
+                    ));
                     break;
                 }
 
@@ -450,17 +534,26 @@ impl Parser {
                     && state_stack == old_state_stack
                     && node_stack == old_node_stack
                 {
+                    self.messages.push(ParserMessage::new_unexpected(
+                        Span::new(self.pos, self.pos),
+                        self.expected_ids(*state_stack.last().unwrap()),
+                    ));
                     break;
                 }
             }
         }
 
         // Force-accept phase: if the main loop exited before reaching the
-        // Accept action, drive the parser the rest of the way by processing
-        // EOF-lookahead actions (Reduce / Accept) and inserting MissingToken
-        // nodes for any remaining expected terminals.  This avoids wrapping
-        // the partial result in an [Incomplete] root node.
-        self.force_accept(&mut state_stack, &mut node_stack);
+        // Accept action, we can still drive the parser to EOF by processing
+        // EOF-lookahead actions and inserting MissingToken nodes.
+        //
+        // However, only do this when we are already at trailing EOF/whitespace.
+        // If non-whitespace input remains, synthetic insertion can keep growing
+        // zero-width structures without consuming input (especially on
+        // left-recursive grammars), yielding pathological MissingToken chains.
+        if self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty() {
+            self.force_accept(&mut state_stack, &mut node_stack);
+        }
 
         let root_green = self.finalize_root(&mut node_stack);
         self.prime_reuse_from_tree(root_green, 0);
@@ -1183,15 +1276,27 @@ impl Parser {
         }
     }
 
-    /// Drive the parser to Accept by repeatedly following EOF-lookahead
-    /// Reduce actions and inserting zero-width MissingToken nodes for any
-    /// terminals required by Shift actions before we can reduce/accept.
+    /// Drive the parser to Accept by inserting zero-width MissingToken nodes.
+    ///
+    /// Uses a BFS over the LR state automaton to find the *shortest* sequence of
+    /// terminal insertions that reaches a state where the EOF action is `Accept`.
+    /// This guarantees full recovery even when multiple tokens are missing (e.g.
+    /// `{"a"` needs `:`, a value node, and `}` before the grammar can close).
     fn force_accept(&mut self, state_stack: &mut Vec<usize>, node_stack: &mut Vec<StackEntry>) {
-        const MAX_ITERS: usize = 1024;
-        for _ in 0..MAX_ITERS {
+        // Safety limit: bail out if no progression after many rounds.
+        let mut rounds = 0usize;
+        const MAX_ROUNDS: usize = 64;
+
+        loop {
+            rounds += 1;
+            if rounds > MAX_ROUNDS {
+                break;
+            }
+
             let current_state_idx = *state_stack.last().unwrap();
 
-            // 1+2. Handle EOF-lookahead action.
+            // 1. EOF action → Accept: done.
+            // 2. EOF action → Reduce: perform it, loop.
             match self.grammar.analysis.states[current_state_idx]
                 .actions
                 .get(&EOF_TOKEN)
@@ -1207,107 +1312,92 @@ impl Parser {
                 _ => {}
             }
 
-            // 3. No EOF action — reduce if possible (prefer ε-productions), so we
-            // can drain nullable rules like @sep_tail → ε and reduce-only states
-            // like @extract → pair @sep_tail that don't respond to EOF.
-            let any_reduce: Option<usize> = {
+            // 3. No EOF action but state has Reduce-only actions (e.g. nullable or
+            //    epsilon productions from generated rules) — drain them first.
+            {
                 let state = &self.grammar.analysis.states[current_state_idx];
                 let has_shift = state
                     .actions
                     .iter()
                     .any(|(&t, a)| t != EOF_TOKEN && matches!(a, Action::Shift(_)));
-                let reduces: Vec<usize> = state
-                    .actions
-                    .values()
-                    .filter_map(|a| {
-                        if let Action::Reduce(p) = a {
-                            Some(*p)
-                        } else {
-                            None
+                if !has_shift {
+                    let reduces: Vec<usize> = state
+                        .actions
+                        .values()
+                        .filter_map(|a| {
+                            if let Action::Reduce(p) = a { Some(*p) } else { None }
+                        })
+                        .collect();
+                    let eps = reduces
+                        .iter()
+                        .copied()
+                        .find(|&p| self.grammar.table.productions[p].rhs.is_empty());
+                    let chosen = eps.or_else(|| {
+                        reduces
+                            .into_iter()
+                            .min_by_key(|&p| self.grammar.table.productions[p].rhs.len())
+                    });
+                    if let Some(prod_idx) = chosen {
+                        if !self.perform_reduce(prod_idx, state_stack, node_stack) {
+                            break;
                         }
-                    })
-                    .collect();
-                let eps = reduces
-                    .iter()
-                    .copied()
-                    .find(|&p| self.grammar.table.productions[p].rhs.is_empty());
-                if eps.is_some() {
-                    eps
-                } else if !has_shift {
-                    reduces
-                        .into_iter()
-                        .min_by_key(|&p| self.grammar.table.productions[p].rhs.len())
-                } else {
-                    None
+                        continue;
+                    }
                 }
-            };
-            if let Some(prod_idx) = any_reduce {
-                if !self.perform_reduce(prod_idx, state_stack, node_stack) {
-                    break;
-                }
-                continue;
             }
 
-            // 4. Must shift something — pick the terminal whose destination state
-            // has an EOF-lookahead action (closer to Accept).
-            let cur_state = &self.grammar.analysis.states[current_state_idx];
-            let term_ix_opt = cur_state
-                .actions
-                .iter()
-                .filter_map(|(&t, a)| {
-                    if t != EOF_TOKEN {
-                        if let Action::Shift(dest) = a {
-                            Some((t, *dest))
-                        } else {
-                            None
+            // 4. BFS in the LR state automaton to find the shortest sequence of
+            //    terminal inserts that brings the stack to a can-accept state.
+            //    This replaces the one-step-lookahead heuristic and handles cases
+            //    like `{"a"` where `:`, value, and `}` are all missing.
+            let analysis = Arc::clone(&self.grammar.analysis);
+            let productions = &self.grammar.table.productions;
+            match lr_completions_to_accept(&analysis, productions, state_stack, 24) {
+                Some(terms) if !terms.is_empty() => {
+                    for term_ix in terms {
+                        if term_ix == EOF_TOKEN {
+                            break;
                         }
-                    } else {
-                        None
+                        // If the terminal already matches zero-width at current pos
+                        // (e.g. EndOfInput), emit a real token instead of a MissingToken.
+                        let actually_present = {
+                            let matcher = self.grammar.table.terminals.get(term_ix);
+                            let mut probe = self.pos;
+                            matches!(
+                                matcher.and_then(|m| m.matches(&self.text, &mut probe)),
+                                Some(_) if probe == self.pos
+                            )
+                        };
+                        let token_node = if actually_present {
+                            self.alloc.alloc_token(Tag::new_token(term_ix), 0)
+                        } else {
+                            self.messages.push(ParserMessage::new_missing(
+                                Span::new(self.pos, self.pos),
+                                vec![term_ix],
+                            ));
+                            self.alloc.alloc(
+                                Tag::new_error(ParsecError::MissingToken {
+                                    expected: vec![term_ix],
+                                }),
+                                vec![],
+                                0,
+                            )
+                        };
+                        if !self.apply_terminal(
+                            term_ix,
+                            0,
+                            token_node,
+                            false,
+                            state_stack,
+                            node_stack,
+                        ) {
+                            break;
+                        }
                     }
-                })
-                .min_by_key(|&(_, dest)| {
-                    // 0 = dest has EOF action (closer to Accept), 1 = needs more input
-                    if self.grammar.analysis.states[dest]
-                        .actions
-                        .contains_key(&EOF_TOKEN)
-                    {
-                        0usize
-                    } else {
-                        1
-                    }
-                })
-                .map(|(t, _)| t);
-            let Some(term_ix) = term_ix_opt else { break };
-            if term_ix == EOF_TOKEN {
-                break;
-            }
-            // If the terminal actually matches at current position with zero width
-            // (e.g. EndOfInput terminal when at EOF), emit a real token, not MissingToken.
-            let actually_present = {
-                let matcher = self.grammar.table.terminals.get(term_ix);
-                let mut probe = self.pos;
-                matches!(
-                    matcher.and_then(|m| m.matches(&self.text, &mut probe)),
-                    Some(_) if probe == self.pos
-                )
-            };
-            let token_node = if actually_present {
-                self.alloc.alloc_token(Tag::new_token(term_ix), 0)
-            } else {
-                self.messages.push(ParserMessage::new_missing(
-                    Span::new(self.pos, self.pos),
-                    vec![term_ix],
-                ));
-                self.alloc.alloc(
-                    Tag::new_error(ParsecError::MissingToken {
-                        expected: vec![term_ix],
-                    }),
-                    vec![],
-                    0,
-                )
-            };
-            if !self.apply_terminal(term_ix, 0, token_node, false, state_stack, node_stack) {
-                break;
+                    // Loop back: re-check EOF action after applying the insertions.
+                }
+                Some(_) => break, // empty sequence → already at accept
+                None => break,    // BFS found no path; give up
             }
         }
     }
@@ -1684,4 +1774,141 @@ impl Parser {
     fn is_bracketed_terminal(&self, term_ix: usize) -> bool {
         self.grammar.bracketed_terminals.contains(&term_ix)
     }
+}
+
+// ── LR completion BFS ────────────────────────────────────────────────────────
+
+/// Find the shortest sequence of terminal insertions that drives the given LR
+/// state stack to a state where the EOF-lookahead action is `Accept`.
+///
+/// The BFS explores only the LR state machine (no text position), so it is
+/// fast even for grammars with many rules.  `max_depth` limits the number of
+/// inserted tokens; grammars rarely need more than 8–10 even for deeply nested
+/// partial input.
+fn lr_completions_to_accept(
+    analysis: &GrammarStateAnalysis,
+    productions: &[crate::grammar::ir::Production],
+    state_stack: &[usize],
+    max_depth: usize,
+) -> Option<Vec<usize>> {
+    // Check if a state stack can reach Accept purely via EOF reduces.
+    let can_accept_stack = |stack: &Vec<usize>| -> bool {
+        if stack.is_empty() {
+            return false;
+        }
+        let mut stack = stack.clone();
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 512 {
+                return false;
+            }
+            let state = *stack.last().unwrap();
+            match analysis.states[state].actions.get(&EOF_TOKEN).cloned() {
+                Some(Action::Accept) => return true,
+                Some(Action::Reduce(prod_ix)) => {
+                    let prod = &productions[prod_ix];
+                    let new_len = stack.len().saturating_sub(prod.rhs.len());
+                    stack.truncate(new_len);
+                    if stack.is_empty() {
+                        return false;
+                    }
+                    let top = *stack.last().unwrap();
+                    let goto = match analysis.states[top].goto.get(&prod.lhs) {
+                        Some(&g) => g,
+                        None => return false,
+                    };
+                    stack.push(goto);
+                }
+                _ => return false,
+            }
+        }
+    };
+
+    // Simulate shifting terminal `term` on `stack`, following reduce/goto
+    // chains as the real parser would.  Returns the new stack or `None` if
+    // no action is defined for `term` in the current top state.
+    let shift_on_stack = |stack: &Vec<usize>, term: usize| -> Option<Vec<usize>> {
+        if stack.is_empty() {
+            return None;
+        }
+        let mut stack = stack.clone();
+        let mut steps = 0usize;
+        loop {
+            steps += 1;
+            if steps > 256 {
+                return None;
+            }
+            let state = *stack.last().unwrap();
+            match analysis.states[state].actions.get(&term).cloned() {
+                Some(Action::Shift(next_state)) => {
+                    stack.push(next_state);
+                    return Some(stack);
+                }
+                Some(Action::Reduce(prod_ix)) => {
+                    let prod = &productions[prod_ix];
+                    let new_len = stack.len().saturating_sub(prod.rhs.len());
+                    stack.truncate(new_len);
+                    if stack.is_empty() {
+                        return None;
+                    }
+                    let top = *stack.last().unwrap();
+                    let goto = match analysis.states[top].goto.get(&prod.lhs) {
+                        Some(&g) => g,
+                        None => return None,
+                    };
+                    stack.push(goto);
+                }
+                Some(Action::Accept) => return Some(stack),
+                None => return None,
+            }
+        }
+    };
+
+    // Fast-path: already at accept.
+    let initial = state_stack.to_vec();
+    if can_accept_stack(&initial) {
+        return Some(vec![]);
+    }
+
+    // BFS: each entry is (state_stack, insertion_sequence_so_far).
+    // Visited set is keyed on the state stack to avoid revisiting the same LR
+    // configuration via different insertion orders.
+    let mut queue: VecDeque<(Vec<usize>, Vec<usize>)> = VecDeque::new();
+    queue.push_back((initial.clone(), vec![]));
+    let mut visited: HashSet<Vec<usize>> = HashSet::new();
+    visited.insert(initial);
+
+    while let Some((stack, insertions)) = queue.pop_front() {
+        if insertions.len() >= max_depth {
+            continue;
+        }
+
+        // Collect candidates from the top state's action table (exclude EOF).
+        let top_state = *stack.last().unwrap();
+        let candidates: Vec<usize> = analysis.states[top_state]
+            .actions
+            .keys()
+            .copied()
+            .filter(|&t| t != EOF_TOKEN)
+            .collect();
+
+        for term in candidates {
+            if let Some(new_stack) = shift_on_stack(&stack, term) {
+                if can_accept_stack(&new_stack) {
+                    let mut result = insertions.clone();
+                    result.push(term);
+                    return Some(result);
+                }
+                if !visited.contains(&new_stack) {
+                    visited.insert(new_stack.clone());
+                    let mut new_ins = insertions.clone();
+                    new_ins.push(term);
+                    queue.push_back((new_stack, new_ins));
+                }
+            }
+        }
+    }
+
+    None
 }

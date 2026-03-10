@@ -154,9 +154,72 @@ fn is_port_free(host: &str, port: u16) -> bool {
     }
 }
 
+/// Convert a slice of parse-tree commands to the JSON wire format the frontend
+/// `normalizeCommands` function understands.
+///
+/// The key difference from a plain `serde_json::to_value` call is that
+/// `ParseTreeQuery::Path(NodePath)` is an internally-tagged serde enum whose
+/// inner type is a sequence (`Vec<usize>`).  Serde cannot add a tag key to a
+/// JSON sequence, so serialisation silently returns `null`.  Here we manually
+/// flatten `Path([…])` → `[…]` so the frontend receives the expected
+/// `{ "index": [0, 1, …] }` shape.
+fn commands_to_web_json(commands: &[runtime::Command]) -> serde_json::Value {
+    use crate::scheme::Command;
+    use crate::scheme::layers::{NodePath, ParseTreeQuery};
+
+    fn path_to_json(path: &NodePath) -> serde_json::Value {
+        serde_json::Value::Array(
+            path.0
+                .iter()
+                .map(|&i| serde_json::Value::Number(i.into()))
+                .collect(),
+        )
+    }
+
+    let items: Vec<serde_json::Value> = commands
+        .iter()
+        .filter_map(|cmd| match cmd {
+            Command::Create { id, value } => {
+                let value_json = serde_json::to_value(value).ok()?;
+                Some(serde_json::json!({ "type": "create", "id": id, "value": value_json }))
+            }
+            Command::Insert {
+                index: ParseTreeQuery::Path(path),
+                id,
+            } => {
+                Some(serde_json::json!({ "type": "insert", "index": path_to_json(path), "id": id }))
+            }
+            Command::Delete {
+                index: ParseTreeQuery::Path(path),
+            } => Some(serde_json::json!({ "type": "delete", "index": path_to_json(path) })),
+            Command::Replace {
+                index: ParseTreeQuery::Path(path),
+                id,
+            } => Some(
+                serde_json::json!({ "type": "replace", "index": path_to_json(path), "id": id }),
+            ),
+            Command::SetRoot { id } => Some(serde_json::json!({ "type": "setRoot", "id": id })),
+            // Message / Allocator queries are backend-only — skip them.
+            _ => None,
+        })
+        .collect();
+
+    serde_json::Value::Array(items)
+}
+
 fn signal_to_response(signal: &runtime::RuntimeSignal) -> serde_json::Value {
     match signal {
-        runtime::RuntimeSignal::Event { event } => event.payload.to_json(),
+        runtime::RuntimeSignal::Event { event } => {
+            // The CST layer wraps delta commands in the event payload.  Try to
+            // downcast to the concrete type first so we can use the
+            // frontend-compatible wire format.  Falling back to raw `.to_json()`
+            // would silently produce `null` here because of the internally-tagged
+            // serde enum (`ParseTreeQuery`) wrapping a sequence.
+            if let Some(commands) = event.payload.downcast_ref::<Vec<runtime::Command>>() {
+                return commands_to_web_json(commands);
+            }
+            event.payload.to_json()
+        }
         runtime::RuntimeSignal::QueryResult { value, .. } => value.to_json(),
         runtime::RuntimeSignal::Accepted { .. } | runtime::RuntimeSignal::Ack => {
             serde_json::json!({})
@@ -178,13 +241,16 @@ fn resolve_api_request(
                     text,
                     completion,
                 } => {
+                    let completion_policy =
+                        completion.unwrap_or(runtime::CompletionPolicy::Settled);
                     let request = runtime::RuntimeRequest::ApplyTextEdit {
                         span,
-                        text,
-                        completion: completion.unwrap_or(runtime::CompletionPolicy::Settled),
+                        text: text.clone(),
+                        completion: completion_policy.clone(),
                     };
 
-                    match this.request(request) {
+                    let result = this.request(request);
+                    match result {
                         Ok(signal) => rouille::Response::json(&signal_to_response(&signal)),
                         Err(e) => rouille::Response::json(&e).with_status_code(500),
                     }
@@ -242,7 +308,7 @@ fn query_source_text(this: &WebPreviewInterface) -> runtime::RuntimeResult<runti
     let request_for_span = |span: utils::Span| -> runtime::RuntimeRequest {
         runtime::RuntimeRequest::QueryLayer {
             layer: runtime::LayerName::root(),
-            index: serde_json::to_value(span).unwrap_or(serde_json::json!({})),
+            index: runtime::Payload::new(span),
         }
     };
 
@@ -274,21 +340,17 @@ fn build_tree_snapshot(this: &WebPreviewInterface) -> runtime::RuntimeResult<ser
         &source,
     );
 
-    serde_json::to_value(commands).map_err(|err| runtime::RuntimeError::InvalidRequest {
-        message: format!("failed to encode tree snapshot commands: {err}"),
-    })
+    Ok(commands_to_web_json(&commands))
 }
 
 fn extract_source_text(signal: &runtime::RuntimeSignal) -> runtime::RuntimeResult<String> {
     match signal {
-        runtime::RuntimeSignal::QueryResult { value, .. } => {
-            value
-                .downcast_ref::<String>()
-                .cloned()
-                .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                    message: "source text query result was not a String".to_string(),
-                })
-        }
+        runtime::RuntimeSignal::QueryResult { value, .. } => value
+            .downcast_ref::<String>()
+            .cloned()
+            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
+                message: "source text query result was not a String".to_string(),
+            }),
         other => Err(runtime::RuntimeError::InvalidRequest {
             message: format!("unexpected signal for source query: {other:?}"),
         }),

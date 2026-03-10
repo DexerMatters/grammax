@@ -49,6 +49,13 @@ impl SourceText {
             })
         }
     }
+
+    fn clamp_span(&self, span: Span) -> Span {
+        let len = self.text.len();
+        let start = span.start.min(len);
+        let end = span.end.min(len);
+        Span::new(start.min(end), end)
+    }
 }
 
 // ── IR impl ──────────────────────────────────────────────────────────────────
@@ -61,8 +68,9 @@ impl IR for SourceText {
 
     /// Query a substring (the `Value` at `index`).
     fn query(&self, index: Span) -> Result<String, Self::Error> {
-        self.validate_span(index)?;
-        Ok(self.text[index.start..index.end].to_owned())
+        let span = self.clamp_span(index);
+        self.validate_span(span)?;
+        Ok(self.text[span.start..span.end].to_owned())
     }
 
     /// Clears staging table then applies the transaction directly.
@@ -80,23 +88,20 @@ impl IR for SourceText {
                     if index.start != index.end {
                         return Err(SourceTextError::NotAnInsertionPoint { span: *index });
                     }
-                    if index.start > self.text.len() {
-                        return Err(SourceTextError::InvalidSpan {
-                            span: *index,
-                            text_len: self.text.len(),
-                        });
-                    }
+                    let at = index.start.min(self.text.len());
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.text.insert_str(index.start, &fragment);
+                    self.text.insert_str(at, &fragment);
                 }
                 Command::Delete { index } => {
-                    self.validate_span(*index)?;
-                    self.text.drain(index.start..index.end);
+                    let span = self.clamp_span(*index);
+                    self.validate_span(span)?;
+                    self.text.drain(span.start..span.end);
                 }
                 Command::Replace { index, id } => {
-                    self.validate_span(*index)?;
+                    let span = self.clamp_span(*index);
+                    self.validate_span(span)?;
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.text.replace_range(index.start..index.end, &fragment);
+                    self.text.replace_range(span.start..span.end, &fragment);
                 }
                 Command::SetRoot { .. } => {} // text has no root concept
             }

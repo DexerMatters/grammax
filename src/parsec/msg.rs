@@ -1,7 +1,7 @@
 use crate::utils::Span;
 
 /// Error messages generated during parsing, which can be either unexpected tokens, missing tokens, or custom messages.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum ErrorMessage {
     UnexpectedToken { expected: Vec<usize> },
     MissingToken { expected: Vec<usize> },
@@ -9,7 +9,7 @@ pub enum ErrorMessage {
 }
 
 /// A parser message consists of a span in the input text and an error message, used for error reporting and recovery.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct ParserMessage {
     pub span: Span,
     pub message: ErrorMessage,

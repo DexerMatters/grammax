@@ -13,7 +13,10 @@ use crate::{
     scheme::passes::{
         delta,
         metrics::EditMetrics,
-        strategy::{CandidateScore, EditKind, StrategyCandidate, StrategyContext, pick_candidate},
+        strategy::{
+            CandidateScore, EditKind, StrategyCandidate, StrategyContext, count_errors,
+            pick_candidate,
+        },
     },
     utils::Span,
 };
@@ -302,12 +305,7 @@ impl Reparser {
         }
 
         if best.is_none() {
-            best = get_cached_root_candidate(
-                &mut root_candidate_cache,
-                self,
-                parser,
-                source_text,
-            );
+            best = get_cached_root_candidate(&mut root_candidate_cache, self, parser, source_text);
             if best.is_some() {
                 if let Some(m) = metrics.as_deref_mut() {
                     m.message =
@@ -323,23 +321,38 @@ impl Reparser {
             let candidate_is_errorful =
                 !candidate.score.is_error_free() || !candidate.messages.is_empty();
             if candidate_is_errorful {
-                if let Some(root_candidate) = get_cached_root_candidate(
-                    &mut root_candidate_cache,
-                    self,
-                    parser,
-                    source_text,
-                ) {
+                if let Some(root_candidate) =
+                    get_cached_root_candidate(&mut root_candidate_cache, self, parser, source_text)
+                {
                     // Always prefer root when the zipper green was an Incomplete node (parse_rule
-                    // gave up entirely), or when root genuinely has fewer parse messages.
+                    // gave up entirely), or when root has fewer errors outside the edit span.
+                    //
+                    // Using errors_outside rather than total message count is critical:
+                    // sub-region recovery may bundle several characters into a single large error
+                    // token (1 message) while the root parse emits two precise, in-span messages.
+                    // Message count would incorrectly favour the bundled result; comparing how
+                    // far errors spill outside the edit boundary is the reliable signal.
                     let zipper_green_is_incomplete = matches!(
                         self.alloc.get_node(candidate.green).tag,
                         crate::parsec::tree::Tag::Error(
                             crate::parsec::tree::ParsecError::Incomplete
                         )
                     );
+                    let (root_inside, root_outside) =
+                        count_errors(&root_candidate.messages, edit_span);
                     let root_is_cleaner = zipper_green_is_incomplete
                         || root_candidate.messages.is_empty()
-                        || root_candidate.messages.len() < candidate.messages.len();
+                        // Candidate spills more errors outside the edit span than root does.
+                        // The `root_outside == 0` guard used previously was too strict: when a
+                        // prior edit left a residual error just outside the new edit_span,
+                        // root_outside becomes 1, blocking this branch even when the candidate
+                        // has 2+ structural errors outside (e.g. missing `}` + missing EOF).
+                        // Comparing relative spillover fixes both cases:
+                        //   • candidate pollutes more than root   → prefer root
+                        //   • same spillover, root has fewer inside → prefer root
+                        || candidate.score.errors_outside > root_outside
+                        || (candidate.score.errors_outside == root_outside
+                            && root_inside < candidate.score.errors_inside);
                     if root_is_cleaner {
                         if let Some(m) = metrics.as_deref_mut() {
                             m.message =
@@ -858,7 +871,12 @@ fn collect_from(
                                 child_end + alloc.get_node(green.children[idx + 1]).width;
                             let next_child_end =
                                 next_child_start + alloc.get_node(next_child_id).width;
-                            overlaps.push((idx + 2, next_child_id, next_child_start, next_child_end));
+                            overlaps.push((
+                                idx + 2,
+                                next_child_id,
+                                next_child_start,
+                                next_child_end,
+                            ));
                         }
                     }
                 }
@@ -905,7 +923,9 @@ fn collect_from(
                         let next_idx = idx + 1;
                         let next_sep_id = green.children[next_idx];
                         let next_sep = alloc.get_node(next_sep_id);
-                        if matches!(&next_sep.tag, Tag::Token { .. }) && idx + 2 < green.children.len() {
+                        if matches!(&next_sep.tag, Tag::Token { .. })
+                            && idx + 2 < green.children.len()
+                        {
                             let sep_width = next_sep.width;
                             let following_id = green.children[idx + 2];
                             let following_start = cend + sep_width;

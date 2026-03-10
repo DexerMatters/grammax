@@ -3,7 +3,8 @@ use rustc_hash::FxHashMap;
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
     runtime::Command,
-    scheme::layers::{NodePath, ParseNodeValue},
+    runtime::Payload,
+    scheme::layers::{NodePath, ParseNodeValue, ParseTreeQuery},
 };
 
 const MAX_LCS_CELLS: usize = 4096;
@@ -59,7 +60,7 @@ pub(crate) fn generate_commands_for_full_tree(
     );
 
     commands.push(Command::Insert {
-        index: NodePath(vec![]),
+        index: ParseTreeQuery::Path(NodePath(vec![])),
         id: node_id,
     });
 
@@ -179,7 +180,7 @@ fn emit_commands_for_delta(
                 next_node_id,
             );
             out.push(Command::Insert {
-                index: insert_path.clone(),
+                index: ParseTreeQuery::Path(insert_path.clone()),
                 id: node_id,
             });
         }
@@ -190,7 +191,9 @@ fn emit_commands_for_delta(
         for ix in (old_mid_start..old_mid_end).rev() {
             let mut delete_path = path.clone();
             delete_path.0.push(ix);
-            out.push(Command::Delete { index: delete_path });
+            out.push(Command::Delete {
+                index: ParseTreeQuery::Path(delete_path),
+            });
         }
         return;
     }
@@ -311,7 +314,9 @@ fn emit_linear_splice_diff(
     for ix in (old_mid_start..old_mid_end).rev() {
         let mut delete_path = path.clone();
         delete_path.0.push(ix);
-        out.push(Command::Delete { index: delete_path });
+        out.push(Command::Delete {
+            index: ParseTreeQuery::Path(delete_path),
+        });
     }
 
     for ix in new_mid_start..new_mid_end {
@@ -351,17 +356,17 @@ fn emit_replace_at_path(
 
     if path.0.is_empty() {
         out.push(Command::Delete {
-            index: path.clone(),
+            index: ParseTreeQuery::Path(path.clone()),
         });
         out.push(Command::Insert {
-            index: path.clone(),
+            index: ParseTreeQuery::Path(path.clone()),
             id: node_id,
         });
         return;
     }
 
     out.push(Command::Replace {
-        index: path.clone(),
+        index: ParseTreeQuery::Path(path.clone()),
         id: node_id,
     });
 }
@@ -384,7 +389,7 @@ fn emit_insert_at_path(
         next_node_id,
     );
     out.push(Command::Insert {
-        index: path.clone(),
+        index: ParseTreeQuery::Path(path.clone()),
         id: node_id,
     });
 }
@@ -468,7 +473,9 @@ fn try_emit_by_greedy_tag_match(
             while old_cursor < old_rel {
                 let mut del_path = path.clone();
                 del_path.0.push(current_index);
-                buf.push(Command::Delete { index: del_path });
+                buf.push(Command::Delete {
+                    index: ParseTreeQuery::Path(del_path),
+                });
                 // Deletion: live-tree index does NOT advance (next child shifts into this slot).
                 old_cursor += 1;
             }
@@ -517,7 +524,7 @@ fn try_emit_by_greedy_tag_match(
             let mut insert_path = path.clone();
             insert_path.0.push(current_index);
             buf.push(Command::Insert {
-                index: insert_path.clone(),
+                index: ParseTreeQuery::Path(insert_path.clone()),
                 id: node_id,
             });
             current_index += 1;
@@ -528,7 +535,9 @@ fn try_emit_by_greedy_tag_match(
     while old_cursor < old_mid.len() {
         let mut del_path = path.clone();
         del_path.0.push(current_index);
-        buf.push(Command::Delete { index: del_path });
+        buf.push(Command::Delete {
+            index: ParseTreeQuery::Path(del_path),
+        });
         old_cursor += 1;
     }
 
@@ -678,7 +687,9 @@ fn try_emit_deletions_as_subsequence_aligned(
         } else {
             let mut delete_path = path.clone();
             delete_path.0.push(current_index);
-            buf.push(Command::Delete { index: delete_path });
+            buf.push(Command::Delete {
+                index: ParseTreeQuery::Path(delete_path),
+            });
         }
     }
 
@@ -749,7 +760,9 @@ fn emit_lcs_diff(
     for &old_rel in unmatched_old.iter().rev() {
         let mut delete_path = path.clone();
         delete_path.0.push(old_mid_start + old_rel);
-        out.push(Command::Delete { index: delete_path });
+        out.push(Command::Delete {
+            index: ParseTreeQuery::Path(delete_path),
+        });
     }
 
     // 2. Emit insertions using new-tree positions (valid after all deletes above)
@@ -896,7 +909,9 @@ fn greens_equivalent(
             .iter()
             .copied()
             .zip(new_node.children.iter().copied())
-            .all(|(old_child, new_child)| cache.get(&(old_child, new_child)).copied().unwrap_or(false));
+            .all(|(old_child, new_child)| {
+                cache.get(&(old_child, new_child)).copied().unwrap_or(false)
+            });
         cache.insert((old_green, new_green), equivalent);
     }
 
@@ -958,7 +973,9 @@ fn greens_align_equivalent(
             .iter()
             .copied()
             .zip(new_node.children.iter().copied())
-            .all(|(old_child, new_child)| cache.get(&(old_child, new_child)).copied().unwrap_or(false));
+            .all(|(old_child, new_child)| {
+                cache.get(&(old_child, new_child)).copied().unwrap_or(false)
+            });
         cache.insert((old_green, new_green), equivalent);
     }
 
@@ -1059,7 +1076,11 @@ fn emit_create_commands_from_green_with_field(
 
         let mut child_ids = Vec::with_capacity(node.children.len());
         for _ in 0..node.children.len() {
-            child_ids.push(emitted_ids.pop().expect("child create id missing during postorder walk"));
+            child_ids.push(
+                emitted_ids
+                    .pop()
+                    .expect("child create id missing during postorder walk"),
+            );
         }
         child_ids.reverse();
 
@@ -1069,47 +1090,49 @@ fn emit_create_commands_from_green_with_field(
 
         match &node.tag {
             Tag::Token { rule_ix } => {
-                let text = token_text_for_node(&node.tag, frame.node_offset, node.width, source_text)
-                    .unwrap_or_default();
+                let text =
+                    token_text_for_node(&node.tag, frame.node_offset, node.width, source_text)
+                        .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseNodeValue::Token {
+                    value: Payload::new(ParseNodeValue::Token {
                         rule_ix: *rule_ix,
                         text,
                         field,
-                    },
+                    }),
                 });
             }
             Tag::Error(err) => {
-                let text = token_text_for_node(&node.tag, frame.node_offset, node.width, source_text)
-                    .unwrap_or_default();
+                let text =
+                    token_text_for_node(&node.tag, frame.node_offset, node.width, source_text)
+                        .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseNodeValue::Error {
+                    value: Payload::new(ParseNodeValue::Error {
                         error: err.clone(),
                         text,
                         field,
-                    },
+                    }),
                 });
             }
             Tag::Rule { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseNodeValue::Node {
+                    value: Payload::new(ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,
-                    },
+                    }),
                 });
             }
             Tag::Field { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseNodeValue::Node {
+                    value: Payload::new(ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,
-                    },
+                    }),
                 });
             }
         }

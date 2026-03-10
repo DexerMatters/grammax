@@ -342,4 +342,35 @@ pub enum Command<Repr: IR> {
     SetRoot { id: Option<usize> },
 }
 
+impl<Repr: IR> Command<Repr> {
+    /// Clone this command by cloning only its fields.
+    ///
+    /// This method only requires `Repr::Ix: Clone` and `Repr::Value: Clone`,
+    /// unlike the derive-generated `Clone` impl which requires `Repr: Clone`.
+    pub fn clone_fields(&self) -> Self
+    where
+        Repr::Ix: Clone,
+        Repr::Value: Clone,
+    {
+        match self {
+            Command::Create { id, value } => Command::Create {
+                id: *id,
+                value: value.clone(),
+            },
+            Command::Insert { index, id } => Command::Insert {
+                index: index.clone(),
+                id: *id,
+            },
+            Command::Delete { index } => Command::Delete {
+                index: index.clone(),
+            },
+            Command::Replace { index, id } => Command::Replace {
+                index: index.clone(),
+                id: *id,
+            },
+            Command::SetRoot { id } => Command::SetRoot { id: *id },
+        }
+    }
+}
+
 pub type Transaction<Repr> = std::sync::Arc<Vec<Command<Repr>>>;

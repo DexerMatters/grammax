@@ -1,20 +1,10 @@
-//! Pass 1→2: the incremental parser pass.
-//!
-//! [`ParserPass`] implements [`scheme::Pass<SourceText, RedGreenTreeIR>`].
-//! Given a [`SourceText`] transaction (the text edit), it runs the
-//! incremental parser/reparser and produces parser commands as a
-//! [`Transaction<RedGreenTreeIR>`]
-//! describing the parse-tree delta.
-//!
-//! The pass internally holds a [`Parser`] and a [`Reparser`] so that
-//! re-parses are incremental: only the affected parse region is re-computed.
-
 use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
+    runtime::Payload,
     scheme::{
         self,
-        layers::{RedGreenTreeIR, SourceText},
+        layers::{ParseNodeValue, RedGreenTreeIR, SourceText},
     },
     utils::Span,
 };
@@ -24,18 +14,6 @@ use super::{
     reparser::{Reparser, ReparserConfig},
 };
 
-// ── ParserPass ─────────────────────────────────────────────────────────────────
-
-/// Pass from Layer 1 (SourceText) → Layer 2 (RedGreenTreeIR).
-///
-/// Wraps an incremental [`Reparser`] that keeps the current parse tree and
-/// re-parses only the changed region on each transaction.
-///
-/// # How it wires into the Pipeline
-///
-/// ```text
-/// ──Transaction<SourceText>──▶  [ParserPass thread]  ──Transaction<RedGreenTreeIR>──▶  [IncrementalLowerer thread]
-/// ```
 pub struct ParserPass {
     parser: Parser,
     reparser: Reparser,
@@ -69,17 +47,9 @@ impl ParserPass {
     }
 }
 
-// ── scheme::Pass impl ─────────────────────────────────────────────────────────
-
 impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
     type Error = std::convert::Infallible;
 
-    /// Transform a source-text transaction into a parse-tree transaction.
-    ///
-    /// After `upstream` has already applied the transaction, `upstream.text`
-    /// is the *new* full source text. The edit coordinates (span + new_len)
-    /// are reconstructed from the command sequence so the reparser can do an
-    /// incremental re-parse.
     fn transform(
         &mut self,
         upstream: &SourceText,
@@ -87,38 +57,43 @@ impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
     ) -> Result<scheme::Transaction<RedGreenTreeIR>, Self::Error> {
         let new_text = &upstream.text;
 
-        // Extract the edit (span, new_len) from the transaction.
         let edit = extract_edit(&txn);
 
         if let Some((span, new_len)) = edit {
-            // Attempt an incremental re-parse.
-            let result = self
-                .reparser
-                .handle_edit(&mut self.parser, span, new_len, new_text, None);
-            match result {
-                Ok(edit_result) => {
-                    return Ok(std::sync::Arc::new(edit_result.semantic_commands));
+            // A span that starts at 0 and covers the entire current text is a
+            // "replace-all" (e.g. the CLI submitting a full buffer, or the very
+            // first character typed into an empty document).  No incremental
+            // candidate can help here — always use the full-reparse path so the
+            // CST layer receives a correct root-setting Insert command.
+            let old_len = self.parser.text().len();
+            let is_replace_all = span.start == 0 && span.end >= old_len;
+
+            if !is_replace_all {
+                let result =
+                    self.reparser
+                        .handle_edit(&mut self.parser, span, new_len, new_text, None);
+                if let Ok(edit_result) = result {
+                    let cmds = prepend_messages_command(
+                        &self.parser.messages,
+                        edit_result.semantic_commands,
+                    );
+                    return Ok(std::sync::Arc::new(cmds));
                 }
-                Err(_) => {
-                    // Incremental re-parse failed; fall through to full re-parse.
-                }
+                // Incremental re-parse failed; fall through to full re-parse.
             }
         }
 
-        // Full re-parse (first edit, or incremental failure).
+        // Full re-parse.
         let crate::parsec::Result { root, .. } = self.parser.parse_text(new_text);
         self.reparser.current = std::rc::Rc::new(root.clone());
-        let commands =
+        let tree_cmds =
             delta::generate_commands_for_full_tree(&self.parser.alloc, root.green, new_text);
-        Ok(std::sync::Arc::new(commands))
+        let cmds = prepend_messages_command(&self.parser.messages, tree_cmds);
+
+        Ok(std::sync::Arc::new(cmds))
     }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
-
-/// Reconstruct the (changed_span, new_len) pair from a SourceText transaction.
-///
-/// Returns `None` if the transaction has no structural edit (e.g. SetRoot only).
 fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
     // Collect staged string lengths indexed by Create id.
     let mut staged_len: Vec<usize> = Vec::new();
@@ -146,4 +121,26 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
         }
     }
     None
+}
+
+/// Prepend a `ParseNodeValue::Messages` Create command (id=0) carrying the
+/// parser-level message list so the CST layer can include errors that are not
+/// encoded as error nodes in the green tree (e.g. panic-mode skip errors
+/// dropped by `finalize_root`).  Tree-node IDs start at 1, so id=0 is safe.
+fn prepend_messages_command(
+    messages: &crate::parsec::msg::ParserMessages,
+    rest: Vec<scheme::Command<RedGreenTreeIR>>,
+) -> Vec<scheme::Command<RedGreenTreeIR>> {
+    if messages.is_empty() {
+        return rest;
+    }
+    let mut cmds = Vec::with_capacity(rest.len() + 1);
+    cmds.push(scheme::Command::Create {
+        id: 0,
+        value: Payload::new(ParseNodeValue::Messages {
+            messages: messages.clone(),
+        }),
+    });
+    cmds.extend(rest);
+    cmds
 }

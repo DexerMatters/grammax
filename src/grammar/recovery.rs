@@ -6,15 +6,12 @@ use std::collections::HashSet;
 pub struct Region {
     pub start: usize,
     pub end: usize,
-    pub indent: usize,
 }
 
 /// Recovery specifications for error handling during parsing
 #[derive(Clone, Debug)]
 pub struct RecoverySpecs {
     pub regions: Vec<Region>,
-    pub line_starts: Vec<usize>,
-    pub line_indents: Vec<usize>,
     pub strategy: ErrorRecoveryStrategy,
 }
 
@@ -46,17 +43,9 @@ impl ErrorRecoveryStrategy {
         }
         None
     }
-
-    pub fn can_recover_at(&self, state_id: usize) -> bool {
-        self.recovery_states.contains(&state_id)
-    }
 }
 
 impl RecoverySpecs {
-    pub fn from_text(text: &str) -> Self {
-        Self::from_text_with_strategy(text, ErrorRecoveryStrategy::new())
-    }
-
     pub fn from_text_with_strategy(text: &str, strategy: ErrorRecoveryStrategy) -> Self {
         let mut line_starts = vec![0];
         let mut line_indents = vec![0];
@@ -79,12 +68,7 @@ impl RecoverySpecs {
 
         let regions = Self::compute_regions(&line_starts, &line_indents, text.len());
 
-        Self {
-            regions,
-            line_starts,
-            line_indents,
-            strategy,
-        }
+        Self { regions, strategy }
     }
 
     fn compute_regions(
@@ -110,7 +94,6 @@ impl RecoverySpecs {
                     regions.push(Region {
                         start: region_start,
                         end: line_start,
-                        indent: prev_indent,
                     });
                 }
             }
@@ -118,25 +101,13 @@ impl RecoverySpecs {
             stack.push((line_start, indent));
         }
 
-        while let Some((region_start, indent)) = stack.pop() {
+        while let Some((region_start, _)) = stack.pop() {
             regions.push(Region {
                 start: region_start,
                 end: text_len,
-                indent,
             });
         }
 
         regions
-    }
-
-    pub fn line_number(&self, pos: usize) -> usize {
-        self.line_starts
-            .binary_search(&pos)
-            .unwrap_or_else(|i| i.saturating_sub(1))
-    }
-
-    pub fn column_number(&self, pos: usize) -> usize {
-        let line = self.line_number(pos);
-        pos - self.line_starts[line]
     }
 }

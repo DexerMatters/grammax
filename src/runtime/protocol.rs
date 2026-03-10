@@ -1,19 +1,23 @@
+use std::fmt::Display;
+
 use crossbeam::channel;
 
 use crate::{
-    scheme::{self, LayerName, PassId, layers::SourceText},
+    scheme::{LayerName, PassId},
     utils::Span,
 };
 
+use super::payload::Payload;
+
 pub type RevisionId = u64;
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeEvent {
     pub revision: RevisionId,
     pub layer: LayerName,
     pub milestone: PassId,
-    pub payload: serde_json::Value,
+    pub payload: Payload,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -34,19 +38,12 @@ pub enum RuntimeSignalKind {
     Ack,
 }
 
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RuntimeSignal {
-    Accepted {
-        revision: RevisionId,
-    },
-    Event {
-        event: RuntimeEvent,
-    },
-    QueryResult {
-        layer: LayerName,
-        value: serde_json::Value,
-    },
+    Accepted { revision: RevisionId },
+    Event { event: RuntimeEvent },
+    QueryResult { layer: LayerName, value: Payload },
     Ack,
 }
 
@@ -120,16 +117,16 @@ pub enum RuntimeRequest {
         completion: CompletionPolicy,
     },
     ApplySourceTxn {
-        txn: scheme::Transaction<SourceText>,
+        txn: Payload,
         completion: CompletionPolicy,
     },
     ApplyTopTxn {
-        txn: serde_json::Value,
+        txn: Payload,
         completion: CompletionPolicy,
     },
     QueryLayer {
         layer: LayerName,
-        index: serde_json::Value,
+        index: Payload,
     },
     Shutdown,
 }
@@ -140,6 +137,16 @@ pub enum RuntimeError {
     QueueFull,
     ChannelClosed,
     InvalidRequest { message: String },
+}
+
+impl Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "Runtime queue is full"),
+            Self::ChannelClosed => write!(f, "Runtime channel is closed"),
+            Self::InvalidRequest { message } => write!(f, "Invalid request: {}", message),
+        }
+    }
 }
 
 pub type RuntimeResult<T = RuntimeSignal> = Result<T, RuntimeError>;

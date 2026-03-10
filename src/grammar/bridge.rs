@@ -41,6 +41,35 @@ pub fn derive_recovery_delimiters(table: &RuleTable) -> Vec<usize> {
     out
 }
 
+/// Detects terminals that have the same delimiter on both ends (e.g., strings delimited by `"`).
+/// These are typically content matchers that are wrapped by literal delimiters.
+pub fn derive_bracketed_terminals(table: &RuleTable) -> Vec<usize> {
+    let mut bracketed = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // Check for named matchers that are bracketed types (e.g., "string", "ident")
+    // These are commonly wrapped by matching delimiter literals in the grammar
+    for (idx, matcher) in table.terminals.iter().enumerate() {
+        let display = matcher.display();
+
+        // Check if this is a bracketed content matcher
+        if is_bracketed_matcher_type(&display) && seen.insert(idx) {
+            bracketed.push(idx);
+        }
+    }
+
+    bracketed
+}
+
+/// Determines if a matcher display string represents a bracketed/delimited content type.
+/// Such matchers are typically used for strings, comments, and identifiers within delimiters.
+fn is_bracketed_matcher_type(display: &str) -> bool {
+    matches!(
+        display,
+        "string" | "ident" | "json_string" | "string_content" | "identifier"
+    )
+}
+
 fn is_punctuation_literal(preview: &str) -> bool {
     !preview.is_empty()
         && preview

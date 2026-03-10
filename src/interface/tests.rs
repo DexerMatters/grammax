@@ -28,14 +28,23 @@ fn test_tap_prints_cst_commands() {
         null    -> tt("null")
     );
 
-    let (pass, observer) = CompilerBuilder::new()
+    let (layer, source_observer) = CompilerBuilder::new().tap();
+    thread::spawn(move || {
+        while let Some(transaction) = source_observer.recv() {
+            println!("======Received Source transaction:");
+            for cmd in transaction.iter() {
+                println!("Source Command: {:?}", cmd);
+            }
+        }
+    });
+    let (pass, observer) = layer
         .then_pass(ParserPass::new(grammar))
         .then_layer(RedGreenTreeIR::default())
         .tap();
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
-            println!("======Received transaction:");
+            println!("======Received CST transaction:");
             for cmd in transaction.iter() {
                 println!("CST Command: {:?}", cmd);
             }

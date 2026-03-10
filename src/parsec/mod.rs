@@ -6,6 +6,7 @@ pub(crate) mod recovery;
 #[cfg(test)]
 mod tests;
 pub mod tree;
+pub mod view;
 pub mod words;
 pub use msg::ParserMessage;
 pub use parser::IncrementalReuseStats;

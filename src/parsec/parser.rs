@@ -1,5 +1,5 @@
-use std::collections::{HashSet, VecDeque};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -176,14 +176,6 @@ impl Parser {
         self.recovery_specs().map(|specs| &specs.strategy)
     }
 
-    pub(crate) fn newly_computed_nodes(&self) -> Vec<Span> {
-        self.newly_computed_nodes.clone()
-    }
-
-    pub(crate) fn newly_computed_tokens(&self) -> Vec<Span> {
-        self.newly_computed_tokens.clone()
-    }
-
     pub(crate) fn set_insert_pos(&mut self, pos: Option<usize>) {
         self.inc_insert_pos = pos;
     }
@@ -193,27 +185,8 @@ impl Parser {
         self.recovery_specs_cache = None;
     }
 
-    pub(crate) fn configure_reuse(
-        &mut self,
-        enabled: bool,
-        cache_capacity: usize,
-        cache_failures: bool,
-    ) {
-        self.reuse_enabled = enabled;
-        self.reuse_cache_failures = cache_failures;
-
-        let new_capacity = cache_capacity.max(1);
-        if self.reuse_cache.capacity() != new_capacity {
-            self.reuse_cache = LruCache::new(new_capacity);
-        }
-    }
-
     pub(crate) fn clear_reuse_cache(&mut self) {
         self.reuse_cache.clear();
-    }
-
-    pub(crate) fn reset_reuse_stats(&mut self) {
-        self.reuse_stats = IncrementalReuseStats::default();
     }
 
     pub(crate) fn reuse_stats(&self) -> IncrementalReuseStats {
@@ -481,9 +454,7 @@ impl Parser {
                 // insertions with no remaining input to shift.  Instead, break out and let
                 // `force_accept` insert missing tokens by following the LR automaton from the
                 // current state, which is fast and semantically equivalent.
-                if self.pos >= self.text.len()
-                    || self.text[self.pos..].trim().is_empty()
-                {
+                if self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty() {
                     break;
                 }
 
@@ -1325,7 +1296,11 @@ impl Parser {
                         .actions
                         .values()
                         .filter_map(|a| {
-                            if let Action::Reduce(p) = a { Some(*p) } else { None }
+                            if let Action::Reduce(p) = a {
+                                Some(*p)
+                            } else {
+                                None
+                            }
                         })
                         .collect();
                     let eps = reduces

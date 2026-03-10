@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crossbeam::channel;
 
 use crate::{
@@ -135,6 +137,16 @@ pub enum RuntimeError {
     QueueFull,
     ChannelClosed,
     InvalidRequest { message: String },
+}
+
+impl Display for RuntimeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::QueueFull => write!(f, "Runtime queue is full"),
+            Self::ChannelClosed => write!(f, "Runtime channel is closed"),
+            Self::InvalidRequest { message } => write!(f, "Invalid request: {}", message),
+        }
+    }
 }
 
 pub type RuntimeResult<T = RuntimeSignal> = Result<T, RuntimeError>;

@@ -30,3 +30,7 @@ features = ["runtime-agnostic"]
 [features]
 webui = ["dep:rouille", "dep:mime_guess"]
 vsclsp = ["dep:tower-lsp"]
+
+[[bin]]
+name = "gmx"
+path = "src/main.rs"

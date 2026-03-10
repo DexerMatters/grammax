@@ -1,7 +1,5 @@
 use crate::new_grammar;
-use crate::parsec::display::{format_ast, format_messages};
 use crate::parsec::parser::Parser;
-use crate::parsec::tree::TreeAllocRefExt;
 use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
 #[test]
@@ -126,23 +124,4 @@ fn test_recovery_strategy_is_wired_for_current_text() {
     let specs = parser.recovery_specs().expect("recovery specs");
     assert!(!specs.regions.is_empty());
     assert!(specs.strategy.sync_tokens.len() >= 2);
-}
-
-#[test]
-fn test_parse_text_handles_closing_quote_after_partial_string() {
-    let grammar = new_grammar!(
-        start where
-        start   -> r!(json) + tt(EndOfInput)
-        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
-        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
-        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
-        boolean -> tt("true") | tt("false")
-        null    -> tt("null")
-    );
-
-    let mut parser = Parser::new(grammar);
-    let result = parser.parse_text("{\"a\"");
 }

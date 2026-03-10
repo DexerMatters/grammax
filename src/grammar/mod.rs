@@ -327,14 +327,14 @@ impl Grammar {
         self
     }
 
-    /// Load a grammar from a .gmx file.
+    /// Load a grammar from a grammax binary file.
     pub fn load_from(path: &Path) -> io::Result<&'static Self> {
         let bytes = fs::read(path)?;
         let grammar = cache::deserialize_grammar_file(&bytes)?;
         Ok(Box::leak(Box::new(grammar)))
     }
 
-    /// Save this grammar to a .gmx file.
+    /// Save this grammar to a grammax binary file.
     pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
         let path = path.as_ref();
         let bytes = cache::serialize_grammar_file(self)?;

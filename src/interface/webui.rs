@@ -125,6 +125,10 @@ impl WebPreviewInterface {
         cprintln!("Web preview server running at <green>{}</green>.", url);
         cprintln!("Press Ctrl+C to stop the server.");
 
+        if let Err(e) = webbrowser::open(&url) {
+            cprintln!("<red>Failed to open web browser: {}</red>", e);
+        }
+
         let (handler, sender_to_stop) = server.stoppable();
 
         ctrlc::set_handler(move || {

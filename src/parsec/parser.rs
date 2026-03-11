@@ -71,6 +71,10 @@ impl<'a> Result<'a> {
     pub fn view(self) -> View<'a> {
         View::new(self.grammar, self.alloc, self.source, self.root.green, 0)
     }
+
+    pub fn is_ok(&self) -> bool {
+        self.messages.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -193,7 +197,7 @@ impl Parser {
         self.reuse_stats
     }
 
-    pub fn parse_text<'a>(&'a mut self, text: &'a str) -> Result<'a> {
+    pub fn parse_text<'a>(&mut self, text: &'a str) -> Result<'a> {
         self.text = text.to_string();
         self.recovery_specs_cache = None;
         self.pos = 0;
@@ -530,7 +534,7 @@ impl Parser {
         self.prime_reuse_from_tree(root_green, 0);
 
         Result {
-            source: &self.text,
+            source: text,
             grammar: self.grammar,
             alloc: self.alloc.clone(),
             root: RedNode::root(root_green),

@@ -1,9 +1,10 @@
 #[cfg(feature = "webui")]
 use crate::{
+    interface::BasicInterface,
     new_grammar,
-    parsec::words::*,
+    parsec::{tree::GreenId, words::*},
     runtime::{CompilerBuilder, ComposedCompiler, ParserPass},
-    scheme::layers::RedGreenTreeIR,
+    scheme::layers::{NodePath, ParseTreeQuery, RedGreenTreeIR},
 };
 
 #[cfg(feature = "webui")]
@@ -77,16 +78,27 @@ fn test_arith_commands() {
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
+            println!("======Current parse tree:");
+            let result = observer.query(ParseTreeQuery::Path(NodePath::root()));
+            let result = result.expect("Runtime query failed");
+            let tree = result.expect("Query is bad for this layer");
+            let green_id = tree
+                .downcast_ref::<GreenId>()
+                .expect("Value is not a GreenId");
+            println!("GreenId at root: {:?}", green_id);
+
             println!("======Received transaction:");
             for cmd in transaction.iter() {
-                println!("CST Command: {:?}", cmd);
+                println!("{:?}", cmd);
             }
         }
     });
 
-    let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
+    let runtime = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
         ComposedCompiler::from_pass_with_events(pass, evt_tx)
     });
 
-    runtime.run().expect("runtime failed");
+    runtime
+        .insert(0, "1 + 2 * 3")
+        .expect("Failed to insert text");
 }

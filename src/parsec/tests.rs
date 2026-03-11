@@ -106,22 +106,21 @@ fn test_json() {
 
 #[test]
 fn test_recovery_strategy_is_wired_for_current_text() {
-    let grammar = new_grammar!(
-        json where
-        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
-        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
-        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
-        boolean -> tt("true") | tt("false")
-        null    -> tt("null")
-    );
+    let my_grammar = new_grammar! {
+        // The rule to start parsing from
+        start where
+        // FORMAT: rule_name -> rule_body
+        start -> r!(expr) + t(EndOfInput)
+        expr -> r!(add) | r!(mul) | r!(num)
+        add -> r!(expr) + t('+') + r!(expr).drop(1)
+        mul -> r!(expr).drop(1) + t('*') + r!(expr).drop(2)
+        num -> t(NUMS) | t('(') + r!(expr) + t(')')
+    };
 
-    let mut parser = Parser::new(grammar);
-    parser.set_text("{\n  \"k\": 1,\n  \"v\": 2\n}");
+    assert!(my_grammar.test("1+2*3"));
+    assert!(my_grammar.test("(1+2)*3"));
+    assert!(!my_grammar.test("1+2*"));
 
-    let specs = parser.recovery_specs().expect("recovery specs");
-    assert!(!specs.regions.is_empty());
-    assert!(specs.strategy.sync_tokens.len() >= 2);
+    println!("{}", my_grammar.parse("1*(2+3").format_ast());
+    println!("{}", my_grammar.parse("1*(2+3").format_messages());
 }

@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use rustc_hash::FxHashMap;
 
+use crate::parsec::{self, Parser};
 use crate::utils::Span;
 
 /// Static storage for cached grammars
@@ -84,8 +85,21 @@ macro_rules! new_grammar {
 	};
 }
 
+#[macro_export]
+macro_rules! new_grammar_no_cache {
+	($start: ident where $($name: ident -> $node: expr)*) => {
+		{
+			#[allow(unused_imports)]
+			use $crate::{grammar::edsl::*, r};
+			$(fn $name() -> GrammarNode { $node })*
+			$crate::grammar::Grammar::new_uncached($start(), stringify!($start)).expect("failed to create grammar")
+		}
+	};
+}
+
 #[derive(Debug)]
 pub enum GrammarError {
+    ParseError(String),
     UnboundRuleReference(Span, String),
     DuplicateRuleName(Span, String),
     NoStartRule(Span),
@@ -345,6 +359,14 @@ impl Grammar {
     pub fn load_from_binary(bytes: impl AsRef<[u8]>) -> io::Result<&'static Self> {
         let grammar = cache::deserialize_grammar_file(bytes.as_ref())?;
         Ok(Box::leak(Box::new(grammar)))
+    }
+
+    pub fn test(&'static self, input: &str) -> bool {
+        Parser::new(self).parse_text(input).is_ok()
+    }
+
+    pub fn parse<'a>(&'static self, input: &'a str) -> parsec::parser::Result<'a> {
+        Parser::new(self).parse_text(input)
     }
 }
 

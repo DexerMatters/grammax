@@ -10,15 +10,15 @@ use crossbeam::channel;
 use crate::{
     grammar::Grammar,
     interface::{BasicInterface, Interface},
-    scheme::{self, LayerName, PassId, layers::SourceText},
+    scheme::{self, layers::SourceText},
     utils::Span,
 };
 
 use super::{
     compiler::ComposedCompiler,
     protocol::{
-        CompletionPolicy, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimeRequest,
-        RuntimeResult, RuntimeSelector, RuntimeSignal,
+        RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimeRequest, RuntimeResult,
+        RuntimeSelector, RuntimeSignal,
     },
 };
 
@@ -110,14 +110,14 @@ fn run_runtime_loop(
     subscribers: Arc<Mutex<Vec<Subscriber>>>,
     mut compiler: ComposedCompiler,
 ) {
-    let settled_layer = compiler
-        .settled_layer()
+    let settled_layer_path = compiler
+        .settled_layer_path()
         .cloned()
-        .unwrap_or_else(LayerName::runtime);
-    let settled_milestone = compiler
-        .settled_milestone()
+        .unwrap_or_else(super::protocol::RuntimePath::root);
+    let settled_pass_path = compiler
+        .settled_pass_path()
         .cloned()
-        .unwrap_or_else(PassId::runtime_error);
+        .unwrap_or_else(super::protocol::RuntimePath::root);
 
     let mut pending = PendingReplies::new();
 
@@ -137,8 +137,8 @@ fn run_runtime_loop(
                         evt,
                         &subscribers,
                         &mut pending,
-                        &settled_layer,
-                        &settled_milestone,
+                        &settled_layer_path,
+                        &settled_pass_path,
                     ),
                     LoopControl::Break
                 ) {
@@ -170,66 +170,15 @@ fn handle_request(
     pending: &mut PendingReplies,
 ) -> LoopControl {
     match request {
-        RuntimeRequest::ApplyTextEdit {
-            span,
-            text,
-            completion,
-        } => {
+        RuntimeRequest::ApplyTextEdit { span, text } => {
             let txn = edit_to_txn(span, text);
-            finish_submit(compiler.submit_source(txn), completion, reply, pending);
+            finish_submit(compiler.submit_source(txn), reply, pending);
             LoopControl::Continue
         }
-        RuntimeRequest::ApplySourceTxn { txn, completion } => {
-            let typed = txn
-                .downcast_ref::<crate::scheme::Transaction<crate::scheme::layers::SourceText>>()
-                .cloned();
-
-            let result = if let Some(txn) = typed {
-                compiler.submit_source(txn)
-            } else if let Some(json) = txn.downcast_ref::<serde_json::Value>() {
-                serde_json::from_value::<
-                    crate::scheme::Transaction<crate::scheme::layers::SourceText>,
-                >(json.clone())
-                .map_err(|e| RuntimeError::InvalidRequest {
-                    message: e.to_string(),
-                })
-                .and_then(|t| compiler.submit_source(t))
-            } else {
-                Err(RuntimeError::InvalidRequest {
-                    message: "applySourceTxn payload type mismatch".to_string(),
-                })
-            };
-
-            finish_submit(result, completion, reply, pending);
-            LoopControl::Continue
-        }
-        RuntimeRequest::ApplyTopTxn { txn, completion } => {
-            let typed = txn
-                .downcast_ref::<crate::scheme::Transaction<crate::scheme::layers::SourceText>>()
-                .cloned();
-
-            let result = if let Some(txn) = typed {
-                compiler.submit_source(txn)
-            } else if let Some(json) = txn.downcast_ref::<serde_json::Value>() {
-                serde_json::from_value::<
-                    crate::scheme::Transaction<crate::scheme::layers::SourceText>,
-                >(json.clone())
-                .map_err(|e| RuntimeError::InvalidRequest {
-                    message: e.to_string(),
-                })
-                .and_then(|t| compiler.submit_source(t))
-            } else {
-                Err(RuntimeError::InvalidRequest {
-                    message: "applyTopTxn payload type mismatch".to_string(),
-                })
-            };
-            finish_submit(result, completion, reply, pending);
-            LoopControl::Continue
-        }
-        RuntimeRequest::QueryLayer { layer, index } => {
+        RuntimeRequest::QueryLayer { layer_path, index } => {
             let response = compiler
-                .query(layer.clone(), index)
-                .map(|value| RuntimeSignal::QueryResult { layer, value });
+                .query(layer_path.clone(), index)
+                .map(|value| RuntimeSignal::QueryResult { layer_path, value });
             let _ = reply.send(response);
             LoopControl::Continue
         }
@@ -244,21 +193,14 @@ fn handle_request(
 
 fn finish_submit(
     result: RuntimeResult<u64>,
-    completion: CompletionPolicy,
     reply: channel::Sender<RuntimeResult>,
     pending: &mut PendingReplies,
 ) {
     match result {
-        Ok(revision) if matches!(completion, CompletionPolicy::Enqueued) => {
-            let _ = reply.send(Ok(RuntimeSignal::Accepted { revision }));
-        }
         Ok(revision) => {
             pending.insert(
                 revision,
-                (
-                    RuntimeSelector::revision(revision).with_completion(completion),
-                    reply,
-                ),
+                (RuntimeSelector::revision(revision), reply),
             );
         }
         Err(err) => {
@@ -271,8 +213,8 @@ fn handle_event_message(
     evt: Result<RuntimeEvent, channel::RecvError>,
     subscribers: &Arc<Mutex<Vec<Subscriber>>>,
     pending: &mut PendingReplies,
-    settled_layer: &LayerName,
-    settled_milestone: &PassId,
+    settled_layer_path: &super::protocol::RuntimePath,
+    settled_pass_path: &super::protocol::RuntimePath,
 ) -> LoopControl {
     let Ok(event) = evt else {
         fail_pending(pending, RuntimeError::ChannelClosed);
@@ -282,20 +224,20 @@ fn handle_event_message(
     let signal = RuntimeSignal::Event {
         event: event.clone(),
     };
-    broadcast_signal(subscribers, &signal, settled_layer, settled_milestone);
-    resolve_pending_signal(signal, pending, settled_layer, settled_milestone);
+    broadcast_signal(subscribers, &signal, settled_layer_path, settled_pass_path);
+    resolve_pending_signal(signal, pending, settled_layer_path, settled_pass_path);
     LoopControl::Continue
 }
 
 fn broadcast_signal(
     subscribers: &Arc<Mutex<Vec<Subscriber>>>,
     signal: &RuntimeSignal,
-    settled_layer: &LayerName,
-    settled_milestone: &PassId,
+    settled_layer_path: &super::protocol::RuntimePath,
+    settled_pass_path: &super::protocol::RuntimePath,
 ) {
     if let Ok(mut outs) = subscribers.lock() {
         outs.retain(|sub| {
-            if !signal_matches(&sub.selector, signal, settled_layer, settled_milestone) {
+            if !signal_matches(&sub.selector, signal, settled_layer_path, settled_pass_path) {
                 return true;
             }
             sub.sender.send(signal.clone()).is_ok()
@@ -306,8 +248,8 @@ fn broadcast_signal(
 fn resolve_pending_signal(
     signal: RuntimeSignal,
     pending: &mut PendingReplies,
-    settled_layer: &LayerName,
-    settled_milestone: &PassId,
+    settled_layer_path: &super::protocol::RuntimePath,
+    settled_pass_path: &super::protocol::RuntimePath,
 ) {
     let Some(revision) = signal.revision() else {
         return;
@@ -322,7 +264,7 @@ fn resolve_pending_signal(
         return;
     }
 
-    if signal_matches(&selector, &signal, settled_layer, settled_milestone) {
+    if signal_matches(&selector, &signal, settled_layer_path, settled_pass_path) {
         let _ = reply.send(Ok(signal));
         return;
     }
@@ -333,8 +275,8 @@ fn resolve_pending_signal(
 fn signal_matches(
     selector: &RuntimeSelector,
     signal: &RuntimeSignal,
-    settled_layer: &LayerName,
-    settled_milestone: &PassId,
+    settled_layer_path: &super::protocol::RuntimePath,
+    settled_pass_path: &super::protocol::RuntimePath,
 ) -> bool {
     if let Some(kind) = selector.kind {
         if signal.kind() != kind {
@@ -348,35 +290,17 @@ fn signal_matches(
         }
     }
 
-    match &selector.completion {
-        None => true,
-        Some(CompletionPolicy::Enqueued) => matches!(signal, RuntimeSignal::Accepted { .. }),
-        Some(policy) => signal
-            .event()
-            .map(|event| completion_matches(policy, event, settled_layer, settled_milestone))
-            .unwrap_or(false),
-    }
-}
-
-fn completion_matches(
-    policy: &CompletionPolicy,
-    event: &RuntimeEvent,
-    settled_layer: &LayerName,
-    settled_milestone: &PassId,
-) -> bool {
-    match policy {
-        CompletionPolicy::Enqueued => true,
-        CompletionPolicy::Settled => {
-            &event.layer == settled_layer || &event.milestone == settled_milestone
-        }
-        CompletionPolicy::Layer(name) => &event.layer == name,
-        CompletionPolicy::Milestone(name) => &event.milestone == name,
-    }
+    signal
+        .event()
+        .map(|event| {
+            &event.layer_path == settled_layer_path || &event.pass_path == settled_pass_path
+        })
+        .unwrap_or(false)
 }
 
 fn signal_error_message(signal: &RuntimeSignal) -> Option<String> {
     let event = signal.event()?;
-    if event.milestone != PassId::runtime_error() {
+    if !event.is_error {
         return None;
     }
 

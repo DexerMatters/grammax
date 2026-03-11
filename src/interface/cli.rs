@@ -43,6 +43,10 @@ impl Interface for CliInterface {
 }
 
 impl CliInterface {
+    fn settled_layer_path() -> runtime::RuntimePath {
+        runtime::RuntimePath(vec![0])
+    }
+
     pub fn run(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
 
@@ -87,13 +91,12 @@ impl CliInterface {
         self.request(runtime::RuntimeRequest::ApplyTextEdit {
             span: utils::Span::new(0, usize::MAX),
             text: text.to_string(),
-            completion: runtime::CompletionPolicy::Settled,
         })
     }
 
     fn query_tree_payload(
         &self,
-        layer: runtime::LayerName,
+        layer_path: runtime::RuntimePath,
         index: ParseTreeQuery,
     ) -> runtime::RuntimeResult<runtime::Payload> {
         let decode = |signal: runtime::RuntimeSignal| -> runtime::RuntimeResult<runtime::Payload> {
@@ -106,7 +109,7 @@ impl CliInterface {
         };
 
         self.request(runtime::RuntimeRequest::QueryLayer {
-            layer,
+            layer_path,
             index: runtime::Payload::new(index),
         })
         .and_then(decode)
@@ -114,10 +117,10 @@ impl CliInterface {
 
     fn query_green_id(
         &self,
-        layer: runtime::LayerName,
+        layer_path: runtime::RuntimePath,
         path: NodePath,
     ) -> runtime::RuntimeResult<usize> {
-        let payload = self.query_tree_payload(layer, ParseTreeQuery::Path(path))?;
+        let payload = self.query_tree_payload(layer_path, ParseTreeQuery::Path(path))?;
         payload.downcast_ref::<usize>().copied().ok_or_else(|| {
             runtime::RuntimeError::InvalidRequest {
                 message: "path query did not return green id".to_string(),
@@ -125,8 +128,11 @@ impl CliInterface {
         })
     }
 
-    fn query_allocator(&self, layer: runtime::LayerName) -> runtime::RuntimeResult<TreeAllocRef> {
-        let payload = self.query_tree_payload(layer, ParseTreeQuery::Allocator)?;
+    fn query_allocator(
+        &self,
+        layer_path: runtime::RuntimePath,
+    ) -> runtime::RuntimeResult<TreeAllocRef> {
+        let payload = self.query_tree_payload(layer_path, ParseTreeQuery::Allocator)?;
         payload
             .downcast_ref::<TreeAllocRef>()
             .cloned()
@@ -135,8 +141,11 @@ impl CliInterface {
             })
     }
 
-    fn query_messages(&self, layer: runtime::LayerName) -> runtime::RuntimeResult<ParserMessages> {
-        let payload = self.query_tree_payload(layer, ParseTreeQuery::Message)?;
+    fn query_messages(
+        &self,
+        layer_path: runtime::RuntimePath,
+    ) -> runtime::RuntimeResult<ParserMessages> {
+        let payload = self.query_tree_payload(layer_path, ParseTreeQuery::Message)?;
         payload
             .downcast_ref::<ParserMessages>()
             .cloned()
@@ -146,23 +155,11 @@ impl CliInterface {
     }
 
     /// Build messages + AST text from the settled RedGreenTreeIR layer.
-    fn display_result(
-        &self,
-        settled_signal: runtime::RuntimeSignal,
-        source: &str,
-    ) -> runtime::RuntimeResult<(String, String)> {
-        let layer = match settled_signal {
-            runtime::RuntimeSignal::Event { event } => event.layer,
-            other => {
-                return Err(runtime::RuntimeError::InvalidRequest {
-                    message: format!("unexpected settled signal: {other:?}"),
-                });
-            }
-        };
-
-        let messages = self.query_messages(layer.clone())?;
-        let alloc = self.query_allocator(layer.clone())?;
-        let root_green = self.query_green_id(layer, NodePath::root())?;
+    fn display_result(&self, source: &str) -> runtime::RuntimeResult<(String, String)> {
+        let layer_path = Self::settled_layer_path();
+        let messages = self.query_messages(layer_path.clone())?;
+        let alloc = self.query_allocator(layer_path.clone())?;
+        let root_green = self.query_green_id(layer_path, NodePath::root())?;
         let message_text = format_messages_with_source(self.grammar, &messages, source);
         let root = RedNode::root(root_green);
         let ast_text = format_ast(self.grammar, &root, &alloc, source);
@@ -286,7 +283,7 @@ fn key_event_handler(
                 move_to(stdout, 0, state.origin_row + num_lines)?;
                 write!(stdout, "\r\n")?;
                 writeln!(stdout, "----------------------------------\r")?;
-                match settled.and_then(|signal| cli.display_result(signal, &source)) {
+                match settled.and_then(|_| cli.display_result(&source)) {
                     Ok((messages, ast)) => {
                         if !messages.is_empty() {
                             cwrite!(stdout, "\r\n<bold>Messages:</bold>\r\n")?;

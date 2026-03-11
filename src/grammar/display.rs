@@ -197,6 +197,9 @@ pub fn format_grammar_error(error: &GrammarError, source: &str) -> String {
         GrammarError::IoError(e) => {
             format!("{}error: I/O error - {}{}", RED, e, RESET)
         }
+        GrammarError::ParseError(msg) => {
+            format!("{}error: parse error:\n{}{}", RED, RESET, msg)
+        }
     };
 
     let _ = write!(out, "{} at {}:{}", error_msg, start_line, start_col);
@@ -232,6 +235,9 @@ pub fn format_grammar_error_message(error: &GrammarError) -> String {
         }
         GrammarError::IoError(e) => {
             format!("{}error: I/O error - {}{}", RED, e, RESET)
+        }
+        GrammarError::ParseError(msg) => {
+            format!("{}error: parse error:\n{}{}", RED, RESET, msg)
         }
     }
 }

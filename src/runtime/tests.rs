@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{thread, time::Duration};
 
 use crate::{
     interface::BasicInterface,
@@ -14,7 +14,7 @@ use crate::{
 
 #[test]
 fn test_json() {
-    let _grammar = new_grammar!(
+    let grammar = new_grammar!(
         json where
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
@@ -25,6 +25,31 @@ fn test_json() {
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
+
+    let (cst_pass, cst_obs) = CompilerBuilder::new()
+        .then_pass(ParserPass::new(grammar))
+        .then_layer(RedGreenTreeIR::default())
+        .tap();
+
+    // thread::spawn(move || {
+    //     for update in cst_obs.updates.iter() {
+    //         println!(
+    //             "=== CST update: revision {}, {} commands ===",
+    //             update.0,
+    //             update.1.len()
+    //         );
+    //         for cmd in update.1.iter() {
+    //             println!("  {cmd:?}");
+    //         }
+    //     }
+    // });
+
+    let compiler = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
+        ComposedCompiler::from_pass_with_events(cst_pass, evt_tx)
+    });
+
+    compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
+    compiler.update(10, 14, "Doe").expect("update");
 }
 
 #[test]
@@ -62,53 +87,6 @@ fn test_tap_prints_cst_commands() {
     println!("=== revision {revision} — {} CST command(s) ===", txn.len());
     for cmd in txn.iter() {
         println!("  {cmd:?}");
-    }
-}
-
-#[test]
-fn test_service_subscription_uses_same_selector_logic_as_completion() {
-    let grammar = new_grammar!(
-        json where
-        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
-        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
-        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
-        boolean -> tt("true") | tt("false")
-        null    -> tt("null")
-    );
-
-    let runtime = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
-        let pass = CompilerBuilder::new()
-            .then_pass(ParserPass::new(grammar))
-            .then_layer(RedGreenTreeIR::default());
-        ComposedCompiler::from_pass_with_events(pass, evt_tx)
-    });
-
-    let rx = runtime.subscribe(
-        RuntimeSelector::events().with_completion(crate::runtime::CompletionPolicy::Settled),
-    );
-
-    let response = runtime.insert(0, r#"{"key": 42}"#).expect("submit");
-    let signal = rx
-        .recv_timeout(Duration::from_secs(1))
-        .expect("subscription event");
-
-    match signal {
-        RuntimeSignal::Event { event } => {
-            assert_eq!(event.revision, 1);
-            assert!(event.payload.to_json().is_array());
-        }
-        other => panic!("expected event signal, got {other:?}"),
-    }
-
-    match response {
-        RuntimeSignal::Event { event } => {
-            assert_eq!(event.revision, 1);
-            assert!(event.payload.to_json().is_array());
-        }
-        other => panic!("expected event signal, got {other:?}"),
     }
 }
 

@@ -13,7 +13,7 @@ pub use crate::scheme::{LayerName, PassId};
 pub use compiler::{CompilerBuilder, ComposedCompiler, ExpectLayer, ExpectPass, LayerObserver};
 pub use payload::{Payload, SerdeAny};
 pub use protocol::{
-    CompletionPolicy, RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimeRequest,
+    RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimePath, RuntimeRequest,
     RuntimeResult, RuntimeSelector, RuntimeSignal, RuntimeSignalKind,
 };
 pub use service::RuntimeService;

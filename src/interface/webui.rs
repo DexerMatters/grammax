@@ -27,11 +27,7 @@ struct TerminalInfo {
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum WebAction {
-    ApplyTextEdit {
-        span: utils::Span,
-        text: String,
-        completion: Option<runtime::CompletionPolicy>,
-    },
+    ApplyTextEdit { span: utils::Span, text: String },
     GetSource,
     GetTree,
     Shutdown,
@@ -214,11 +210,6 @@ fn commands_to_web_json(commands: &[runtime::Command]) -> serde_json::Value {
 fn signal_to_response(signal: &runtime::RuntimeSignal) -> serde_json::Value {
     match signal {
         runtime::RuntimeSignal::Event { event } => {
-            // The CST layer wraps delta commands in the event payload.  Try to
-            // downcast to the concrete type first so we can use the
-            // frontend-compatible wire format.  Falling back to raw `.to_json()`
-            // would silently produce `null` here because of the internally-tagged
-            // serde enum (`ParseTreeQuery`) wrapping a sequence.
             if let Some(commands) = event.payload.downcast_ref::<Vec<runtime::Command>>() {
                 return commands_to_web_json(commands);
             }
@@ -240,17 +231,10 @@ fn resolve_api_request(
         "api/action" => {
             let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
             match body {
-                WebAction::ApplyTextEdit {
-                    span,
-                    text,
-                    completion,
-                } => {
-                    let completion_policy =
-                        completion.unwrap_or(runtime::CompletionPolicy::Settled);
+                WebAction::ApplyTextEdit { span, text } => {
                     let request = runtime::RuntimeRequest::ApplyTextEdit {
                         span,
                         text: text.clone(),
-                        completion: completion_policy.clone(),
                     };
 
                     let result = this.request(request);
@@ -311,7 +295,7 @@ fn serialize_terminal_infos(grammar: &'static grammar::Grammar) -> &'static Vec<
 fn query_source_text(this: &WebPreviewInterface) -> runtime::RuntimeResult<runtime::RuntimeSignal> {
     let request_for_span = |span: utils::Span| -> runtime::RuntimeRequest {
         runtime::RuntimeRequest::QueryLayer {
-            layer: runtime::LayerName::root(),
+            layer_path: runtime::RuntimePath::root(),
             index: runtime::Payload::new(span),
         }
     };

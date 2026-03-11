@@ -1,6 +1,6 @@
 use crossbeam::channel;
 
-use crate::{grammar, runtime, scheme::LayerName, utils};
+use crate::{grammar, runtime, utils};
 
 pub mod cli;
 #[cfg(feature = "vsclsp")]
@@ -55,69 +55,44 @@ impl Interface for BasicInterface {
 }
 
 impl BasicInterface {
-    pub fn update_with_policy(
-        &self,
-        start: usize,
-        end: usize,
-        text: &str,
-        completion: runtime::CompletionPolicy,
-    ) -> runtime::RuntimeResult {
+    pub fn update(&self, start: usize, end: usize, text: &str) -> runtime::RuntimeResult {
         self.request(runtime::RuntimeRequest::ApplyTextEdit {
             span: utils::Span::new(start, end),
             text: text.to_string(),
-            completion,
         })
-    }
-
-    pub fn update(&self, start: usize, end: usize, text: &str) -> runtime::RuntimeResult {
-        self.update_with_policy(start, end, text, runtime::CompletionPolicy::Settled)
     }
 
     pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult {
-        self.update_with_policy(offset, offset, text, runtime::CompletionPolicy::Settled)
+        self.update(offset, offset, text)
     }
 
     pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult {
-        self.update_with_policy(start, end, "", runtime::CompletionPolicy::Settled)
-    }
-
-    pub fn submit_top_txn<T>(
-        &self,
-        txn: T,
-        completion: runtime::CompletionPolicy,
-    ) -> runtime::RuntimeResult
-    where
-        T: serde::Serialize + Send + Sync + 'static,
-    {
-        self.request(runtime::RuntimeRequest::ApplyTopTxn {
-            txn: runtime::Payload::new(txn),
-            completion,
-        })
+        self.update(start, end, "")
     }
 
     pub fn query_layer<I>(
         &self,
-        layer: LayerName,
+        layer_path: runtime::RuntimePath,
         index: I,
     ) -> runtime::RuntimeResult<runtime::Payload>
     where
         I: serde::Serialize + Send + Sync + 'static,
     {
-        let expected_layer = layer;
+        let expected_layer = layer_path;
         let signal = self.request(runtime::RuntimeRequest::QueryLayer {
-            layer: expected_layer.clone(),
+            layer_path: expected_layer.clone(),
             index: runtime::Payload::new(index),
         })?;
 
         match signal {
             runtime::RuntimeSignal::QueryResult {
-                layer: returned_layer,
+                layer_path: returned_layer,
                 value,
             } if returned_layer == expected_layer => Ok(value),
-            runtime::RuntimeSignal::QueryResult { layer, .. } => {
+            runtime::RuntimeSignal::QueryResult { layer_path, .. } => {
                 Err(runtime::RuntimeError::InvalidRequest {
                     message: format!(
-                        "query layer mismatch: expected {expected_layer}, got {layer}"
+                        "query layer mismatch: expected {expected_layer}, got {layer_path}"
                     ),
                 })
             }
@@ -128,7 +103,7 @@ impl BasicInterface {
     }
 
     pub fn query_source_text(&self, span: utils::Span) -> runtime::RuntimeResult<String> {
-        let payload = self.query_layer(LayerName::root(), span)?;
+        let payload = self.query_layer(runtime::RuntimePath::root(), span)?;
 
         payload.downcast_ref::<String>().cloned().ok_or_else(|| {
             runtime::RuntimeError::InvalidRequest {

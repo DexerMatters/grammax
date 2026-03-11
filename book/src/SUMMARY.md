@@ -15,14 +15,13 @@
 - [Interactive](./guide/6-interactive.md)
 
 # Developer guide
-- [Build a compiler](./developer/1-compiler.md)
-    - [IR](./developer/1-1-ir.md)
-    - [Pass](./developer/1-2-pass.md)
-    - [Command](./developer/1-3-command.md)
-    - [Signal](./developer/1-4-signal.md)
+- [Introduction](./developer/0-introduction.md)
+- [Layers](./developer/1-layers.md)
+- [Pipeline](./developer/2-pipeline.md)
+- [Interactive](./developer/3-interactive.md)
 
 # Design and implementation
-- [Design as "terraced fields"](./design/1-terraces.md)
+- [The Chapter 0 - Design as "terraced fields"](./design/0-terraces.md)
 - [Grammar normalization](./design/1-grammar-normalization.md)
 - [Error recovery](./design/2-error-recovery.md)
 - [Node reusing](./design/3-node-reusing.md)

@@ -8,7 +8,7 @@ use crate::{
         Grammar, GrammarError,
         edsl::{self, GrammarNode},
     },
-    new_grammar,
+    new_grammar, new_grammar_no_cache,
     parsec::{
         self,
         view::View,
@@ -19,7 +19,7 @@ use crate::{
 
 thread_local! {
     #[allow(dead_code)]
-    static GRAMMAX_DSL_GRAMMAR_PROTOTYPE: &'static Grammar = new_grammar! {
+    static GRAMMAX_DSL_GRAMMAR_PROTOTYPE: &'static Grammar = new_grammar_no_cache! {
         table where
         table -> sep(r!(rule), t('\n')) + tt(EndOfInput)
         rule -> field("name", tt(IDENT)) + tt("->") + field("definition", r!(expr))
@@ -31,7 +31,8 @@ thread_local! {
         many -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("*")
         some -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("+")
         reference -> tt(IDENT)
-        terminal -> (tt("(") + r!(expr) + tt(")")) | r!(literal) | r!(token)
+        terminal -> (tt("(") + r!(expr) + tt(")")) | opt(t("!")) + r!(primary)
+        primary -> r!(token) | r!(literal)
         token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMS") | tt("ALPHABETS") | tt("EOF")
         literal -> tt('"') + tt(STRING) + tt('"')
     };
@@ -48,6 +49,9 @@ impl Grammar {
     pub fn interpret(dsl: impl AsRef<str>) -> Result<&'static Self, GrammarError> {
         let mut parser = parsec::Parser::new(grammax_dsl_grammar());
         let result = parser.parse_text(dsl.as_ref());
+        if !result.messages.is_empty() {
+            return Err(GrammarError::ParseError(result.format_messages()));
+        }
         translate_dsl_grammar(result)
     }
 
@@ -138,9 +142,9 @@ fn view_expr(view: View) -> GrammarNode {
             let field_name = view
                 .into_each_field("field_name")
                 .next()
-                .and_then(|field| field.into())
                 .map(|n| n.text().trim())
-                .unwrap_or("");
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| panic!("Missing field name in fields node: {}", view.display()));
             let field_name = Box::leak(field_name.to_string().into_boxed_str()) as &'static str;
 
             let expr = view
@@ -197,12 +201,11 @@ fn view_repetition_expr(view: View, min: usize) -> GrammarNode {
         .map(view_expr)
         .unwrap_or_else(|| panic!("Missing repeated expression in node: {}", view.display()));
 
-    let sep = view.into_each_field("sep").next().and_then(|field| {
-        field
-            .into()
-            .and_then(|value| value.into_each_rule("expr").next())
-            .map(view_expr)
-    });
+    let sep = view
+        .into_each_field("sep")
+        .next()
+        .and_then(|field| field.into())
+        .map(view_expr);
 
     if let Some(separator) = sep {
         GrammarNode::SeparatedRepetition {
@@ -231,7 +234,8 @@ fn view_leaf_expr(view: View) -> GrammarNode {
 
     if text.starts_with('"') && text.ends_with('"') && text.len() >= 2 {
         let inner = text.trim_matches('"');
-        let inner = Box::leak(inner.to_string().into_boxed_str()) as &'static str;
+        let inner = normalize_escaped_string(inner);
+        let inner = Box::leak(inner.into_boxed_str()) as &'static str;
         return GrammarNode::Terminal(Arc::new(words::token(inner)), span);
     }
 
@@ -249,22 +253,86 @@ fn view_leaf_expr(view: View) -> GrammarNode {
     GrammarNode::UnboundReference(text.to_string(), span)
 }
 
-fn view_token(view: View) -> GrammarNode {
+fn normalize_escaped_string(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            out.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+
+    out
+}
+
+fn view_token_with_mode(view: View, raw: bool) -> GrammarNode {
     let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     let token_name = view.text().trim();
     let matcher: Arc<dyn Matcher + Send + Sync> = match token_name {
-        "IDENT" => Arc::new(words::token(words::IDENT)),
-        "STRING" => Arc::new(words::token(words::STRING)),
-        "NUMBER" => Arc::new(words::token(words::NUMS)),
-        "ALPHANUMS" => Arc::new(words::token(words::ALPHANUMS)),
-        "ALPHABETS" => Arc::new(words::token(words::ALPHAS)),
-        "EOF" => Arc::new(words::token(words::EndOfInput)),
+        "IDENT" => {
+            if raw {
+                Arc::new(words::IDENT)
+            } else {
+                Arc::new(words::token(words::IDENT))
+            }
+        }
+        "STRING" => {
+            if raw {
+                Arc::new(words::STRING)
+            } else {
+                Arc::new(words::token(words::STRING))
+            }
+        }
+        "NUMBER" => {
+            if raw {
+                Arc::new(words::NUMS)
+            } else {
+                Arc::new(words::token(words::NUMS))
+            }
+        }
+        "ALPHANUMS" => {
+            if raw {
+                Arc::new(words::ALPHANUMS)
+            } else {
+                Arc::new(words::token(words::ALPHANUMS))
+            }
+        }
+        "ALPHABETS" => {
+            if raw {
+                Arc::new(words::ALPHAS)
+            } else {
+                Arc::new(words::token(words::ALPHAS))
+            }
+        }
+        "EOF" => {
+            if raw {
+                Arc::new(words::EndOfInput)
+            } else {
+                Arc::new(words::token(words::EndOfInput))
+            }
+        }
         _ => panic!("Unsupported token type: {}", token_name),
     };
     GrammarNode::Terminal(matcher, span)
 }
 
-fn view_literal(view: View) -> GrammarNode {
+fn view_token(view: View) -> GrammarNode {
+    view_token_with_mode(view, false)
+}
+
+fn view_literal_with_mode(view: View, raw: bool) -> GrammarNode {
     let span = Span::new(view.span_bytes().0, view.span_bytes().1);
     let text = view
         .into_each()
@@ -275,24 +343,48 @@ fn view_literal(view: View) -> GrammarNode {
         .map(|child| child.text().trim())
         .unwrap_or("");
 
-    let text = Box::leak(text.to_string().into_boxed_str()) as &'static str;
-    GrammarNode::Terminal(Arc::new(words::token(text)), span)
+    let text = normalize_escaped_string(text);
+    let text = Box::leak(text.into_boxed_str()) as &'static str;
+    let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
+        Arc::new(text)
+    } else {
+        Arc::new(words::token(text))
+    };
+    GrammarNode::Terminal(matcher, span)
+}
+
+fn view_literal(view: View) -> GrammarNode {
+    view_literal_with_mode(view, false)
 }
 
 fn view_terminal(view: View) -> GrammarNode {
+    // Handle parenthesized expression: (tt("(") + r!(expr) + tt(")"))
     if let Some(expr) = view.into_each_rule("expr").next() {
         return view_expr(expr);
     }
 
-    if let Some(token) = view.into_each_rule("token").next() {
-        return view_token(token);
-    }
+    // Handle primary with optional raw marker: opt(t("!")) + r!(primary)
+    // The "!" prefix means don't omit leading spaces (raw primary)
+    let is_raw = view.into_each().any(|child| child.text().trim() == "!");
 
-    if let Some(literal) = view.into_each_rule("literal").next() {
-        return view_literal(literal);
+    if let Some(primary) = view.into_each_rule("primary").next() {
+        return view_primary(primary, is_raw);
     }
 
     panic!("Unsupported terminal shape: {}", view.display())
+}
+
+fn view_primary(view: View, raw: bool) -> GrammarNode {
+    // A primary is either a token or a literal (both with default space omission)
+    if let Some(token) = view.into_each_rule("token").next() {
+        return view_token_with_mode(token, raw);
+    }
+
+    if let Some(literal) = view.into_each_rule("literal").next() {
+        return view_literal_with_mode(literal, raw);
+    }
+
+    panic!("Unsupported primary shape: {}", view.display())
 }
 
 #[cfg(test)]
@@ -302,28 +394,24 @@ mod tests {
 
     #[test]
     fn test_dsl_grammar() {
-        let grammar = Grammar::load_from_binary(Asset::get("grammax.gmx.bin").unwrap().data)
-            .expect("Failed to load grammar");
-        // let (pass, _) = CompilerBuilder::new()
-        //     .then_pass(ParserPass::new(grammar))
-        //     .then_layer(RedGreenTreeIR::default())
-        //     .tap();
-
-        // let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
-        //     ComposedCompiler::from_pass_with_events(pass, evt_tx)
-        // });
-        // runtime.run().expect("runtime failed");
-
+        let grammar = GRAMMAX_DSL_GRAMMAR_PROTOTYPE.with(|g| *g);
+        grammar
+            .save_to("/home/dexer/repos/grammax/grammars/grammax.gmx.bin")
+            .unwrap();
         let mut parser = Parser::new(grammar);
 
         println!("Grammar:\n{}", parser.grammar.table);
 
         let text = r#"
-start -> expr EOF
-expr -> add | mul | primary
-add -> lhs:expr "+" rhs:expr/1
-mul -> lhs:expr/1 "*" rhs:expr/2
-primary -> NUMBER | "(" expr ")"
+start    -> json EOF
+json     -> object | array | string | number | boolean | null
+object   -> "{" pair{","}* "}"
+pair     -> key:string ":" value:json
+array    -> "[" json{","}* "]"
+string   -> "\"" STRING "\""
+number   -> NUMBER
+boolean -> "true" | "false"
+null     -> "null"
 "#;
 
         let result = parser.parse_text(text);

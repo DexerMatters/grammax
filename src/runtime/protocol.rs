@@ -2,31 +2,50 @@ use std::fmt::Display;
 
 use crossbeam::channel;
 
-use crate::{
-    scheme::{LayerName, PassId},
-    utils::Span,
-};
+use crate::utils::Span;
 
 use super::payload::Payload;
 
 pub type RevisionId = u64;
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct RuntimePath(pub Vec<u32>);
+
+impl RuntimePath {
+    pub fn root() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn child(&self, branch_index: u32) -> Self {
+        let mut next = self.0.clone();
+        next.push(branch_index);
+        Self(next)
+    }
+}
+
+impl Display for RuntimePath {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "path:")?;
+        if self.0.is_empty() {
+            write!(f, "/")
+        } else {
+            for seg in &self.0 {
+                write!(f, "/{seg}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RuntimeEvent {
     pub revision: RevisionId,
-    pub layer: LayerName,
-    pub milestone: PassId,
+    pub layer_path: RuntimePath,
+    pub pass_path: RuntimePath,
+    pub is_error: bool,
     pub payload: Payload,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum CompletionPolicy {
-    Enqueued,
-    Settled,
-    Layer(LayerName),
-    Milestone(PassId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -41,9 +60,16 @@ pub enum RuntimeSignalKind {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RuntimeSignal {
-    Accepted { revision: RevisionId },
-    Event { event: RuntimeEvent },
-    QueryResult { layer: LayerName, value: Payload },
+    Accepted {
+        revision: RevisionId,
+    },
+    Event {
+        event: RuntimeEvent,
+    },
+    QueryResult {
+        layer_path: RuntimePath,
+        value: Payload,
+    },
     Ack,
 }
 
@@ -78,7 +104,6 @@ impl RuntimeSignal {
 pub struct RuntimeSelector {
     pub revision: Option<RevisionId>,
     pub kind: Option<RuntimeSignalKind>,
-    pub completion: Option<CompletionPolicy>,
 }
 
 impl RuntimeSelector {
@@ -101,11 +126,6 @@ impl RuntimeSelector {
         self.kind = Some(kind);
         self
     }
-
-    pub fn with_completion(mut self, completion: CompletionPolicy) -> Self {
-        self.completion = Some(completion);
-        self
-    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -114,18 +134,9 @@ pub enum RuntimeRequest {
     ApplyTextEdit {
         span: Span,
         text: String,
-        completion: CompletionPolicy,
-    },
-    ApplySourceTxn {
-        txn: Payload,
-        completion: CompletionPolicy,
-    },
-    ApplyTopTxn {
-        txn: Payload,
-        completion: CompletionPolicy,
     },
     QueryLayer {
-        layer: LayerName,
+        layer_path: RuntimePath,
         index: Payload,
     },
     Shutdown,
@@ -136,6 +147,7 @@ pub enum RuntimeRequest {
 pub enum RuntimeError {
     QueueFull,
     ChannelClosed,
+    InvalidQuery,
     InvalidRequest { message: String },
 }
 
@@ -144,6 +156,7 @@ impl Display for RuntimeError {
         match self {
             Self::QueueFull => write!(f, "Runtime queue is full"),
             Self::ChannelClosed => write!(f, "Runtime channel is closed"),
+            Self::InvalidQuery => write!(f, "Invalid query"),
             Self::InvalidRequest { message } => write!(f, "Invalid request: {}", message),
         }
     }

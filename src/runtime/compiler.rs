@@ -1,6 +1,5 @@
 use std::{
     any::Any,
-    cell::Cell,
     collections::HashMap,
     fmt,
     marker::PhantomData,
@@ -17,10 +16,10 @@ use serde_json::Value;
 
 use super::{
     payload::Payload,
-    protocol::{RevisionId, RuntimeError, RuntimeEvent, RuntimeResult},
+    protocol::{RevisionId, RuntimeError, RuntimeEvent, RuntimePath, RuntimeResult},
 };
 use crate::{
-    scheme::{self, IR, LayerName, PassId, Pipeline, QueryHandle, layers::SourceText},
+    scheme::{self, IR, Pipeline, QueryHandle, layers::SourceText},
     utils::Span,
 };
 
@@ -28,8 +27,8 @@ type SourceTxn = scheme::Transaction<SourceText>;
 type QueryFn = Arc<dyn Fn(Payload) -> RuntimeResult<Payload> + Send + Sync>;
 type SubmitTopFn = Arc<dyn Fn(RevisionId, SourceTxn) -> RuntimeResult<()> + Send + Sync>;
 type ShutdownHook = Box<dyn FnOnce() + Send>;
-type SharedQueries = Arc<Mutex<HashMap<LayerName, QueryFn>>>;
-type SharedLayerNames = Arc<Mutex<Vec<LayerName>>>;
+type SharedQueries = Arc<Mutex<HashMap<RuntimePath, QueryFn>>>;
+type SharedLayerPaths = Arc<Mutex<Vec<RuntimePath>>>;
 type SharedShutdownHooks = Arc<Mutex<Vec<ShutdownHook>>>;
 type SharedEventSender = Arc<OnceLock<channel::Sender<RuntimeEvent>>>;
 
@@ -60,86 +59,62 @@ impl<U: IR> LayerObserver<U> {
         self.try_recv_update().map(|(_, txn)| txn)
     }
 
-    pub fn query_handle(&self) -> Option<&QueryHandle<U>> {
-        self.query.get()
-    }
-}
-
-#[derive(Clone)]
-struct IdAllocator {
-    seed: u64,
-    next: Arc<AtomicU64>,
-}
-
-impl IdAllocator {
-    fn new() -> Self {
-        Self {
-            seed: 0x243f_6a88_85a3_08d3,
-            next: Arc::new(AtomicU64::new(1)),
+    pub fn query(&self, index: U::Ix) -> RuntimeResult<Result<U::Value, U::Error>> {
+        match self.query.get() {
+            None => Err(runtime_invalid("query handle not set".to_string())),
+            Some(handle) => match handle.query(index) {
+                None => Err(runtime_invalid("query failed".to_string())),
+                Some(result) => Ok(result),
+            },
         }
-    }
-
-    fn next_layer(&self) -> LayerName {
-        LayerName::new(mix64(self.seed ^ 0x4c41_5945_525f_4944 ^ self.bump()))
-    }
-
-    fn next_pass(&self) -> PassId {
-        PassId::new(mix64(self.seed ^ 0x5041_5353_5f49_4400 ^ self.bump()))
-    }
-
-    fn bump(&self) -> u64 {
-        self.next.fetch_add(1, Ordering::Relaxed)
     }
 }
 
 #[derive(Clone)]
 struct BuilderCore {
     submit_top: SubmitTopFn,
-    top_layer: LayerName,
+    top_layer_path: RuntimePath,
     queries: SharedQueries,
-    layer_names: SharedLayerNames,
-    settled: Cell<(LayerName, PassId)>,
+    layer_paths: SharedLayerPaths,
+    settled: std::cell::RefCell<(RuntimePath, RuntimePath)>,
     shutdown_hooks: SharedShutdownHooks,
     event_sender: SharedEventSender,
-    ids: IdAllocator,
 }
 
 impl BuilderCore {
     fn new(
         submit_top: SubmitTopFn,
-        top_layer: LayerName,
-        top_milestone: PassId,
+        top_layer_path: RuntimePath,
+        top_pass_path: RuntimePath,
         event_sender: SharedEventSender,
-        ids: IdAllocator,
     ) -> Self {
         Self {
             submit_top,
-            top_layer: top_layer.clone(),
+            top_layer_path: top_layer_path.clone(),
             queries: Arc::new(Mutex::new(HashMap::new())),
-            layer_names: Arc::new(Mutex::new(vec![top_layer.clone()])),
-            settled: Cell::new((top_layer, top_milestone)),
+            layer_paths: Arc::new(Mutex::new(vec![top_layer_path.clone()])),
+            settled: std::cell::RefCell::new((top_layer_path, top_pass_path)),
             shutdown_hooks: Arc::new(Mutex::new(Vec::new())),
             event_sender,
-            ids,
         }
     }
 
-    fn insert_query(&self, layer: LayerName, query: QueryFn) {
+    fn insert_query(&self, layer_path: RuntimePath, query: QueryFn) {
         if let Ok(mut queries) = self.queries.lock() {
-            queries.insert(layer, query);
+            queries.insert(layer_path, query);
         }
     }
 
-    fn push_layer(&self, layer: LayerName) {
-        if let Ok(mut layers) = self.layer_names.lock() {
-            if !layers.contains(&layer) {
-                layers.push(layer);
+    fn push_layer(&self, layer_path: RuntimePath) {
+        if let Ok(mut layers) = self.layer_paths.lock() {
+            if !layers.contains(&layer_path) {
+                layers.push(layer_path);
             }
         }
     }
 
-    fn set_settled(&self, layer: LayerName, milestone: PassId) {
-        self.settled.set((layer, milestone));
+    fn set_settled(&self, layer_path: RuntimePath, pass_path: RuntimePath) {
+        *self.settled.borrow_mut() = (layer_path, pass_path);
     }
 
     fn push_shutdown_hook(&self, hook: ShutdownHook) {
@@ -148,16 +123,8 @@ impl BuilderCore {
         }
     }
 
-    fn settled_snapshot(&self) -> (LayerName, PassId) {
-        self.settled.get()
-    }
-
-    fn next_layer_id(&self) -> LayerName {
-        self.ids.next_layer()
-    }
-
-    fn next_pass_id(&self) -> PassId {
-        self.ids.next_pass()
+    fn settled_snapshot(&self) -> (RuntimePath, RuntimePath) {
+        self.settled.borrow().clone()
     }
 }
 
@@ -166,11 +133,10 @@ pub struct CompilerBuilder;
 impl CompilerBuilder {
     /// Entry point — the pipeline always ingests `SourceText` at the top.
     pub fn new() -> ExpectPass<SourceText> {
-        let ids = IdAllocator::new();
-        let layer_name = LayerName::root();
-        let milestone = PassId::ingress();
-        let submit_layer_name = layer_name.clone();
-        let submit_milestone = milestone.clone();
+        let layer_path = RuntimePath::root();
+        let pass_path = RuntimePath::root();
+        let submit_layer_path = layer_path.clone();
+        let submit_pass_path = pass_path.clone();
 
         let event_sender: SharedEventSender = Arc::new(OnceLock::new());
         let submit_event_sender = Arc::clone(&event_sender);
@@ -180,8 +146,9 @@ impl CompilerBuilder {
             send_layer_event::<SourceText>(
                 &submit_event_sender,
                 revision,
-                submit_layer_name.clone(),
-                submit_milestone.clone(),
+                submit_layer_path.clone(),
+                submit_pass_path.clone(),
+                false,
                 &txn,
             );
 
@@ -190,13 +157,13 @@ impl CompilerBuilder {
                 .map_err(|_| RuntimeError::ChannelClosed)
         });
 
-        let core = BuilderCore::new(submit_top, layer_name.clone(), milestone, event_sender, ids);
+        let core = BuilderCore::new(submit_top, layer_path.clone(), pass_path, event_sender);
 
         ExpectPass {
             core,
             input_rx: output_rx,
             upstream_seed: SourceText::default(),
-            layer_name,
+            layer_path,
             query_handle: None,
             listeners: Vec::new(),
             _marker: PhantomData,
@@ -208,7 +175,7 @@ pub struct ExpectPass<U: IR + 'static> {
     core: BuilderCore,
     input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
     upstream_seed: U,
-    layer_name: LayerName,
+    layer_path: RuntimePath,
     query_handle: Option<QueryHandle<U>>,
     listeners: ListenerSet<U>,
     _marker: PhantomData<U>,
@@ -245,14 +212,14 @@ where
     where
         P: Send + 'static,
     {
-        let pass_id = self.core.next_pass_id();
+        let pass_path = self.layer_path.child(0);
         let core = self.core;
         ExpectLayer {
             core,
             input_rx: self.input_rx,
             upstream_seed: self.upstream_seed,
-            upstream_layer_name: self.layer_name,
-            pass_id,
+            upstream_layer_path: self.layer_path,
+            pass_path,
             pass,
             upstream_listeners: self.listeners,
             _marker: PhantomData,
@@ -301,17 +268,17 @@ where
         }));
 
         let upstream_seed = self.upstream_seed;
-        let upstream_layer_name = self.layer_name;
+        let upstream_layer_path = self.layer_path;
         let core = self.core;
-        let pass_id1 = core.next_pass_id();
-        let pass_id2 = core.next_pass_id();
+        let pass_path1 = upstream_layer_path.child(0);
+        let pass_path2 = upstream_layer_path.child(1);
 
         let branch1 = ExpectLayer {
             core: core.clone(),
             input_rx: rx1,
             upstream_seed: upstream_seed.clone(),
-            upstream_layer_name: upstream_layer_name.clone(),
-            pass_id: pass_id1,
+            upstream_layer_path: upstream_layer_path.clone(),
+            pass_path: pass_path1,
             pass: pass1,
             upstream_listeners: Vec::new(),
             _marker: PhantomData,
@@ -321,8 +288,8 @@ where
             core,
             input_rx: rx2,
             upstream_seed,
-            upstream_layer_name,
-            pass_id: pass_id2,
+            upstream_layer_path,
+            pass_path: pass_path2,
             pass: pass2,
             upstream_listeners: Vec::new(),
             _marker: PhantomData,
@@ -336,8 +303,8 @@ pub struct ExpectLayer<U: IR + 'static, P> {
     core: BuilderCore,
     input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
     upstream_seed: U,
-    upstream_layer_name: LayerName,
-    pass_id: PassId,
+    upstream_layer_path: RuntimePath,
+    pass_path: RuntimePath,
     pass: P,
     upstream_listeners: ListenerSet<U>,
     _marker: PhantomData<(U, P)>,
@@ -360,14 +327,14 @@ where
         P: scheme::Pass<U, D> + Send + 'static,
         P::Error: Send + fmt::Debug + 'static,
     {
-        let downstream_layer_name = self.core.next_layer_id();
+        let downstream_layer_path = self.pass_path.clone();
         let (output_rx, downstream_query) = connect_stage::<U, D, P>(
             &self.core,
             self.input_rx,
             self.upstream_seed,
-            self.upstream_layer_name,
-            downstream_layer_name.clone(),
-            self.pass_id,
+            self.upstream_layer_path,
+            downstream_layer_path.clone(),
+            self.pass_path,
             self.pass,
             downstream,
             self.upstream_listeners,
@@ -377,7 +344,7 @@ where
             core: self.core,
             input_rx: output_rx,
             upstream_seed: D::default(),
-            layer_name: downstream_layer_name,
+            layer_path: downstream_layer_path,
             query_handle: Some(downstream_query),
             listeners: Vec::new(),
             _marker: PhantomData,
@@ -389,9 +356,9 @@ fn connect_stage<U, D, P>(
     core: &BuilderCore,
     input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
     upstream_seed: U,
-    upstream_layer_name: LayerName,
-    downstream_layer_name: LayerName,
-    pass_id: PassId,
+    upstream_layer_path: RuntimePath,
+    downstream_layer_path: RuntimePath,
+    pass_path: RuntimePath,
     pass: P,
     downstream: D,
     upstream_listeners: ListenerSet<U>,
@@ -426,13 +393,13 @@ where
         let _ = lock.set(upstream_query.clone());
     }
     core.insert_query(
-        upstream_layer_name,
+        upstream_layer_path,
         Arc::new(move |index| query_handle_any::<U>(&upstream_query, index)),
     );
 
     let downstream_query = pipeline.downstream.query_handle();
     core.insert_query(
-        downstream_layer_name.clone(),
+        downstream_layer_path.clone(),
         Arc::new({
             let dq = downstream_query.clone();
             move |index| query_handle_any::<D>(&dq, index)
@@ -449,8 +416,8 @@ where
     // switch per operation (and the intermediate fwd channel), which meaningfully
     // reduces round-trip latency for incremental edits.
     let event_sender = Arc::clone(&core.event_sender);
-    let coord_layer_name = downstream_layer_name.clone();
-    let coord_milestone = pass_id.clone();
+    let coord_layer_path = downstream_layer_path.clone();
+    let coord_pass_path = pass_path.clone();
     let (coord_stop_tx, coord_stop_rx) = channel::unbounded::<()>();
     let coord_handle = thread::spawn(move || {
         loop {
@@ -484,8 +451,9 @@ where
             send_layer_event::<D>(
                 &event_sender,
                 revision,
-                coord_layer_name.clone(),
-                coord_milestone.clone(),
+                coord_layer_path.clone(),
+                coord_pass_path.clone(),
+                false,
                 &downstream_txn,
             );
 
@@ -501,8 +469,8 @@ where
         let _ = coord_handle.join();
     }));
 
-    core.push_layer(downstream_layer_name.clone());
-    core.set_settled(downstream_layer_name, pass_id);
+    core.push_layer(downstream_layer_path.clone());
+    core.set_settled(downstream_layer_path, pass_path);
 
     (next_output_rx, downstream_query)
 }
@@ -564,15 +532,15 @@ impl ComposedCompiler {
             }));
         }
 
-        let (settled_layer, settled_milestone) = pass.core.settled_snapshot();
+        let (settled_layer_path, settled_pass_path) = pass.core.settled_snapshot();
 
         ComposedCompiler {
             submit_top: pass.core.submit_top,
             queries: pass.core.queries,
-            layer_names: pass.core.layer_names,
-            settled_layer,
-            settled_milestone,
-            source_layer: pass.core.top_layer,
+            layer_paths: pass.core.layer_paths,
+            settled_layer_path,
+            settled_pass_path,
+            source_layer_path: pass.core.top_layer_path,
             next_revision: AtomicU64::new(1),
             source_len: 0,
             shutdown_hooks: pass.core.shutdown_hooks,
@@ -584,10 +552,10 @@ impl ComposedCompiler {
 pub struct ComposedCompiler {
     submit_top: SubmitTopFn,
     queries: SharedQueries,
-    layer_names: SharedLayerNames,
-    settled_layer: LayerName,
-    settled_milestone: PassId,
-    source_layer: LayerName,
+    layer_paths: SharedLayerPaths,
+    settled_layer_path: RuntimePath,
+    settled_pass_path: RuntimePath,
+    source_layer_path: RuntimePath,
     next_revision: AtomicU64,
     source_len: usize,
     shutdown_hooks: SharedShutdownHooks,
@@ -609,14 +577,14 @@ impl ComposedCompiler {
     }
 
     /// Query a layer and return the result as a type-erased [`Payload`].
-    pub fn query(&self, layer: impl Into<LayerName>, index: Payload) -> RuntimeResult<Payload> {
-        let layer = layer.into();
+    pub fn query(&self, layer_path: impl Into<RuntimePath>, index: Payload) -> RuntimeResult<Payload> {
+        let layer_path = layer_path.into();
         let query = self
             .queries
             .lock()
             .ok()
-            .and_then(|queries| queries.get(&layer).cloned())
-            .ok_or_else(|| runtime_invalid(format!("unknown layer: {layer}")))?;
+            .and_then(|queries| queries.get(&layer_path).cloned())
+            .ok_or_else(|| runtime_invalid(format!("unknown layer path: {layer_path}")))?;
 
         query(index)
     }
@@ -625,32 +593,32 @@ impl ComposedCompiler {
     ///
     /// Convenience wrapper around [`query`][Self::query] for callers that need
     /// a [`serde_json::Value`] rather than a typed [`Payload`].
-    pub fn query_json(&self, layer: impl Into<LayerName>, index: Value) -> RuntimeResult<Value> {
-        self.query(layer, Payload::new(index)).map(|p| p.to_json())
+    pub fn query_json(&self, layer_path: impl Into<RuntimePath>, index: Value) -> RuntimeResult<Value> {
+        self.query(layer_path, Payload::new(index)).map(|p| p.to_json())
     }
 
     pub fn source_text(&self) -> Option<String> {
         let span = Span::new(0, self.source_len);
         let index = serde_json::to_value(span).ok()?;
         let payload = self
-            .query(self.source_layer.clone(), Payload::new(index))
+            .query(self.source_layer_path.clone(), Payload::new(index))
             .ok()?;
         payload.downcast_ref::<String>().cloned()
     }
 
-    pub fn layer_names(&self) -> Vec<LayerName> {
-        self.layer_names
+    pub fn layer_paths(&self) -> Vec<RuntimePath> {
+        self.layer_paths
             .lock()
             .map(|layers| layers.clone())
             .unwrap_or_default()
     }
 
-    pub fn settled_layer(&self) -> Option<&LayerName> {
-        Some(&self.settled_layer)
+    pub fn settled_layer_path(&self) -> Option<&RuntimePath> {
+        Some(&self.settled_layer_path)
     }
 
-    pub fn settled_milestone(&self) -> Option<&PassId> {
-        Some(&self.settled_milestone)
+    pub fn settled_pass_path(&self) -> Option<&RuntimePath> {
+        Some(&self.settled_pass_path)
     }
 
     pub fn shutdown(&mut self) {
@@ -669,14 +637,6 @@ impl Drop for ComposedCompiler {
     fn drop(&mut self) {
         self.shutdown();
     }
-}
-
-fn mix64(mut x: u64) -> u64 {
-    x ^= x >> 30;
-    x = x.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    x ^= x >> 27;
-    x = x.wrapping_mul(0x94d0_49bb_1331_11eb);
-    x ^ (x >> 31)
 }
 
 fn query_handle_any<R>(handle: &QueryHandle<R>, index: Payload) -> RuntimeResult<Payload>
@@ -718,8 +678,9 @@ fn clone_event_sender(shared: &SharedEventSender) -> Option<channel::Sender<Runt
 fn send_layer_event<R>(
     sender: &SharedEventSender,
     revision: RevisionId,
-    layer: LayerName,
-    milestone: PassId,
+    layer_path: RuntimePath,
+    pass_path: RuntimePath,
+    is_error: bool,
     txn: &scheme::Transaction<R>,
 ) where
     R: IR + 'static,
@@ -737,8 +698,9 @@ fn send_layer_event<R>(
     let payload = Payload::new(commands);
     let _ = sender.send(RuntimeEvent {
         revision,
-        layer,
-        milestone,
+        layer_path,
+        pass_path,
+        is_error,
         payload,
     });
 }
@@ -747,7 +709,7 @@ fn send_runtime_error(sender: &SharedEventSender, revision: RevisionId, err: &Ru
     send_runtime_error_text(
         &clone_event_sender(sender),
         revision,
-        runtime_error_message(err),
+        format!("runtime error: {err}"),
     );
 }
 
@@ -763,8 +725,9 @@ fn send_runtime_error_text(
     let msg = message.into();
     let _ = sender.send(RuntimeEvent {
         revision,
-        layer: LayerName::runtime(),
-        milestone: PassId::runtime_error(),
+        layer_path: RuntimePath::root(),
+        pass_path: RuntimePath::root(),
+        is_error: true,
         payload: Payload::new(serde_json::json!({ "message": msg })),
     });
 }
@@ -825,14 +788,6 @@ fn clamp_span(span: Span, len: usize) -> Span {
 fn runtime_invalid(message: impl Into<String>) -> RuntimeError {
     RuntimeError::InvalidRequest {
         message: message.into(),
-    }
-}
-
-fn runtime_error_message(err: &RuntimeError) -> String {
-    match err {
-        RuntimeError::QueueFull => "runtime queue full".to_string(),
-        RuntimeError::ChannelClosed => "runtime channel closed".to_string(),
-        RuntimeError::InvalidRequest { message } => message.clone(),
     }
 }
 

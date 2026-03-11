@@ -15,13 +15,13 @@ To build Grammax from source, you will first need to install Rust and Cargo. Ple
 
 After you install Rust and Cargo, you can install Grammax with the following command:
 ```bash
-cargo install grammax
+cargo install grammax --all-features
 ```
 This will automatically download Grammax from [crates.io](https://crates.io/) and install the executable file into Cargo's global binary directory (by default, `~/.cargo/bin` on Linux or `%USERPROFILE%\.cargo\bin` on Windows). Make sure there is the directory in the environment variable `$PATH`.
 
 Then run the following command in your terminal to verify the installation. It prints the version of Grammax if installation succeeds.
 ```bash
-grammax -v
+gmx --version
 ```
 
 You can update Grammax by repeating the installation command `cargo install grammax`. The command will check if there is a newer version and reinstall Grammax if the newer one is found.

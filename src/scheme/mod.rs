@@ -117,7 +117,7 @@ impl<Repr: IR> QueryHandle<Repr> {
     }
 }
 
-pub struct IRInstance<Repr: IR + Send + 'static>
+pub(crate) struct IRInstance<Repr: IR + Send + 'static>
 where
     Repr::Ix: Send + Sync,
     Repr::Value: Send + Sync,
@@ -165,23 +165,10 @@ where
             query_sender,
         }
     }
-
-    pub fn send(&self, txn: Transaction<Repr>) {
-        let _ = self.sender.send(txn);
-    }
-
-    pub fn clone_sender(&self) -> channel::Sender<Transaction<Repr>> {
-        self.sender.clone()
-    }
-
     pub fn query_handle(&self) -> QueryHandle<Repr> {
         QueryHandle {
             sender: self.query_sender.clone(),
         }
-    }
-
-    pub fn query(&self, index: Repr::Ix) -> Option<Result<Repr::Value, Repr::Error>> {
-        self.query_handle().query(index)
     }
 
     pub fn shutdown(self) {
@@ -208,7 +195,7 @@ where
     handle: JoinHandle<()>,
     sender: channel::Sender<Transaction<U>>,
     upstream_query_sender: channel::Sender<QueryMsg<U>>,
-    pub downstream: IRInstance<D>,
+    pub(crate) downstream: IRInstance<D>,
     _pass: PhantomData<P>,
 }
 

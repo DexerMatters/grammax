@@ -8,18 +8,21 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
-    scheme::layers::cst::Command,
-    scheme::layers::cst::NodePath,
-    scheme::passes::{
-        delta,
-        metrics::EditMetrics,
-        strategy::{
-            CandidateScore, EditKind, StrategyCandidate, StrategyContext, count_errors,
-            pick_candidate,
+    scheme::{
+        layers::{ParseTreeIR, cst::NodePath},
+        passes::{
+            delta,
+            metrics::EditMetrics,
+            strategy::{
+                CandidateScore, EditKind, StrategyCandidate, StrategyContext, count_errors,
+                pick_candidate,
+            },
         },
     },
     utils::Span,
 };
+
+type Command = crate::scheme::Command<ParseTreeIR>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EditResult {

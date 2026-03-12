@@ -15,6 +15,8 @@ use crate::parsec::recovery::{
 use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
 use crate::parsec::view::View;
 use crate::runtime;
+use crate::scheme::Command;
+use crate::scheme::layers::ParseTreeIR;
 use crate::utils::{LruCache, Span};
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
@@ -52,7 +54,7 @@ pub struct Result<'a> {
     source: &'a str,
     pub root: RedNode,
     pub messages: ParserMessages,
-    pub semantic_commands: Vec<runtime::Command>,
+    pub semantic_commands: Vec<Command<ParseTreeIR>>,
 }
 
 impl<'a> Result<'a> {

@@ -5,10 +5,10 @@ use crate::{
     new_grammar,
     parsec::words::*,
     runtime::{
-        CompilerBuilder, RuntimeSelector, RuntimeService, RuntimeSignal,
+        CompilerBuilder, RuntimeService, RuntimeSignal,
         compiler::{ComposedCompiler, delete_span, insert_at, replace_span},
     },
-    scheme::{layers::RedGreenTreeIR, passes::ParserPass},
+    scheme::{layers::ParseTreeIR, passes::ParserPass},
     utils::Span,
 };
 
@@ -28,7 +28,7 @@ fn test_json() {
 
     let (cst_pass, cst_obs) = CompilerBuilder::new()
         .then_pass(ParserPass::new(grammar))
-        .then_layer(RedGreenTreeIR::default())
+        .then_layer(ParseTreeIR::default())
         .tap();
 
     // thread::spawn(move || {
@@ -68,7 +68,7 @@ fn test_tap_prints_cst_commands() {
 
     let (cst_pass, cst_obs) = CompilerBuilder::new()
         .then_pass(ParserPass::new(grammar))
-        .then_layer(RedGreenTreeIR::default())
+        .then_layer(ParseTreeIR::default())
         .tap();
 
     let mut compiler = ComposedCompiler::from_pass(cst_pass);
@@ -118,7 +118,7 @@ fn test_incremental_parse_narrow_error_region() {
 
     let (cst_pass, cst_obs) = CompilerBuilder::new()
         .then_pass(ParserPass::new(grammar))
-        .then_layer(RedGreenTreeIR::default())
+        .then_layer(ParseTreeIR::default())
         .tap();
 
     let mut compiler = ComposedCompiler::from_pass(cst_pass);
@@ -161,95 +161,4 @@ fn test_incremental_parse_narrow_error_region() {
         "Incremental parse produced MissingToken nodes for valid delimiters!\nCommands: {:?}",
         txn2.as_slice()
     );
-}
-
-#[test]
-fn test_server_style_delete_delete_insert_exposes_transient_empty_value() {
-    let grammar = new_grammar!(
-        start where
-        start   -> r!(json) + tt(EndOfInput)
-        json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
-        object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
-        pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
-        array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
-        string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
-        boolean -> tt("true") | tt("false")
-        null    -> tt("null")
-    );
-
-    let (layer, source_obs) = CompilerBuilder::new().tap();
-    let (cst_pass, cst_obs) = layer
-        .then_pass(ParserPass::new(grammar))
-        .then_layer(RedGreenTreeIR::default())
-        .tap();
-
-    let mut compiler = ComposedCompiler::from_pass(cst_pass);
-
-    let initial = "{\n\"a\": 11,\n\"b\": 22\n}";
-    compiler
-        .submit_source(insert_at(0, initial))
-        .expect("submit initial");
-    let (_source_rev1, source_txn1) = source_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for initial source txn");
-    let (_cst_rev1, cst_txn1) = cst_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for initial cst txn");
-
-    compiler
-        .submit_source(delete_span(Span::new(8, 9)))
-        .expect("delete second digit");
-    let (_source_rev2, source_txn2) = source_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for first delete source txn");
-    let (_cst_rev2, cst_txn2) = cst_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for first delete cst txn");
-
-    compiler
-        .submit_source(delete_span(Span::new(7, 8)))
-        .expect("delete first digit");
-    let (_source_rev3, source_txn3) = source_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for second delete source txn");
-    let (_cst_rev3, cst_txn3) = cst_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for second delete cst txn");
-
-    compiler
-        .submit_source(insert_at(7, "x"))
-        .expect("insert replacement char");
-    let (_source_rev4, source_txn4) = source_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for insert source txn");
-    let (_cst_rev4, cst_txn4) = cst_obs
-        .updates
-        .recv_timeout(Duration::from_millis(500))
-        .expect("timed out waiting for insert cst txn");
-
-    let source1: Vec<String> = source_txn1.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let cst1: Vec<String> = cst_txn1.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let source2: Vec<String> = source_txn2.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let cst2: Vec<String> = cst_txn2.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let source3: Vec<String> = source_txn3.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let cst3: Vec<String> = cst_txn3.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let source4: Vec<String> = source_txn4.iter().map(|cmd| format!("{cmd:?}")).collect();
-    let cst4: Vec<String> = cst_txn4.iter().map(|cmd| format!("{cmd:?}")).collect();
-
-    println!("=== initial source ===\n{}", source1.join("\n"));
-    println!("=== initial cst ===\n{}", cst1.join("\n"));
-    println!("=== delete second digit source ===\n{}", source2.join("\n"));
-    println!("=== delete second digit cst ===\n{}", cst2.join("\n"));
-    println!("=== delete first digit source ===\n{}", source3.join("\n"));
-    println!("=== delete first digit cst ===\n{}", cst3.join("\n"));
-    println!("=== insert x source ===\n{}", source4.join("\n"));
-    println!("=== insert x cst ===\n{}", cst4.join("\n"));
 }

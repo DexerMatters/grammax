@@ -1,7 +1,7 @@
 //! Pass 2→3: the incremental semantic lowerer.
 //!
-//! [`IncrementalLowerer<T, M>`] implements [`scheme::Pass<RedGreenTreeIR, AstArena<T>>`]:
-//! given a [`RedGreenTreeIR`] transaction (the parser commands), it produces
+//! [`IncrementalLowerer<T, M>`] implements [`scheme::Pass<ParseTreeIR, AstArena<T>>`]:
+//! given a [`ParseTreeIR`] transaction (the parser commands), it produces
 //! an [`AstDelta<T>`] transaction that drives the [`AstArena<T>`] downstream.
 //!
 //! User code supplies an [`AstMapper<T>`] (typically [`RuleMap<T>`]) that maps
@@ -13,18 +13,18 @@ use std::{any::type_name, fmt, marker::PhantomData};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
+use crate::scheme::layers::ParseTreeIR;
 use crate::scheme::layers::ast::ErasedAstNode;
 use crate::{
     grammar::Grammar,
     parsec::tree::{GreenId, Tag, TreeAllocRefExt},
     scheme::{
         self,
-        layers::{
-            ASTCell, AstArena, AstDelta, Command, NodePath, ParseNodeValue, ParseTreeQuery,
-            RedGreenTreeIR,
-        },
+        layers::{ASTCell, AstArena, AstDelta, NodePath, ParseNodeValue, ParseTreeQuery},
     },
 };
+
+type Command = crate::scheme::Command<ParseTreeIR>;
 
 // ============================================================================
 // MapOutput — what the user's mapper returns for each green node
@@ -380,7 +380,7 @@ impl<T> AstMapper<T> for RuleMap<T> {
 }
 
 // ============================================================================
-// IncrementalLowerer — the Pass<RedGreenTreeIR, AstArena<T>>
+// IncrementalLowerer — the Pass<ParseTreeIR, AstArena<T>>
 // ============================================================================
 
 /// The semantic loweringPass (Layer 2 → Layer 3).
@@ -433,7 +433,7 @@ where
 
     fn apply_from_ir2(
         &mut self,
-        upstream: &RedGreenTreeIR,
+        upstream: &ParseTreeIR,
         commands: &[Command],
         source_text: &str,
     ) -> Vec<scheme::Command<AstArena<T>>> {
@@ -471,8 +471,8 @@ where
 
     pub fn transform_with_source(
         &mut self,
-        upstream: &RedGreenTreeIR,
-        txn: scheme::Transaction<RedGreenTreeIR>,
+        upstream: &ParseTreeIR,
+        txn: scheme::Transaction<ParseTreeIR>,
         source_text: &str,
     ) -> scheme::Transaction<AstArena<T>> {
         std::sync::Arc::new(self.apply_from_ir2(upstream, &txn, source_text))
@@ -480,7 +480,7 @@ where
 
     fn collect_dirty_nodes(
         &self,
-        upstream: &RedGreenTreeIR,
+        upstream: &ParseTreeIR,
         commands: &[Command],
     ) -> FxHashSet<GreenId> {
         let mut dirty = FxHashSet::default();
@@ -534,7 +534,7 @@ where
 
     fn sync_from_upstream(
         &mut self,
-        upstream: &RedGreenTreeIR,
+        upstream: &ParseTreeIR,
         ops: &mut Vec<scheme::Command<AstArena<T>>>,
     ) {
         let old = std::mem::take(&mut self.greens);
@@ -564,7 +564,7 @@ where
         &self,
         green: GreenId,
         offset: usize,
-        upstream: &RedGreenTreeIR,
+        upstream: &ParseTreeIR,
         old: &FxHashMap<GreenId, GreenNode<T>>,
         out: &mut FxHashMap<GreenId, GreenNode<T>>,
     ) {
@@ -615,7 +615,7 @@ where
     fn copy_shadow_subtree(
         &self,
         green: GreenId,
-        upstream: &RedGreenTreeIR,
+        upstream: &ParseTreeIR,
         old: &FxHashMap<GreenId, GreenNode<T>>,
         out: &mut FxHashMap<GreenId, GreenNode<T>>,
     ) {
@@ -737,7 +737,7 @@ where
     }
 }
 
-impl<T, M> scheme::Pass<RedGreenTreeIR, AstArena<T>> for IncrementalLowerer<T, M>
+impl<T, M> scheme::Pass<ParseTreeIR, AstArena<T>> for IncrementalLowerer<T, M>
 where
     T: fmt::Debug + Clone + PartialEq + Send + 'static,
     M: AstMapper<T> + Send + 'static,
@@ -746,8 +746,8 @@ where
 
     fn transform(
         &mut self,
-        upstream: &RedGreenTreeIR,
-        txn: scheme::Transaction<RedGreenTreeIR>,
+        upstream: &ParseTreeIR,
+        txn: scheme::Transaction<ParseTreeIR>,
     ) -> Result<scheme::Transaction<AstArena<T>>, Self::Error> {
         Ok(self.transform_with_source(upstream, txn, ""))
     }

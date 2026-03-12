@@ -12,10 +12,7 @@ pub mod webui;
 mod tests;
 
 pub trait Interface {
-    fn new(
-        sender: channel::Sender<runtime::RuntimeEnvelope>,
-        grammar: &'static grammar::Grammar,
-    ) -> Self
+    fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self
     where
         Self: Sized;
     fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope>;
@@ -42,11 +39,10 @@ pub struct BasicInterface {
 }
 
 impl Interface for BasicInterface {
-    fn new(
-        sender: channel::Sender<runtime::RuntimeEnvelope>,
-        _grammar: &'static grammar::Grammar,
-    ) -> Self {
-        Self { sender }
+    fn new(ged: runtime::GlobalEventDispatcher, _grammar: &'static grammar::Grammar) -> Self {
+        Self {
+            sender: ged.envelope_tx(),
+        }
     }
 
     fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
@@ -55,47 +51,46 @@ impl Interface for BasicInterface {
 }
 
 impl BasicInterface {
-    pub fn update(&self, start: usize, end: usize, text: &str) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::ApplyTextEdit {
+    pub fn update(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> runtime::RuntimeResult<runtime::RevisionId> {
+        match self.request(runtime::RuntimeRequest::ApplyTextEdit {
             span: utils::Span::new(start, end),
             text: text.to_string(),
-        })
+        })? {
+            runtime::RuntimeSignal::Accepted { revision } => Ok(revision),
+            other => Err(runtime::RuntimeError::InvalidRequest {
+                message: format!("unexpected signal for apply request: {other:?}"),
+            }),
+        }
     }
 
-    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult {
+    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
         self.update(offset, offset, text)
     }
 
-    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult {
+    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
         self.update(start, end, "")
     }
 
     pub fn query_layer<I>(
         &self,
         layer_path: runtime::RuntimePath,
+        revision: Option<runtime::RevisionId>,
         index: I,
     ) -> runtime::RuntimeResult<runtime::Payload>
     where
         I: serde::Serialize + Send + Sync + 'static,
     {
-        let expected_layer = layer_path;
-        let signal = self.request(runtime::RuntimeRequest::QueryLayer {
-            layer_path: expected_layer.clone(),
+        match self.request(runtime::RuntimeRequest::QueryLayer {
+            layer_path,
+            revision,
             index: runtime::Payload::new(index),
-        })?;
-
-        match signal {
-            runtime::RuntimeSignal::QueryResult {
-                layer_path: returned_layer,
-                value,
-            } if returned_layer == expected_layer => Ok(value),
-            runtime::RuntimeSignal::QueryResult { layer_path, .. } => {
-                Err(runtime::RuntimeError::InvalidRequest {
-                    message: format!(
-                        "query layer mismatch: expected {expected_layer}, got {layer_path}"
-                    ),
-                })
-            }
+        })? {
+            runtime::RuntimeSignal::QueryResult { value, .. } => Ok(value),
             other => Err(runtime::RuntimeError::InvalidRequest {
                 message: format!("unexpected signal for query request: {other:?}"),
             }),
@@ -103,13 +98,12 @@ impl BasicInterface {
     }
 
     pub fn query_source_text(&self, span: utils::Span) -> runtime::RuntimeResult<String> {
-        let payload = self.query_layer(runtime::RuntimePath::root(), span)?;
-
-        payload.downcast_ref::<String>().cloned().ok_or_else(|| {
-            runtime::RuntimeError::InvalidRequest {
+        self.query_layer(runtime::RuntimePath::root(), None, span)?
+            .downcast_ref::<String>()
+            .cloned()
+            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
                 message: "source text query result was not a String".to_string(),
-            }
-        })
+            })
     }
 
     pub fn shutdown(&self) -> runtime::RuntimeResult {

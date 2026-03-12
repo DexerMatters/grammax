@@ -6,7 +6,7 @@ use grammax::{
     grammar::{Grammar, display::format_grammar_error},
     interface::cli::CliInterface,
     runtime::{CompilerBuilder, ComposedCompiler, ExpectPass, ParserPass, RuntimeService},
-    scheme::layers::{ParseTreeIR, RedGreenTreeIR},
+    scheme::layers::ParseTreeIR,
 };
 
 #[cfg(feature = "webui")]
@@ -112,7 +112,7 @@ pub fn main() {
             };
             let tap = CompilerBuilder::new()
                 .then_pass(ParserPass::new(grammar))
-                .then_layer(RedGreenTreeIR::default())
+                .then_layer(ParseTreeIR::default())
                 .tap();
             #[cfg(feature = "webui")]
             if interactive_mode.webui {

@@ -577,7 +577,11 @@ impl ComposedCompiler {
     }
 
     /// Query a layer and return the result as a type-erased [`Payload`].
-    pub fn query(&self, layer_path: impl Into<RuntimePath>, index: Payload) -> RuntimeResult<Payload> {
+    pub fn query(
+        &self,
+        layer_path: impl Into<RuntimePath>,
+        index: Payload,
+    ) -> RuntimeResult<Payload> {
         let layer_path = layer_path.into();
         let query = self
             .queries
@@ -593,8 +597,13 @@ impl ComposedCompiler {
     ///
     /// Convenience wrapper around [`query`][Self::query] for callers that need
     /// a [`serde_json::Value`] rather than a typed [`Payload`].
-    pub fn query_json(&self, layer_path: impl Into<RuntimePath>, index: Value) -> RuntimeResult<Value> {
-        self.query(layer_path, Payload::new(index)).map(|p| p.to_json())
+    pub fn query_json(
+        &self,
+        layer_path: impl Into<RuntimePath>,
+        index: Value,
+    ) -> RuntimeResult<Value> {
+        self.query(layer_path, Payload::new(index))
+            .map(|p| p.to_json())
     }
 
     pub fn source_text(&self) -> Option<String> {

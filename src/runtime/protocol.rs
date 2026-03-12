@@ -48,15 +48,6 @@ pub struct RuntimeEvent {
     pub payload: Payload,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RuntimeSignalKind {
-    Accepted,
-    Event,
-    QueryResult,
-    Ack,
-}
-
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RuntimeSignal {
@@ -74,15 +65,6 @@ pub enum RuntimeSignal {
 }
 
 impl RuntimeSignal {
-    pub fn kind(&self) -> RuntimeSignalKind {
-        match self {
-            Self::Accepted { .. } => RuntimeSignalKind::Accepted,
-            Self::Event { .. } => RuntimeSignalKind::Event,
-            Self::QueryResult { .. } => RuntimeSignalKind::QueryResult,
-            Self::Ack => RuntimeSignalKind::Ack,
-        }
-    }
-
     pub fn revision(&self) -> Option<RevisionId> {
         match self {
             Self::Accepted { revision } => Some(*revision),
@@ -99,35 +81,6 @@ impl RuntimeSignal {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeSelector {
-    pub revision: Option<RevisionId>,
-    pub kind: Option<RuntimeSignalKind>,
-}
-
-impl RuntimeSelector {
-    pub fn any() -> Self {
-        Self::default()
-    }
-
-    pub fn events() -> Self {
-        Self::default().with_kind(RuntimeSignalKind::Event)
-    }
-
-    pub fn revision(revision: RevisionId) -> Self {
-        Self {
-            revision: Some(revision),
-            ..Self::default()
-        }
-    }
-
-    pub fn with_kind(mut self, kind: RuntimeSignalKind) -> Self {
-        self.kind = Some(kind);
-        self
-    }
-}
-
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum RuntimeRequest {
@@ -137,6 +90,7 @@ pub enum RuntimeRequest {
     },
     QueryLayer {
         layer_path: RuntimePath,
+        revision: Option<RevisionId>,
         index: Payload,
     },
     Shutdown,

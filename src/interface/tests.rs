@@ -4,7 +4,7 @@ use crate::{
     new_grammar,
     parsec::{tree::GreenId, words::*},
     runtime::{CompilerBuilder, ComposedCompiler, ParserPass},
-    scheme::layers::{NodePath, ParseTreeQuery, RedGreenTreeIR},
+    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery},
 };
 
 #[cfg(feature = "webui")]
@@ -40,7 +40,7 @@ fn test_tap_prints_cst_commands() {
     });
     let (pass, observer) = layer
         .then_pass(ParserPass::new(grammar))
-        .then_layer(RedGreenTreeIR::default())
+        .then_layer(ParseTreeIR::default())
         .tap();
 
     thread::spawn(move || {
@@ -73,7 +73,7 @@ fn test_arith_commands() {
 
     let (pass, observer) = CompilerBuilder::new()
         .then_pass(ParserPass::new(grammar))
-        .then_layer(RedGreenTreeIR::default())
+        .then_layer(ParseTreeIR::default())
         .tap();
 
     thread::spawn(move || {
@@ -94,11 +94,9 @@ fn test_arith_commands() {
         }
     });
 
-    let runtime = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
+    let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
         ComposedCompiler::from_pass_with_events(pass, evt_tx)
     });
 
-    runtime
-        .insert(0, "1 + 2 * 3")
-        .expect("Failed to insert text");
+    runtime.run().expect("Runtime failed unexpectedly");
 }

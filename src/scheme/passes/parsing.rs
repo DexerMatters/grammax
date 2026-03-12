@@ -4,7 +4,7 @@ use crate::{
     runtime::Payload,
     scheme::{
         self,
-        layers::{ParseNodeValue, RedGreenTreeIR, SourceText},
+        layers::{ParseNodeValue, ParseTreeIR, SourceText},
     },
     utils::Span,
 };
@@ -47,14 +47,14 @@ impl ParserPass {
     }
 }
 
-impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
+impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
     type Error = std::convert::Infallible;
 
     fn transform(
         &mut self,
         upstream: &SourceText,
         txn: scheme::Transaction<SourceText>,
-    ) -> Result<scheme::Transaction<RedGreenTreeIR>, Self::Error> {
+    ) -> Result<scheme::Transaction<ParseTreeIR>, Self::Error> {
         let new_text = &upstream.text;
 
         let edit = extract_edit(&txn);
@@ -129,8 +129,8 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
 /// dropped by `finalize_root`).  Tree-node IDs start at 1, so id=0 is safe.
 fn prepend_messages_command(
     messages: &crate::parsec::msg::ParserMessages,
-    rest: Vec<scheme::Command<RedGreenTreeIR>>,
-) -> Vec<scheme::Command<RedGreenTreeIR>> {
+    rest: Vec<scheme::Command<ParseTreeIR>>,
+) -> Vec<scheme::Command<ParseTreeIR>> {
     if messages.is_empty() {
         return rest;
     }

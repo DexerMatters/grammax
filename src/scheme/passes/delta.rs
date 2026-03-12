@@ -2,12 +2,13 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    runtime::Command,
     runtime::Payload,
-    scheme::layers::{NodePath, ParseNodeValue, ParseTreeQuery},
+    scheme::layers::{NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery},
 };
 
 const MAX_LCS_CELLS: usize = 4096;
+
+type Command = crate::scheme::Command<ParseTreeIR>;
 
 pub(crate) fn generate_commands_incremental(
     alloc: &TreeAllocRef,

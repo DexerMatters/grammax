@@ -525,14 +525,3 @@ enum PendingChildEdit {
     Delete { at: usize },
     Replace { at: usize, green: usize },
 }
-
-// ── Command type alias ────────────────────────────────────────────────────────
-
-/// A concrete parse-tree command — `scheme::Command` specialised for the parse-tree IR.
-pub type Command = scheme::Command<ParseTreeIR>;
-
-/// Alias for Layer 2 in the terraced model terminology.
-pub type RedGreenTreeIR = ParseTreeIR;
-
-/// Alias emphasizing that Layer 2 transactions are parser commands.
-pub type ParserCommand = Command;

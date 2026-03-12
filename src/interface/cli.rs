@@ -30,11 +30,11 @@ pub struct CliInterface {
 }
 
 impl Interface for CliInterface {
-    fn new(
-        sender: channel::Sender<runtime::RuntimeEnvelope>,
-        grammar: &'static grammar::Grammar,
-    ) -> Self {
-        Self { sender, grammar }
+    fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
+        Self {
+            sender: ged.envelope_tx(),
+            grammar,
+        }
     }
 
     fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
@@ -42,11 +42,10 @@ impl Interface for CliInterface {
     }
 }
 
-impl CliInterface {
-    fn settled_layer_path() -> runtime::RuntimePath {
-        runtime::RuntimePath(vec![0])
-    }
+// RedGreenTreeIR is always the first downstream layer (SourceText → pass[0] → CST).
+const TREE_LAYER: fn() -> runtime::RuntimePath = || runtime::RuntimePath(vec![0]);
 
+impl CliInterface {
     pub fn run(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
 
@@ -87,83 +86,58 @@ impl CliInterface {
         self.request(runtime::RuntimeRequest::Shutdown)
     }
 
-    fn update(&self, text: &str) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::ApplyTextEdit {
+    fn update(&self, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
+        match self.request(runtime::RuntimeRequest::ApplyTextEdit {
             span: utils::Span::new(0, usize::MAX),
             text: text.to_string(),
-        })
+        })? {
+            runtime::RuntimeSignal::Accepted { revision } => Ok(revision),
+            other => Err(runtime::RuntimeError::InvalidRequest {
+                message: format!("unexpected signal for apply request: {other:?}"),
+            }),
+        }
     }
 
-    fn query_tree_payload(
+    fn query_tree<T: 'static>(
         &self,
-        layer_path: runtime::RuntimePath,
+        revision: runtime::RevisionId,
         index: ParseTreeQuery,
-    ) -> runtime::RuntimeResult<runtime::Payload> {
-        let decode = |signal: runtime::RuntimeSignal| -> runtime::RuntimeResult<runtime::Payload> {
-            match signal {
-                runtime::RuntimeSignal::QueryResult { value, .. } => Ok(value),
-                other => Err(runtime::RuntimeError::InvalidRequest {
+    ) -> runtime::RuntimeResult<T>
+    where
+        T: Clone,
+    {
+        let signal = self.request(runtime::RuntimeRequest::QueryLayer {
+            layer_path: TREE_LAYER(),
+            revision: Some(revision),
+            index: runtime::Payload::new(index),
+        })?;
+        let value = match signal {
+            runtime::RuntimeSignal::QueryResult { value, .. } => value,
+            other => {
+                return Err(runtime::RuntimeError::InvalidRequest {
                     message: format!("unexpected signal: {other:?}"),
-                }),
+                });
             }
         };
-
-        self.request(runtime::RuntimeRequest::QueryLayer {
-            layer_path,
-            index: runtime::Payload::new(index),
-        })
-        .and_then(decode)
-    }
-
-    fn query_green_id(
-        &self,
-        layer_path: runtime::RuntimePath,
-        path: NodePath,
-    ) -> runtime::RuntimeResult<usize> {
-        let payload = self.query_tree_payload(layer_path, ParseTreeQuery::Path(path))?;
-        payload.downcast_ref::<usize>().copied().ok_or_else(|| {
-            runtime::RuntimeError::InvalidRequest {
-                message: "path query did not return green id".to_string(),
-            }
-        })
-    }
-
-    fn query_allocator(
-        &self,
-        layer_path: runtime::RuntimePath,
-    ) -> runtime::RuntimeResult<TreeAllocRef> {
-        let payload = self.query_tree_payload(layer_path, ParseTreeQuery::Allocator)?;
-        payload
-            .downcast_ref::<TreeAllocRef>()
+        value
+            .downcast_ref::<T>()
             .cloned()
             .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                message: "allocator query did not return tree allocator".to_string(),
+                message: format!("query result had unexpected payload type"),
             })
     }
 
-    fn query_messages(
+    fn display_result(
         &self,
-        layer_path: runtime::RuntimePath,
-    ) -> runtime::RuntimeResult<ParserMessages> {
-        let payload = self.query_tree_payload(layer_path, ParseTreeQuery::Message)?;
-        payload
-            .downcast_ref::<ParserMessages>()
-            .cloned()
-            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                message: "message query returned unexpected payload".to_string(),
-            })
-    }
+        source: &str,
+        revision: runtime::RevisionId,
+    ) -> runtime::RuntimeResult<(String, String)> {
+        let messages: ParserMessages = self.query_tree(revision, ParseTreeQuery::Message)?;
+        let alloc: TreeAllocRef = self.query_tree(revision, ParseTreeQuery::Allocator)?;
+        let root_id: usize = self.query_tree(revision, ParseTreeQuery::Path(NodePath::root()))?;
 
-    /// Build messages + AST text from the settled RedGreenTreeIR layer.
-    fn display_result(&self, source: &str) -> runtime::RuntimeResult<(String, String)> {
-        let layer_path = Self::settled_layer_path();
-        let messages = self.query_messages(layer_path.clone())?;
-        let alloc = self.query_allocator(layer_path.clone())?;
-        let root_green = self.query_green_id(layer_path, NodePath::root())?;
         let message_text = format_messages_with_source(self.grammar, &messages, source);
-        let root = RedNode::root(root_green);
-        let ast_text = format_ast(self.grammar, &root, &alloc, source);
-
+        let ast_text = format_ast(self.grammar, &RedNode::root(root_id), &alloc, source);
         Ok((message_text, ast_text))
     }
 }
@@ -283,7 +257,7 @@ fn key_event_handler(
                 move_to(stdout, 0, state.origin_row + num_lines)?;
                 write!(stdout, "\r\n")?;
                 writeln!(stdout, "----------------------------------\r")?;
-                match settled.and_then(|_| cli.display_result(&source)) {
+                match settled.and_then(|revision| cli.display_result(&source, revision)) {
                     Ok((messages, ast)) => {
                         if !messages.is_empty() {
                             cwrite!(stdout, "\r\n<bold>Messages:</bold>\r\n")?;
@@ -412,7 +386,7 @@ mod tests {
         new_grammar,
         parsec::words::{EndOfInput, NUMS},
         runtime::{CompilerBuilder, ComposedCompiler, ParserPass, RuntimeService},
-        scheme::layers::RedGreenTreeIR,
+        scheme::layers::ParseTreeIR,
     };
 
     use super::*;
@@ -430,7 +404,7 @@ mod tests {
 
         let (pass, _observer) = CompilerBuilder::new()
             .then_pass(ParserPass::new(grammar))
-            .then_layer(RedGreenTreeIR::default())
+            .then_layer(ParseTreeIR::default())
             .tap();
 
         let runtime = RuntimeService::<CliInterface>::new(grammar, move |evt_tx| {

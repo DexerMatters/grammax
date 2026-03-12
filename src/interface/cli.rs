@@ -4,7 +4,6 @@ use std::{
 };
 
 use color_print::{cwrite, cwriteln};
-use crossbeam::channel;
 use crossterm::{
     ExecutableCommand, cursor,
     event::{Event, KeyCode, KeyEvent, KeyModifiers, read},
@@ -19,26 +18,21 @@ use crate::{
         msg::ParserMessages,
         tree::{RedNode, TreeAllocRef},
     },
-    runtime,
-    scheme::layers::{NodePath, ParseTreeQuery},
-    utils,
+    runtime::{self, Payload},
+    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery},
 };
 
 pub struct CliInterface {
-    sender: channel::Sender<runtime::RuntimeEnvelope>,
+    ged: runtime::GlobalEventDispatcher,
     grammar: &'static grammar::Grammar,
 }
 
 impl Interface for CliInterface {
     fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
-        Self {
-            sender: ged.envelope_tx(),
-            grammar,
-        }
+        Self { ged, grammar }
     }
-
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
-        &self.sender
+    fn ged(&self) -> &runtime::GlobalEventDispatcher {
+        &self.ged
     }
 }
 
@@ -82,22 +76,6 @@ impl CliInterface {
         Ok(())
     }
 
-    pub fn shutdown(&self) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::Shutdown)
-    }
-
-    fn update(&self, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
-        match self.request(runtime::RuntimeRequest::ApplyTextEdit {
-            span: utils::Span::new(0, usize::MAX),
-            text: text.to_string(),
-        })? {
-            runtime::RuntimeSignal::Accepted { revision } => Ok(revision),
-            other => Err(runtime::RuntimeError::InvalidRequest {
-                message: format!("unexpected signal for apply request: {other:?}"),
-            }),
-        }
-    }
-
     fn query_tree<T: 'static>(
         &self,
         revision: runtime::RevisionId,
@@ -106,19 +84,8 @@ impl CliInterface {
     where
         T: Clone,
     {
-        let signal = self.request(runtime::RuntimeRequest::QueryLayer {
-            layer_path: TREE_LAYER(),
-            revision: Some(revision),
-            index: runtime::Payload::new(index),
-        })?;
-        let value = match signal {
-            runtime::RuntimeSignal::QueryResult { value, .. } => value,
-            other => {
-                return Err(runtime::RuntimeError::InvalidRequest {
-                    message: format!("unexpected signal: {other:?}"),
-                });
-            }
-        };
+        let value: Payload =
+            self.query_layer::<ParseTreeIR>(TREE_LAYER(), revision.into(), index)?;
         value
             .downcast_ref::<T>()
             .cloned()
@@ -251,7 +218,7 @@ fn key_event_handler(
             if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
                 // Submit to runtime and display results
                 let source = state.buffer.clone();
-                let settled = cli.update(&state.buffer);
+                let settled = cli.input(0, usize::MAX, &source);
 
                 let num_lines = state.buffer.matches('\n').count() as u16 + 1;
                 move_to(stdout, 0, state.origin_row + num_lines)?;

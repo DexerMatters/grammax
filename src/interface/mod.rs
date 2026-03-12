@@ -1,6 +1,11 @@
 use crossbeam::channel;
+use serde::Serialize;
 
-use crate::{grammar, runtime, utils};
+use crate::{
+    grammar, runtime,
+    scheme::{self},
+    utils,
+};
 
 pub mod cli;
 #[cfg(feature = "vsclsp")]
@@ -15,14 +20,14 @@ pub trait Interface {
     fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self
     where
         Self: Sized;
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope>;
+    fn ged(&self) -> &runtime::GlobalEventDispatcher;
     fn request(&self, request: runtime::RuntimeRequest) -> runtime::RuntimeResult {
         let (reply_tx, reply_rx) = channel::bounded(1);
         let envelope = runtime::RuntimeEnvelope {
             request,
             reply: reply_tx,
         };
-        match self.sender().try_send(envelope) {
+        match self.ged().envelope_tx().try_send(envelope) {
             Ok(()) => reply_rx
                 .recv()
                 .map_err(|_| runtime::RuntimeError::ChannelClosed)?,
@@ -32,26 +37,46 @@ pub trait Interface {
             }
         }
     }
-}
 
-pub struct BasicInterface {
-    sender: channel::Sender<runtime::RuntimeEnvelope>,
-}
+    fn shutdown(&self) -> runtime::RuntimeResult {
+        self.request(runtime::RuntimeRequest::Shutdown)
+    }
 
-impl Interface for BasicInterface {
-    fn new(ged: runtime::GlobalEventDispatcher, _grammar: &'static grammar::Grammar) -> Self {
-        Self {
-            sender: ged.envelope_tx(),
+    fn query_layer<I>(
+        &self,
+        layer_path: runtime::RuntimePath,
+        revision: Option<runtime::RevisionId>,
+        index: I::Ix,
+    ) -> runtime::RuntimeResult<I::Value>
+    where
+        I: scheme::IR,
+        <I as scheme::IR>::Value: Serialize + Clone + Send + Sync + 'static,
+        <I as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
+    {
+        match self.request(runtime::RuntimeRequest::QueryLayer {
+            layer_path,
+            revision,
+            index: runtime::Payload::new(index),
+        })? {
+            runtime::RuntimeSignal::QueryResult { value, .. } => value
+                .downcast_ref::<I::Value>()
+                .cloned()
+                .ok_or_else(|| runtime::RuntimeError::UnexpectedRequestType),
+            other => Err(runtime::RuntimeError::UndefinedBehavior {
+                message: format!("unexpected signal for query request: {other:?}"),
+            }),
         }
     }
 
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
-        &self.sender
+    fn query_source_text(
+        &self,
+        revision: Option<runtime::RevisionId>,
+        span: utils::Span,
+    ) -> runtime::RuntimeResult<String> {
+        self.query_layer::<scheme::SourceText>(runtime::RuntimePath::root(), revision, span)
     }
-}
 
-impl BasicInterface {
-    pub fn update(
+    fn input(
         &self,
         start: usize,
         end: usize,
@@ -62,51 +87,66 @@ impl BasicInterface {
             text: text.to_string(),
         })? {
             runtime::RuntimeSignal::Accepted { revision } => Ok(revision),
-            other => Err(runtime::RuntimeError::InvalidRequest {
+            other => Err(runtime::RuntimeError::UndefinedBehavior {
                 message: format!("unexpected signal for apply request: {other:?}"),
             }),
         }
     }
 
-    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.update(offset, offset, text)
-    }
-
-    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.update(start, end, "")
-    }
-
-    pub fn query_layer<I>(
+    fn input_till<I>(
         &self,
-        layer_path: runtime::RuntimePath,
-        revision: Option<runtime::RevisionId>,
-        index: I,
-    ) -> runtime::RuntimeResult<runtime::Payload>
+        start: usize,
+        end: usize,
+        text: &str,
+        runtime_path: runtime::RuntimePath,
+    ) -> runtime::RuntimeResult<scheme::Transaction<I>>
     where
-        I: serde::Serialize + Send + Sync + 'static,
+        I: scheme::IR + 'static,
+        <I as scheme::IR>::Value: Serialize + Clone + Send + Sync + 'static,
+        <I as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
     {
-        match self.request(runtime::RuntimeRequest::QueryLayer {
-            layer_path,
-            revision,
-            index: runtime::Payload::new(index),
+        let sub = self.ged().subscribe(Some(runtime_path));
+        match self.request(runtime::RuntimeRequest::ApplyTextEdit {
+            span: utils::Span::new(start, end),
+            text: text.to_string(),
         })? {
-            runtime::RuntimeSignal::QueryResult { value, .. } => Ok(value),
-            other => Err(runtime::RuntimeError::InvalidRequest {
-                message: format!("unexpected signal for query request: {other:?}"),
+            runtime::RuntimeSignal::Accepted { revision } => sub.rev_as(revision),
+            other => Err(runtime::RuntimeError::UndefinedBehavior {
+                message: format!("unexpected signal for apply request: {other:?}"),
             }),
         }
     }
+}
 
-    pub fn query_source_text(&self, span: utils::Span) -> runtime::RuntimeResult<String> {
-        self.query_layer(runtime::RuntimePath::root(), None, span)?
-            .downcast_ref::<String>()
-            .cloned()
-            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                message: "source text query result was not a String".to_string(),
-            })
+pub struct BasicInterface {
+    ged: runtime::GlobalEventDispatcher,
+}
+
+impl Interface for BasicInterface {
+    fn new(ged: runtime::GlobalEventDispatcher, _grammar: &'static grammar::Grammar) -> Self {
+        Self { ged }
     }
 
-    pub fn shutdown(&self) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::Shutdown)
+    fn ged(&self) -> &runtime::GlobalEventDispatcher {
+        &self.ged
+    }
+}
+
+impl BasicInterface {
+    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.input(offset, offset, text)
+    }
+
+    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.input(start, end, "")
+    }
+
+    pub fn replace(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.input(start, end, text)
     }
 }

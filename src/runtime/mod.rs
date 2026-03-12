@@ -12,7 +12,7 @@ pub mod service;
 pub use crate::scheme::passes::{ParserPass, Reparser, ReparserConfig};
 pub use crate::scheme::{LayerName, PassId};
 pub use compiler::{CompilerBuilder, ComposedCompiler, ExpectLayer, ExpectPass, LayerObserver};
-pub use dispatcher::{GlobalEventDispatcher, SubscriptionHandle};
+pub use dispatcher::GlobalEventDispatcher;
 pub use payload::{Payload, SerdeAny};
 pub use protocol::{
     RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimePath, RuntimeRequest,

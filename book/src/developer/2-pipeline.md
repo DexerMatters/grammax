@@ -19,7 +19,7 @@ You can normally instance your compiler with `CompilerBuilder` like this:
 ```rust
 CompilerBuilder::new()
     .then_pass(ParserPass::new(grammar))
-    .then_layer(RedGreenTreeIR::default())
+    .then_layer(ParseTreeIR::default())
     .then_pass(IncrementalLowerer::new(grammar, mapper))
     .then_layer(AstArena::default())
 ```
@@ -35,11 +35,11 @@ You can instance a tap like this:
 ```rust
 let (pass, observer) = CompilerBuilder::new()
     .then_pass(ParserPass::new(grammar))
-    .then_layer(RedGreenTreeIR::default())
+    .then_layer(ParseTreeIR::default())
     .tap();
 ```
 
-where `pass` is an instance of `ExpectPass` from which you can build the rest of the compiler, and `observer` is an instance of `LayerObserver` which you can use to observe the commands flowing from the layer and query its current state. For example, you can print out the commands from `RedGreenTreeIR` in real time like this:
+where `pass` is an instance of `ExpectPass` from which you can build the rest of the compiler, and `observer` is an instance of `LayerObserver` which you can use to observe the commands flowing from the layer and query its current state. For example, you can print out the commands from `ParseTreeIR` in real time like this:
 
 ```rust
 thread::spawn(move || {

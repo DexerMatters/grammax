@@ -103,6 +103,8 @@ pub enum RuntimeError {
     ChannelClosed,
     InvalidQuery,
     InvalidRequest { message: String },
+    UnexpectedRequestType,
+    UndefinedBehavior { message: String },
 }
 
 impl Display for RuntimeError {
@@ -112,6 +114,8 @@ impl Display for RuntimeError {
             Self::ChannelClosed => write!(f, "Runtime channel is closed"),
             Self::InvalidQuery => write!(f, "Invalid query"),
             Self::InvalidRequest { message } => write!(f, "Invalid request: {}", message),
+            Self::UnexpectedRequestType => write!(f, "Unexpected request type"),
+            Self::UndefinedBehavior { message } => write!(f, "Undefined behavior: {}", message),
         }
     }
 }

@@ -1,7 +1,6 @@
 use std::net::{SocketAddr, TcpListener};
 
 use color_print::cprintln;
-use crossbeam::channel;
 use rust_embed::Embed;
 
 use crate::{
@@ -45,7 +44,6 @@ const TREE_LAYER: fn() -> runtime::RuntimePath = || runtime::RuntimePath(vec![0]
 #[derive(Clone)]
 pub struct WebPreviewInterface {
     ged: runtime::GlobalEventDispatcher,
-    sender: channel::Sender<runtime::RuntimeEnvelope>,
     grammar: &'static grammar::Grammar,
     rule_infos: &'static Vec<RuleInfo>,
     terminal_infos: &'static Vec<TerminalInfo>,
@@ -55,10 +53,8 @@ pub struct WebPreviewInterface {
 
 impl Interface for WebPreviewInterface {
     fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
-        let sender = ged.envelope_tx();
         Self {
             ged,
-            sender,
             grammar,
             rule_infos: serialize_rule_infos(grammar),
             terminal_infos: serialize_terminal_infos(grammar),
@@ -67,8 +63,8 @@ impl Interface for WebPreviewInterface {
         }
     }
 
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
-        &self.sender
+    fn ged(&self) -> &runtime::GlobalEventDispatcher {
+        &self.ged
     }
 }
 
@@ -212,34 +208,21 @@ fn resolve_api_request(
         "api/action" => {
             let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
             match body {
-                WebAction::ApplyTextEdit { span, text } => {
-                    // Subscribe before sending the edit so no event is missed.
-                    let sub = this.ged.subscribe(Some(TREE_LAYER()));
-                    match this.request(runtime::RuntimeRequest::ApplyTextEdit { span, text }) {
-                        Ok(runtime::RuntimeSignal::Accepted { revision }) => {
-                            match sub.rev_as::<Vec<Command<ParseTreeIR>>>(revision) {
-                                Ok(cmds) => rouille::Response::json(&commands_to_web_json(&cmds)),
-                                Err(e) => rouille::Response::json(&e).with_status_code(500),
-                            }
-                        }
-                        Ok(other) => {
-                            rouille::Response::json(&runtime::RuntimeError::InvalidRequest {
-                                message: format!("unexpected apply response: {other:?}"),
-                            })
-                            .with_status_code(500)
-                        }
+                WebAction::ApplyTextEdit { span, text } => this
+                    .input_till(span.start, span.end, &text, TREE_LAYER())
+                    .map(|transaction| rouille::Response::json(&commands_to_web_json(&transaction)))
+                    .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
+                WebAction::GetSource => {
+                    match this.query_source_text(None, utils::Span::new(0, usize::MAX)) {
+                        Ok(source) => rouille::Response::json(&source),
                         Err(e) => rouille::Response::json(&e).with_status_code(500),
                     }
                 }
-                WebAction::GetSource => match query_source(this, None) {
-                    Ok(source) => rouille::Response::json(&source),
-                    Err(e) => rouille::Response::json(&e).with_status_code(500),
-                },
                 WebAction::GetTree => match build_tree_snapshot(this, None) {
                     Ok(commands) => rouille::Response::json(&commands),
                     Err(e) => rouille::Response::json(&e).with_status_code(500),
                 },
-                WebAction::Shutdown => match this.request(runtime::RuntimeRequest::Shutdown) {
+                WebAction::Shutdown => match this.shutdown() {
                     Ok(_) => rouille::Response::json(&serde_json::json!({})),
                     Err(e) => rouille::Response::json(&e).with_status_code(500),
                 },
@@ -277,44 +260,11 @@ fn serialize_terminal_infos(grammar: &'static grammar::Grammar) -> &'static Vec<
     Box::leak(Box::new(terminal_infos))
 }
 
-fn query_source(
-    this: &WebPreviewInterface,
-    revision: Option<runtime::RevisionId>,
-) -> runtime::RuntimeResult<String> {
-    let query = |span: utils::Span| match this.request(runtime::RuntimeRequest::QueryLayer {
-        layer_path: runtime::RuntimePath::root(),
-        revision,
-        index: runtime::Payload::new(span),
-    })? {
-        runtime::RuntimeSignal::QueryResult { value, .. } => value
-            .downcast_ref::<String>()
-            .cloned()
-            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                message: "source text payload was not a String".to_string(),
-            }),
-        other => Err(runtime::RuntimeError::InvalidRequest {
-            message: format!("unexpected signal for source query: {other:?}"),
-        }),
-    };
-
-    // Try with usize::MAX first; on length-error retry with the real length.
-    match query(utils::Span::new(0, usize::MAX)) {
-        Ok(s) => Ok(s),
-        Err(runtime::RuntimeError::InvalidRequest { message })
-            if message.contains("text length") || message.contains("text_len") =>
-        {
-            let len = parse_usize_from(&message).unwrap_or(0);
-            query(utils::Span::new(0, len))
-        }
-        Err(e) => Err(e),
-    }
-}
-
 fn build_tree_snapshot(
     this: &WebPreviewInterface,
     revision: Option<runtime::RevisionId>,
 ) -> runtime::RuntimeResult<serde_json::Value> {
-    let source = query_source(this, revision)?;
+    let source = this.query_source_text(revision, utils::Span::new(0, usize::MAX))?;
 
     let mut parser = crate::parsec::Parser::new(this.grammar);
     let crate::parsec::Result { root, .. } = parser.parse_text(&source);
@@ -325,12 +275,4 @@ fn build_tree_snapshot(
     );
 
     Ok(commands_to_web_json(&commands))
-}
-
-fn parse_usize_from(s: &str) -> Option<usize> {
-    s.split_whitespace().find_map(|tok| {
-        tok.trim_matches(|c: char| !c.is_ascii_digit())
-            .parse::<usize>()
-            .ok()
-    })
 }

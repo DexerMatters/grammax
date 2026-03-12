@@ -31,25 +31,27 @@ fn test_json() {
         .then_layer(ParseTreeIR::default())
         .tap();
 
-    // thread::spawn(move || {
-    //     for update in cst_obs.updates.iter() {
-    //         println!(
-    //             "=== CST update: revision {}, {} commands ===",
-    //             update.0,
-    //             update.1.len()
-    //         );
-    //         for cmd in update.1.iter() {
-    //             println!("  {cmd:?}");
-    //         }
-    //     }
-    // });
+    let handle = thread::spawn(move || {
+        for update in cst_obs.updates.iter() {
+            println!(
+                "=== CST update: revision {}, {} commands ===",
+                update.0,
+                update.1.len()
+            );
+            for cmd in update.1.iter() {
+                println!("  {cmd:?}");
+            }
+        }
+    });
 
     let compiler = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
         ComposedCompiler::from_pass_with_events(cst_pass, evt_tx)
     });
 
     compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
-    compiler.update(10, 14, "Doe").expect("update");
+    compiler.replace(10, 14, "Doe").expect("update");
+
+    handle.join().expect("observer thread panicked");
 }
 
 #[test]

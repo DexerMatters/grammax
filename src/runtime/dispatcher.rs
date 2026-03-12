@@ -17,7 +17,7 @@ use super::{
 
 /// Commands that can be sent to the GED loop outside of the envelope channel.
 /// Currently only `Subscribe` needs this path.
-pub(super) enum SubCommand {
+pub(crate) enum SubCommand {
     Subscribe {
         layer_path: Option<RuntimePath>,
         sender: channel::Sender<RuntimeEvent>,
@@ -36,11 +36,7 @@ struct PendingQuery {
     reply: channel::Sender<RuntimeResult>,
 }
 
-// ─── Subscription handle ────────────────────────────────────────────────────
-
-/// Owned handle for a single subscriber.  Dropping it automatically
-/// unregisters the subscription (the GED prunes disconnected senders).
-pub struct SubscriptionHandle {
+pub(crate) struct SubscriptionHandle {
     rx: channel::Receiver<RuntimeEvent>,
 }
 
@@ -68,21 +64,17 @@ impl SubscriptionHandle {
             })
     }
 }
-
-// ─── Public handle ────────────────────────────────────────────────────────────
-
-/// Handle to the running GED loop.  Cheaply cloneable via `Arc`.
 #[derive(Clone)]
 pub struct GlobalEventDispatcher {
     /// Envelope channel shared with all [`Interface`] impls.
-    pub(super) envelope_tx: channel::Sender<RuntimeEnvelope>,
+    pub(crate) envelope_tx: channel::Sender<RuntimeEnvelope>,
     /// Internal channel for Subscribe requests.
-    pub(super) sub_tx: channel::Sender<SubCommand>,
+    pub(crate) sub_tx: channel::Sender<SubCommand>,
 }
 
 impl GlobalEventDispatcher {
     /// Spin up the GED loop and return a handle to it.
-    pub fn start(
+    pub(crate) fn start(
         compiler: ComposedCompiler,
         evt_rx: channel::Receiver<RuntimeEvent>,
     ) -> (Self, thread::JoinHandle<()>) {
@@ -103,13 +95,13 @@ impl GlobalEventDispatcher {
     }
 
     /// Return a clone of the envelope sender for direct use in [`Interface`] impls.
-    pub fn envelope_tx(&self) -> channel::Sender<RuntimeEnvelope> {
+    pub(crate) fn envelope_tx(&self) -> channel::Sender<RuntimeEnvelope> {
         self.envelope_tx.clone()
     }
 
     /// Subscribe to pipeline events, optionally filtered to a specific layer path.
     /// Returns a [`SubscriptionHandle`] with ergonomic helpers for awaiting revisions.
-    pub fn subscribe(&self, layer_path: Option<RuntimePath>) -> SubscriptionHandle {
+    pub(crate) fn subscribe(&self, layer_path: Option<RuntimePath>) -> SubscriptionHandle {
         let (tx, rx) = channel::unbounded();
         let _ = self.sub_tx.send(SubCommand::Subscribe {
             layer_path,

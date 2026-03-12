@@ -94,9 +94,10 @@ fn test_arith_commands() {
         }
     });
 
-    let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
+    let runtime = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
         ComposedCompiler::from_pass_with_events(pass, evt_tx)
     });
 
-    runtime.run().expect("Runtime failed unexpectedly");
+    runtime.insert(0, "1 + 2 * 3").unwrap();
+    runtime.replace(0, 1, "4").unwrap();
 }

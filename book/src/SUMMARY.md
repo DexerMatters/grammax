@@ -3,7 +3,7 @@
 [Introduction](introduction.md)
 
 # User guide
-- [Installation](./guide/1-installation.md)
+- [Installation](./user/1-installation.md)
 - [A tour of Grammax](./user/2-tour.md)
 - [Grammar](./user/3-grammar.md)
     - [Words](./user/3-1-words.md)

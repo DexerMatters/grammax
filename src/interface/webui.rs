@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::net::{SocketAddr, TcpListener};
 
 use color_print::cprintln;
@@ -6,8 +7,15 @@ use rust_embed::Embed;
 use crate::{
     grammar,
     interface::Interface,
-    runtime,
-    scheme::{Command, layers::ParseTreeIR},
+    runtime::{
+        self,
+        compiler::{ContainsPath, Down, Here, TypedTree},
+        dispatcher::GlobalEventDispatcher,
+    },
+    scheme::{
+        Command,
+        layers::{ParseTreeIR, SourceText},
+    },
     utils,
 };
 
@@ -38,21 +46,23 @@ enum WebAction {
     Shutdown,
 }
 
-// RedGreenTreeIR is always the first downstream layer (SourceText → pass[0] → CST).
-const TREE_LAYER: fn() -> runtime::RuntimePath = || runtime::RuntimePath(vec![0]);
-
-#[derive(Clone)]
-pub struct WebPreviewInterface {
-    ged: runtime::GlobalEventDispatcher,
+pub struct WebPreviewInterface<Tree: TypedTree> {
+    ged: GlobalEventDispatcher,
     grammar: &'static grammar::Grammar,
     rule_infos: &'static Vec<RuleInfo>,
     terminal_infos: &'static Vec<TerminalInfo>,
     host: &'static str,
     port: u16,
+    _marker: PhantomData<fn() -> Tree>,
 }
 
-impl Interface for WebPreviewInterface {
-    fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
+impl<Tree: TypedTree> Interface<Tree> for WebPreviewInterface<Tree>
+where
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
+{
+    fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
         Self {
             ged,
             grammar,
@@ -60,15 +70,22 @@ impl Interface for WebPreviewInterface {
             terminal_infos: serialize_terminal_infos(grammar),
             host: "127.0.0.1",
             port: 8080,
+            _marker: PhantomData,
         }
     }
 
-    fn ged(&self) -> &runtime::GlobalEventDispatcher {
+    fn ged(&self) -> &GlobalEventDispatcher {
         &self.ged
     }
 }
 
-impl WebPreviewInterface {
+impl<Tree> WebPreviewInterface<Tree>
+where
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>
+        + 'static,
+{
     pub fn configure(&mut self, host: &'static str, port: u16) {
         self.host = host;
         self.port = port;
@@ -82,7 +99,7 @@ impl WebPreviewInterface {
         format!("{}:{}", self.host, self.port)
     }
 
-    pub fn run(&self) -> runtime::RuntimeResult {
+    pub fn run(&self) -> runtime::RuntimeResult<()> {
         let mut port = self.port;
         while !is_port_free(self.host, port) {
             cprintln!(
@@ -94,12 +111,12 @@ impl WebPreviewInterface {
         }
 
         let addr = format!("{}:{}", self.host, port);
-        let self_clone = self.clone();
+        let this_clone = self.clone();
         let server = rouille::Server::new(addr, move |request| {
             let mut path = request.raw_url().trim_start_matches('/').to_string();
 
             if path.starts_with("api/") {
-                return resolve_api_request(&self_clone, &path, request);
+                return this_clone.resolve_api_request(&path, request);
             }
 
             if path.is_empty() {
@@ -126,6 +143,8 @@ impl WebPreviewInterface {
         cprintln!("Web preview server running at <green>{}</green>.", url);
         cprintln!("Press Ctrl+C to stop the server.");
 
+        webbrowser::open(&url).ok();
+
         let (handler, sender_to_stop) = server.stoppable();
 
         ctrlc::set_handler(move || {
@@ -138,7 +157,82 @@ impl WebPreviewInterface {
 
         let _ = handler.join();
 
-        Ok(runtime::RuntimeSignal::Ack)
+        Ok(())
+    }
+
+    fn resolve_api_request(&self, path: &str, request: &rouille::Request) -> rouille::Response {
+        match path {
+            "api/action" => {
+                let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
+                match body {
+                    WebAction::ApplyTextEdit { span, text } => {
+                        <Self as Interface<Tree>>::edit_source_text_till::<Down<Here>>(
+                            self, span.start, span.end, &text,
+                        )
+                        .map(|(_, transaction)| {
+                            rouille::Response::json(&commands_to_web_json(&transaction))
+                        })
+                        .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500))
+                    }
+                    WebAction::GetSource => {
+                        match <Self as Interface<Tree>>::query_source_text(
+                            self,
+                            None,
+                            utils::Span::new(0, usize::MAX),
+                        ) {
+                            Ok(source) => rouille::Response::json(&source),
+                            Err(e) => rouille::Response::json(&e).with_status_code(500),
+                        }
+                    }
+                    WebAction::GetTree => match self.build_tree_snapshot(None) {
+                        Ok(commands) => rouille::Response::json(&commands),
+                        Err(e) => rouille::Response::json(&e).with_status_code(500),
+                    },
+                    WebAction::Shutdown => match <Self as Interface<Tree>>::shutdown(self) {
+                        Ok(_) => rouille::Response::json(&serde_json::json!({})),
+                        Err(e) => rouille::Response::json(&e).with_status_code(500),
+                    },
+                }
+            }
+            "api/rules" => rouille::Response::json(&self.rule_infos),
+            "api/terminals" => rouille::Response::json(&self.terminal_infos),
+            _ => rouille::Response::empty_404(),
+        }
+    }
+
+    fn build_tree_snapshot(
+        &self,
+        revision: Option<runtime::RevisionId>,
+    ) -> runtime::RuntimeResult<serde_json::Value> {
+        let source = <Self as Interface<Tree>>::query_source_text(
+            self,
+            revision,
+            utils::Span::new(0, usize::MAX),
+        )?;
+
+        let mut parser = crate::parsec::Parser::new(self.grammar);
+        let crate::parsec::Result { root, .. } = parser.parse_text(&source);
+        let commands = crate::scheme::passes::delta::generate_commands_for_full_tree(
+            &parser.alloc,
+            root.green,
+            &source,
+        );
+
+        Ok(commands_to_web_json(&commands))
+    }
+}
+
+impl<Tree: TypedTree> Clone for WebPreviewInterface<Tree> {
+    fn clone(&self) -> Self {
+        Self {
+            ged: self.ged.clone(),
+            grammar: self.grammar,
+            rule_infos: self.rule_infos,
+            terminal_infos: self.terminal_infos,
+            host: self.host,
+            port: self.port,
+            _marker: PhantomData,
+        }
     }
 }
 
@@ -199,41 +293,6 @@ fn commands_to_web_json(commands: &[Command<ParseTreeIR>]) -> serde_json::Value 
     serde_json::Value::Array(items)
 }
 
-fn resolve_api_request(
-    this: &WebPreviewInterface,
-    path: &str,
-    request: &rouille::Request,
-) -> rouille::Response {
-    match path {
-        "api/action" => {
-            let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
-            match body {
-                WebAction::ApplyTextEdit { span, text } => this
-                    .input_till(span.start, span.end, &text, TREE_LAYER())
-                    .map(|transaction| rouille::Response::json(&commands_to_web_json(&transaction)))
-                    .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
-                WebAction::GetSource => {
-                    match this.query_source_text(None, utils::Span::new(0, usize::MAX)) {
-                        Ok(source) => rouille::Response::json(&source),
-                        Err(e) => rouille::Response::json(&e).with_status_code(500),
-                    }
-                }
-                WebAction::GetTree => match build_tree_snapshot(this, None) {
-                    Ok(commands) => rouille::Response::json(&commands),
-                    Err(e) => rouille::Response::json(&e).with_status_code(500),
-                },
-                WebAction::Shutdown => match this.shutdown() {
-                    Ok(_) => rouille::Response::json(&serde_json::json!({})),
-                    Err(e) => rouille::Response::json(&e).with_status_code(500),
-                },
-            }
-        }
-        "api/rules" => rouille::Response::json(&this.rule_infos),
-        "api/terminals" => rouille::Response::json(&this.terminal_infos),
-        _ => rouille::Response::empty_404(),
-    }
-}
-
 fn serialize_rule_infos(grammar: &'static grammar::Grammar) -> &'static Vec<RuleInfo> {
     let infos = &grammar.table.rules;
 
@@ -258,21 +317,4 @@ fn serialize_terminal_infos(grammar: &'static grammar::Grammar) -> &'static Vec<
         });
     }
     Box::leak(Box::new(terminal_infos))
-}
-
-fn build_tree_snapshot(
-    this: &WebPreviewInterface,
-    revision: Option<runtime::RevisionId>,
-) -> runtime::RuntimeResult<serde_json::Value> {
-    let source = this.query_source_text(revision, utils::Span::new(0, usize::MAX))?;
-
-    let mut parser = crate::parsec::Parser::new(this.grammar);
-    let crate::parsec::Result { root, .. } = parser.parse_text(&source);
-    let commands = crate::scheme::passes::delta::generate_commands_for_full_tree(
-        &parser.alloc,
-        root.green,
-        &source,
-    );
-
-    Ok(commands_to_web_json(&commands))
 }

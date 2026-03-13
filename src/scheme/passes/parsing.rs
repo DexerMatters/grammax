@@ -1,10 +1,9 @@
 use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
-    runtime::Payload,
     scheme::{
         self,
-        layers::{ParseNodeValue, ParseTreeIR, SourceText},
+        layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText},
     },
     utils::Span,
 };
@@ -137,7 +136,7 @@ fn prepend_messages_command(
     let mut cmds = Vec::with_capacity(rest.len() + 1);
     cmds.push(scheme::Command::Create {
         id: 0,
-        value: Payload::new(ParseNodeValue::Messages {
+        value: ParseTreeValue::Node(ParseNodeValue::Messages {
             messages: messages.clone(),
         }),
     });

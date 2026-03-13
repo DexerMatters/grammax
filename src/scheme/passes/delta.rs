@@ -2,8 +2,7 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    runtime::Payload,
-    scheme::layers::{NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery},
+    scheme::layers::{NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue},
 };
 
 const MAX_LCS_CELLS: usize = 4096;
@@ -1096,7 +1095,7 @@ fn emit_create_commands_from_green_with_field(
                         .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Token {
+                    value: ParseTreeValue::Node(ParseNodeValue::Token {
                         rule_ix: *rule_ix,
                         text,
                         field,
@@ -1109,7 +1108,7 @@ fn emit_create_commands_from_green_with_field(
                         .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Error {
+                    value: ParseTreeValue::Node(ParseNodeValue::Error {
                         error: err.clone(),
                         text,
                         field,
@@ -1119,7 +1118,7 @@ fn emit_create_commands_from_green_with_field(
             Tag::Rule { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Node {
+                    value: ParseTreeValue::Node(ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,
@@ -1129,7 +1128,7 @@ fn emit_create_commands_from_green_with_field(
             Tag::Field { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Node {
+                    value: ParseTreeValue::Node(ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,

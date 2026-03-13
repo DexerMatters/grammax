@@ -13,5 +13,5 @@ pub mod cst;
 pub mod source;
 
 pub use ast::{ASTCell, AstArena, AstArenaError, AstDelta};
-pub use cst::{NodePath, ParseNodeValue, ParseTreeError, ParseTreeIR, ParseTreeQuery};
+pub use cst::{NodePath, ParseNodeValue, ParseTreeError, ParseTreeIR, ParseTreeQuery, ParseTreeValue};
 pub use source::SourceText;

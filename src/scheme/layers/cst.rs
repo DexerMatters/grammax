@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 use std::fmt;
 
 use crate::{
@@ -7,7 +7,6 @@ use crate::{
         msg::{ErrorMessage, ParserMessage, ParserMessages},
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
     },
-    runtime::Payload,
     scheme::{self, IR},
     utils::Span,
 };
@@ -73,6 +72,42 @@ pub enum ParseTreeError {
     MissingRoot,
     InvalidPath(NodePath),
 }
+
+#[derive(Clone)]
+pub enum ParseTreeValue {
+    Node(ParseNodeValue),
+    GreenId(usize),
+    Messages(ParserMessages),
+    Allocator(TreeAllocRef),
+}
+
+impl fmt::Debug for ParseTreeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Node(n) => write!(f, "Node({n:?})"),
+            Self::GreenId(id) => write!(f, "GreenId({id})"),
+            Self::Messages(m) => write!(f, "Messages({m:?})"),
+            Self::Allocator(_) => write!(f, "Allocator(<opaque>)"),
+        }
+    }
+}
+
+impl Serialize for ParseTreeValue {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Node(n) => n.serialize(s),
+            Self::GreenId(id) => id.serialize(s),
+            Self::Messages(m) => m.serialize(s),
+            // TreeAllocRef is Rc-based and not serialisable; emit null at the
+            // HTTP boundary (it is only used internally by the CLI/tests).
+            Self::Allocator(_) => s.serialize_none(),
+        }
+    }
+}
+
+// SAFETY: see `SendableAlloc` above.
+unsafe impl Send for ParseTreeValue {}
+unsafe impl Sync for ParseTreeValue {}
 
 impl ParseNodeValue {
     pub fn field(&self) -> &str {
@@ -382,20 +417,20 @@ impl ParseTreeIR {
 
 impl IR for ParseTreeIR {
     type Ix = ParseTreeQuery;
-    type Value = Payload;
+    type Value = ParseTreeValue;
     type Error = ParseTreeError;
 
-    fn query(&self, index: ParseTreeQuery) -> Result<Payload, Self::Error> {
+    fn query(&self, index: ParseTreeQuery) -> Result<ParseTreeValue, Self::Error> {
         match index {
-            ParseTreeQuery::Message => Ok(Payload::new(self.parser_messages())),
-            ParseTreeQuery::Allocator => Ok(Payload::new_any(self.alloc.clone())),
+            ParseTreeQuery::Message => Ok(ParseTreeValue::Messages(self.parser_messages())),
+            ParseTreeQuery::Allocator => Ok(ParseTreeValue::Allocator(self.alloc.clone())),
             ParseTreeQuery::Path(path) => {
                 let green = match self.green_at_path(&path) {
                     Some(green) => green,
                     None if self.root.is_none() => return Err(ParseTreeError::MissingRoot),
                     None => return Err(ParseTreeError::InvalidPath(path)),
                 };
-                Ok(Payload::new(green))
+                Ok(ParseTreeValue::GreenId(green))
             }
         }
     }
@@ -423,8 +458,10 @@ impl IR for ParseTreeIR {
         for command in transaction.iter() {
             match command {
                 scheme::Command::Create { id, value } => {
-                    let Some(value) = value.downcast_ref::<ParseNodeValue>() else {
-                        continue;
+                    // Extract the inner ParseNodeValue; skip non-node values.
+                    let value = match value {
+                        ParseTreeValue::Node(n) => n,
+                        _ => continue,
                     };
 
                     // Messages variant carries forwarded parser-level errors.

@@ -5,8 +5,8 @@ use color_print::cprintln;
 use grammax::{
     grammar::{Grammar, display::format_grammar_error},
     interface::cli::CliInterface,
-    runtime::{CompilerBuilder, ComposedCompiler, ExpectPass, ParserPass, RuntimeService},
-    scheme::layers::ParseTreeIR,
+    runtime::{BuildTree, CompilerBuilder, End, Observe, ObservedLayer, ParserPass, Then},
+    scheme::layers::{ParseTreeIR, SourceText},
 };
 
 #[cfg(feature = "webui")]
@@ -110,16 +110,18 @@ pub fn main() {
                     std::process::exit(1);
                 }
             };
-            let tap = CompilerBuilder::new()
-                .then_pass(ParserPass::new(grammar))
-                .then_layer(ParseTreeIR::default())
-                .tap();
+            let tree: Then<SourceText, ParserPass, End<ParseTreeIR>> =
+                CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
+            let _observer: ObservedLayer<
+                Then<SourceText, ParserPass, End<ParseTreeIR>>,
+                grammax::runtime::Down<grammax::runtime::Here>,
+            > = tree.observe::<grammax::runtime::Down<grammax::runtime::Here>>();
             #[cfg(feature = "webui")]
             if interactive_mode.webui {
-                start_webui(tap.0, grammar);
+                start_webui(tree, grammar);
                 return;
             }
-            start_cli(tap.0, grammar);
+            start_cli(tree, grammar);
         }
         None => {
             cprintln!("No command provided. Use '<bold>--help</bold>' for usage information.");
@@ -127,25 +129,23 @@ pub fn main() {
     }
 }
 
-fn start_cli(tap: ExpectPass<ParseTreeIR>, grammar: &'static Grammar) {
-    RuntimeService::<CliInterface>::new(grammar, move |evt_tx| {
-        ComposedCompiler::from_pass_with_events(tap, evt_tx)
-    })
-    .run()
-    .unwrap_or_else(|e| {
-        cprintln!("<red>error:</red> Runtime failed unexpectedly: \n{}", e);
-        std::process::exit(1);
-    })
+type ParseTreePass = Then<SourceText, ParserPass, End<ParseTreeIR>>;
+
+fn start_cli(tree: ParseTreePass, grammar: &'static Grammar) {
+    tree.build_runtime::<CliInterface<ParseTreePass>>(grammar)
+        .run()
+        .unwrap_or_else(|e| {
+            cprintln!("<red>error:</red> Runtime failed unexpectedly: \n{}", e);
+            std::process::exit(1);
+        })
 }
 
 #[cfg(feature = "webui")]
-fn start_webui(tap: ExpectPass<ParseTreeIR>, grammar: &'static Grammar) {
-    RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
-        ComposedCompiler::from_pass_with_events(tap, evt_tx)
-    })
-    .run()
-    .unwrap_or_else(|e| {
-        cprintln!("<red>error:</red> Runtime failed unexpectedly: \n{}", e);
-        std::process::exit(1);
-    });
+fn start_webui(tree: ParseTreePass, grammar: &'static Grammar) {
+    tree.build_runtime::<WebPreviewInterface<ParseTreePass>>(grammar)
+        .run()
+        .unwrap_or_else(|e| {
+            cprintln!("<red>error:</red> Runtime failed unexpectedly: \n{}", e);
+            std::process::exit(1);
+        });
 }

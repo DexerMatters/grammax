@@ -1,4 +1,4 @@
-use std::{ops::Deref, thread};
+use std::{marker::PhantomData, ops::Deref, thread};
 
 use crossbeam::channel;
 
@@ -8,46 +8,40 @@ use crate::{
 };
 
 use super::{
-    compiler::ComposedCompiler,
-    dispatcher::{GlobalEventDispatcher, SubscriptionHandle},
-    protocol::{RuntimeEvent, RuntimePath},
+    compiler::{ComposedCompiler, TypedTree},
+    dispatcher::GlobalEventDispatcher,
+    protocol::RuntimeEvent,
 };
 
-pub struct RuntimeService<Impl = BasicInterface> {
-    ged: GlobalEventDispatcher,
+pub struct RuntimeService<Tree: TypedTree, Impl = BasicInterface<Tree>> {
     api: Impl,
     _handle: thread::JoinHandle<()>,
+    _marker: PhantomData<fn() -> Tree>,
 }
 
-impl<Impl: Interface> RuntimeService<Impl> {
+impl<Tree, Impl> RuntimeService<Tree, Impl>
+where
+    Tree: TypedTree + 'static,
+{
     /// Build the compiler pipeline and start the GED event loop.
-    pub fn new<F>(grammar: &'static Grammar, f: F) -> Self
+    pub(crate) fn new<F>(grammar: &'static Grammar, f: F) -> Self
     where
-        F: FnOnce(Option<channel::Sender<RuntimeEvent>>) -> ComposedCompiler + Send + 'static,
+        Impl: Interface<Tree>,
+        F: FnOnce(Option<channel::Sender<RuntimeEvent>>) -> ComposedCompiler<Tree> + Send + 'static,
     {
         let (evt_tx, evt_rx) = channel::unbounded::<RuntimeEvent>();
         let compiler = f(Some(evt_tx));
         let (ged, handle) = GlobalEventDispatcher::start(compiler, evt_rx);
-        let api = Impl::new(ged.clone(), grammar);
+        let api = Impl::new(ged, grammar);
         Self {
-            ged,
             api,
             _handle: handle,
+            _marker: PhantomData,
         }
-    }
-
-    /// Subscribe to pipeline events, optionally filtered to `layer_path`.
-    /// Pass `None` to receive events from every layer.
-    pub fn subscribe(&self, layer_path: Option<RuntimePath>) -> SubscriptionHandle {
-        self.ged.subscribe(layer_path)
-    }
-
-    pub fn ged(&self) -> &GlobalEventDispatcher {
-        &self.ged
     }
 }
 
-impl<Impl> Deref for RuntimeService<Impl> {
+impl<Tree: TypedTree, Impl> Deref for RuntimeService<Tree, Impl> {
     type Target = Impl;
 
     fn deref(&self) -> &Self::Target {

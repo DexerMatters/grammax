@@ -17,33 +17,99 @@ Pipelines are transparent to developers. You don't need to worry about how to de
 You can normally instance your compiler with `CompilerBuilder` like this:
 
 ```rust
-CompilerBuilder::new()
-    .then_pass(ParserPass::new(grammar))
-    .then_layer(ParseTreeIR::default())
-    .then_pass(IncrementalLowerer::new(grammar, mapper))
-    .then_layer(AstArena::default())
+let tree = CompilerBuilder::new()
+    .then(ParserPass::new(grammar), ParseTreeIR::default())
+    .then(IncrementalLowerer::new(grammar, mapper), AstArena::default());
 ```
 
-where `new` is the default layer for the source text; `then_pass` and `then_layer` are just methods for sequentially adding passes and layers. The pipeline is automatically set up afterwards.
+`CompilerBuilder::new()` creates a tree whose current layer is the source text. Each call to `then(pass, ir)` adds one more stage below the current leaf and returns a new typed tree. In the example above, the resulting pipeline is:
+
+```text
+SourceText
+  |
+ParseTreeIR
+  |
+AstArena
+```
+
+This means the source text is still the root of the tree, `ParseTreeIR` is one step below it, and `AstArena` is one step below `ParseTreeIR`.
+
+## Composing larger trees
+
+Sequential pipelines are the most common case, but the builder is not limited to a single chain. You can also fork the tree and keep composing on one branch.
+
+For example, the following code builds this shape:
+
+```text
+SourceText
+  |
+IR1
+  |
+IR2
+ / \
+IR3 IR4
+ |
+IR5
+```
+
+```rust
+let tree = CompilerBuilder::new()
+    .then(Pass1::new(), IR1::default())
+    .then(Pass2::new(), IR2::default())
+    .map_left(|ir1_branch| {
+        ir1_branch.map_left(|ir2_leaf| {
+            ir2_leaf.fork(
+                Pass3::new(),
+                IR3::default(),
+                Pass4::new(),
+                IR4::default(),
+            )
+        })
+    })
+    .map_left(|ir1_branch| {
+        ir1_branch.map_left(|ir2_branch| {
+            ir2_branch.map_left(|ir3_leaf| ir3_leaf.then(Pass5::new(), IR5::default()))
+        })
+    });
+```
+
+The key idea is that `.then()` only extends a plain leaf, while `.map_left()` and `.map_right()` let you reopen an existing branch and keep composing inside it.
+
+As a rule of thumb:
+
+- use `then(pass, ir)` to extend a linear pipeline;
+- use `fork(left_pass, left_ir, right_pass, right_ir)` to split one leaf into two branches;
+- use `map_left()` or `map_right()` to keep composing inside an already-built branch.
 
 ## Observing the pipeline
 
-**Tap** is adapted from the concept of "tap" in Unix pipelines. It allows you to observe the commands flowing through the pipeline just like setting a tap on a water pipe. You can set up a tap on after any layer to query its current state and observe the commands flowing from it.
+You can observe any layer in the tree by calling `observe::<Path>()`. The path is a type-level description of how to walk from the root layer to the layer you want:
 
-You can instance a tap like this:
+- `Here` means the current layer;
+- `Down<P>` means go to the left child, then continue with `P`;
+- `Another<P>` means go to the right child, then continue with `P`.
+
+For the sequential compiler shown above, observation looks like this:
 
 ```rust
-let (pass, observer) = CompilerBuilder::new()
-    .then_pass(ParserPass::new(grammar))
-    .then_layer(ParseTreeIR::default())
-    .tap();
+let tree = CompilerBuilder::new()
+    .then(ParserPass::new(grammar), ParseTreeIR::default())
+    .then(IncrementalLowerer::new(grammar, mapper), AstArena::default());
+
+let source_observer = tree.observe::<Here>();
+let parse_tree_observer = tree.observe::<Down<Here>>();
+let ast_observer = tree.observe::<Down<Down<Here>>>();
 ```
 
-where `pass` is an instance of `ExpectPass` from which you can build the rest of the compiler, and `observer` is an instance of `LayerObserver` which you can use to observe the commands flowing from the layer and query its current state. For example, you can print out the commands from `ParseTreeIR` in real time like this:
+The returned value is a `LayerObserver`. You can use it to receive transactions and to query the current state of that layer.
+
+For example, you can print out the commands from `ParseTreeIR` in real time like this:
 
 ```rust
+let parse_tree_observer = tree.observe::<Down<Here>>();
+
 thread::spawn(move || {
-    while let Some(transaction) = observer.recv() {
+    while let Some(transaction) = parse_tree_observer.recv() {
         println!("======Received transaction======");
         for cmd in transaction.iter() {
              println!("{:?}", cmd);
@@ -52,23 +118,36 @@ thread::spawn(move || {
 });
 ```
 
-By using `recv` method, the observer acts like a receiver of a channel, waiting for transactions to arrive and printing them out in real time. You can also query the current state of the layer by using the `query` method:
+By using `recv()`, the observer acts like a receiver of a channel, waiting for transactions to arrive and printing them out in real time. You can also query the current state of the layer by using `query()`:
 
 ```rust
-thread::spawn(move || {
-    while let Some(transaction) = observer.recv() {
-        println!("======Current tree root======");
-        let result = observer.query(ParseTreeQuery::Path(NodePath::root()));
-        let result = result.expect("Runtime query failed");
-        let tree = result.expect("Query is bad for this layer");
-        let green_id = tree
-            .downcast_ref::<GreenId>()
-            .expect("Value is not a GreenId");
-        println!("GreenId at root: {:?}", green_id);
+let parse_tree_observer = tree.observe::<Down<Here>>();
+
+let result = parse_tree_observer.query(ParseTreeQuery::Path(NodePath::root()));
+match result {
+    Ok(ParseTreeValue::GreenId(id)) => {
+        println!("GreenId at root: {:?}", id);
     }
-});
+    Ok(other) => {
+        panic!("expected GreenId, got {other:?}");
+    }
+    Err(err) => {
+        panic!("Runtime query failed: {err:?}");
+    }
+}
 ```
 
-It looks verbose because the `query` does not miss any possible error and returns a `Result<Result<_, _>, _>` object. The first wrapper is for runtime errors, which may occur when the query handle is not set or the query fails for some runtime reason. The second wrapper is for errors provided by the queried layer, which may occur when the query is bad (e.g., asking for a non-existent value with out-of-range index). You can unwrap the two layers of `Result` to get the value you want, which is a type-erased `GreenId` in this case. (Note that the value is type-erased because the layer may return any type of value. You can not only query the root of the tree but also the allocator or parser messages, which are specified in `ParseTreeQuery`.)
+The `query()` method returns a nested `Result` so that runtime failures and IR-specific failures are both preserved. This is intentionally verbose: querying a live pipeline can fail because the runtime is unavailable, because the query handle is not installed yet, or because the query itself is invalid for that IR.
+
+For the branched example above, some useful paths are:
+
+- `Here`: `SourceText`
+- `Down<Here>`: `IR1`
+- `Down<Down<Here>>`: `IR2`
+- `Down<Down<Down<Here>>>`: `IR3`
+- `Another<Down<Down<Here>>>`: `IR4`
+- `Down<Down<Down<Down<Here>>>>`: `IR5`
+
+Once you are comfortable reading these path types, the whole compiler tree becomes statically navigable at compile time.
 
 

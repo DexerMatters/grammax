@@ -5,19 +5,17 @@
 
 pub mod compiler;
 pub mod dispatcher;
-pub mod payload;
 pub mod protocol;
 pub mod service;
 
 pub use crate::scheme::passes::{ParserPass, Reparser, ReparserConfig};
 pub use crate::scheme::{LayerName, PassId};
-pub use compiler::{CompilerBuilder, ComposedCompiler, ExpectLayer, ExpectPass, LayerObserver};
-pub use dispatcher::GlobalEventDispatcher;
-pub use payload::{Payload, SerdeAny};
-pub use protocol::{
-    RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimePath, RuntimeRequest,
-    RuntimeResult, RuntimeSignal,
+pub use compiler::{
+    Another, BuildTree, CompilerBuilder, ComposedCompiler, ContainsPath, ContainsTree, Down, End,
+    Fork, Here, LayerObserver, Observe, ObservePath, ObservedLayer, SeededTree, Then, TypedTree,
 };
+pub use protocol::{RevisionId, RuntimeError, RuntimePath};
+pub(crate) use protocol::{RuntimeEnvelope, RuntimeRequest, RuntimeResult, RuntimeSignal};
 pub use service::RuntimeService;
 
 #[cfg(test)]

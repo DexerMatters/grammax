@@ -1,5 +1,6 @@
 use std::{
     io::{self, Write},
+    marker::PhantomData,
     usize,
 };
 
@@ -15,31 +16,46 @@ use crate::{
     interface::Interface,
     parsec::{
         display::{format_ast, format_messages_with_source},
-        msg::ParserMessages,
-        tree::{RedNode, TreeAllocRef},
+        tree::RedNode,
     },
-    runtime::{self, Payload},
-    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery},
+    runtime::{
+        self,
+        compiler::{ContainsPath, Down, Here, TypedTree},
+        dispatcher::GlobalEventDispatcher,
+    },
+    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText},
 };
 
-pub struct CliInterface {
-    ged: runtime::GlobalEventDispatcher,
+pub struct CliInterface<Tree: TypedTree> {
+    ged: GlobalEventDispatcher,
     grammar: &'static grammar::Grammar,
+    _marker: PhantomData<fn() -> Tree>,
 }
 
-impl Interface for CliInterface {
-    fn new(ged: runtime::GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
-        Self { ged, grammar }
+impl<Tree> Interface<Tree> for CliInterface<Tree>
+where
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
+{
+    fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
+        Self {
+            ged,
+            grammar,
+            _marker: PhantomData,
+        }
     }
-    fn ged(&self) -> &runtime::GlobalEventDispatcher {
+    fn ged(&self) -> &GlobalEventDispatcher {
         &self.ged
     }
 }
 
-// RedGreenTreeIR is always the first downstream layer (SourceText → pass[0] → CST).
-const TREE_LAYER: fn() -> runtime::RuntimePath = || runtime::RuntimePath(vec![0]);
-
-impl CliInterface {
+impl<Tree> CliInterface<Tree>
+where
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
+{
     pub fn run(&self) -> io::Result<()> {
         let mut stdout = io::stdout();
 
@@ -50,7 +66,6 @@ impl CliInterface {
         write!(stdout, "input: \r\n")?;
         stdout.flush()?;
 
-        // Record the row where line 1 starts, so we can do absolute redraws
         let (_, origin_row) = cursor::position()?;
 
         let mut state = EditorState {
@@ -59,13 +74,12 @@ impl CliInterface {
             origin_row,
         };
 
-        // Draw initial line marker
         full_redraw(&mut stdout, &mut state)?;
 
         loop {
             match read()? {
                 Event::Key(key) => {
-                    if !key_event_handler(&self, &mut stdout, &mut state, key)? {
+                    if !self.key_event_handler(&mut stdout, &mut state, key)? {
                         break;
                     }
                 }
@@ -76,36 +90,196 @@ impl CliInterface {
         Ok(())
     }
 
-    fn query_tree<T: 'static>(
-        &self,
-        revision: runtime::RevisionId,
-        index: ParseTreeQuery,
-    ) -> runtime::RuntimeResult<T>
-    where
-        T: Clone,
-    {
-        let value: Payload =
-            self.query_layer::<ParseTreeIR>(TREE_LAYER(), revision.into(), index)?;
-        value
-            .downcast_ref::<T>()
-            .cloned()
-            .ok_or_else(|| runtime::RuntimeError::InvalidRequest {
-                message: format!("query result had unexpected payload type"),
-            })
-    }
-
     fn display_result(
         &self,
         source: &str,
         revision: runtime::RevisionId,
     ) -> runtime::RuntimeResult<(String, String)> {
-        let messages: ParserMessages = self.query_tree(revision, ParseTreeQuery::Message)?;
-        let alloc: TreeAllocRef = self.query_tree(revision, ParseTreeQuery::Allocator)?;
-        let root_id: usize = self.query_tree(revision, ParseTreeQuery::Path(NodePath::root()))?;
+        let rev = Some(revision);
+
+        let messages = match <Self as Interface<Tree>>::query_layer::<Down<Here>>(
+            self,
+            rev,
+            ParseTreeQuery::Message,
+        )? {
+            ParseTreeValue::Messages(m) => m,
+            other => {
+                return Err(runtime::RuntimeError::UndefinedBehavior {
+                    message: format!("expected Messages, got {other:?}"),
+                });
+            }
+        };
+        let alloc = match <Self as Interface<Tree>>::query_layer::<Down<Here>>(
+            self,
+            rev,
+            ParseTreeQuery::Allocator,
+        )? {
+            ParseTreeValue::Allocator(a) => a,
+            other => {
+                return Err(runtime::RuntimeError::UndefinedBehavior {
+                    message: format!("expected Allocator, got {other:?}"),
+                });
+            }
+        };
+        let root_id = match <Self as Interface<Tree>>::query_layer::<Down<Here>>(
+            self,
+            rev,
+            ParseTreeQuery::Path(NodePath::root()),
+        )? {
+            ParseTreeValue::GreenId(id) => id,
+            other => {
+                return Err(runtime::RuntimeError::UndefinedBehavior {
+                    message: format!("expected GreenId, got {other:?}"),
+                });
+            }
+        };
 
         let message_text = format_messages_with_source(self.grammar, &messages, source);
         let ast_text = format_ast(self.grammar, &RedNode::root(root_id), &alloc, source);
         Ok((message_text, ast_text))
+    }
+
+    fn key_event_handler(
+        &self,
+        stdout: &mut io::Stdout,
+        state: &mut EditorState,
+        event: KeyEvent,
+    ) -> io::Result<bool> {
+        match event.code {
+            KeyCode::Char(c) => {
+                if event.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
+                    stdout.execute(LeaveAlternateScreen)?;
+                    return Ok(false);
+                }
+
+                if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
+                    let source = state.buffer.clone();
+                    let settled =
+                        <Self as Interface<Tree>>::edit_source_text(self, 0, usize::MAX, &source);
+
+                    let num_lines = state.buffer.matches('\n').count() as u16 + 1;
+                    move_to(stdout, 0, state.origin_row + num_lines)?;
+                    write!(stdout, "\r\n")?;
+                    writeln!(stdout, "----------------------------------\r")?;
+                    match settled.and_then(|revision| self.display_result(&source, revision)) {
+                        Ok((messages, ast)) => {
+                            if !messages.is_empty() {
+                                cwrite!(stdout, "\r\n<bold>Messages:</bold>\r\n")?;
+                                for line in messages.lines() {
+                                    write!(stdout, "{}\r\n", line)?;
+                                }
+                                write!(stdout, "\r\n")?;
+                            }
+                            cwrite!(stdout, "<bold>AST:</bold>\r\n")?;
+                            for line in ast.lines() {
+                                write!(stdout, "{}\r\n", line)?;
+                            }
+                            write!(stdout, "\r\n")?;
+                        }
+                        Err(e) => {
+                            write!(stdout, "Error: {:?}\r\n", e)?;
+                        }
+                    }
+                    writeln!(stdout, "----------------------------------\r")?;
+                    stdout.flush()?;
+
+                    let (_, _new_row) = cursor::position()?;
+                    write!(stdout, "input: \r\n")?;
+                    stdout.flush()?;
+                    let (_, origin_row) = cursor::position()?;
+                    state.buffer.clear();
+                    state.cursor_pos = 0;
+                    state.origin_row = origin_row;
+                    full_redraw(stdout, state)?;
+                    return Ok(true);
+                }
+
+                state.buffer.insert(state.cursor_pos, c);
+                state.cursor_pos += 1;
+                full_redraw(stdout, state)?;
+            }
+
+            KeyCode::Backspace => {
+                if state.cursor_pos > 0 {
+                    state.cursor_pos -= 1;
+                    state.buffer.remove(state.cursor_pos);
+                    full_redraw(stdout, state)?;
+                }
+            }
+
+            KeyCode::Enter => {
+                state.buffer.insert(state.cursor_pos, '\n');
+                state.cursor_pos += 1;
+                full_redraw(stdout, state)?;
+            }
+
+            KeyCode::Left => {
+                let ls = line_start(&state.buffer, state.cursor_pos);
+                if state.cursor_pos > ls {
+                    state.cursor_pos -= 1;
+                    let (line_idx, col) = state.cursor_line_col();
+                    move_to(
+                        stdout,
+                        MARKER_WIDTH + col as u16,
+                        state.origin_row + line_idx as u16,
+                    )?;
+                    stdout.flush()?;
+                }
+            }
+
+            KeyCode::Right => {
+                let le = line_end(&state.buffer, state.cursor_pos);
+                if state.cursor_pos < le {
+                    state.cursor_pos += 1;
+                    let (line_idx, col) = state.cursor_line_col();
+                    move_to(
+                        stdout,
+                        MARKER_WIDTH + col as u16,
+                        state.origin_row + line_idx as u16,
+                    )?;
+                    stdout.flush()?;
+                }
+            }
+
+            KeyCode::Up => {
+                let (line_idx, col) = state.cursor_line_col();
+                if line_idx > 0 {
+                    let cur_ls = line_start(&state.buffer, state.cursor_pos);
+                    let prev_ls = line_start(&state.buffer, cur_ls - 1);
+                    let prev_le = line_end(&state.buffer, prev_ls);
+                    let prev_len = prev_le - prev_ls;
+                    let new_col = col.min(prev_len);
+                    state.cursor_pos = prev_ls + new_col;
+                    move_to(
+                        stdout,
+                        MARKER_WIDTH + new_col as u16,
+                        state.origin_row + (line_idx - 1) as u16,
+                    )?;
+                    stdout.flush()?;
+                }
+            }
+
+            KeyCode::Down => {
+                let (line_idx, col) = state.cursor_line_col();
+                let le = line_end(&state.buffer, state.cursor_pos);
+                if le < state.buffer.len() {
+                    let next_ls = le + 1;
+                    let next_le = line_end(&state.buffer, next_ls);
+                    let next_len = next_le - next_ls;
+                    let new_col = col.min(next_len);
+                    state.cursor_pos = next_ls + new_col;
+                    move_to(
+                        stdout,
+                        MARKER_WIDTH + new_col as u16,
+                        state.origin_row + (line_idx + 1) as u16,
+                    )?;
+                    stdout.flush()?;
+                }
+            }
+
+            _ => {}
+        }
+        Ok(true)
     }
 }
 
@@ -202,161 +376,19 @@ fn full_redraw(stdout: &mut io::Stdout, state: &mut EditorState) -> io::Result<(
     stdout.flush()
 }
 
-fn key_event_handler(
-    cli: &CliInterface,
-    stdout: &mut io::Stdout,
-    state: &mut EditorState,
-    event: KeyEvent,
-) -> io::Result<bool> {
-    match event.code {
-        KeyCode::Char(c) => {
-            if event.modifiers.contains(KeyModifiers::CONTROL) && c == 'c' {
-                stdout.execute(LeaveAlternateScreen)?;
-                return Ok(false);
-            }
-
-            if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
-                // Submit to runtime and display results
-                let source = state.buffer.clone();
-                let settled = cli.input(0, usize::MAX, &source);
-
-                let num_lines = state.buffer.matches('\n').count() as u16 + 1;
-                move_to(stdout, 0, state.origin_row + num_lines)?;
-                write!(stdout, "\r\n")?;
-                writeln!(stdout, "----------------------------------\r")?;
-                match settled.and_then(|revision| cli.display_result(&source, revision)) {
-                    Ok((messages, ast)) => {
-                        if !messages.is_empty() {
-                            cwrite!(stdout, "\r\n<bold>Messages:</bold>\r\n")?;
-                            for line in messages.lines() {
-                                write!(stdout, "{}\r\n", line)?;
-                            }
-                            write!(stdout, "\r\n")?;
-                        }
-                        cwrite!(stdout, "<bold>AST:</bold>\r\n")?;
-                        for line in ast.lines() {
-                            write!(stdout, "{}\r\n", line)?;
-                        }
-                        write!(stdout, "\r\n")?;
-                    }
-                    Err(e) => {
-                        write!(stdout, "Error: {:?}\r\n", e)?;
-                    }
-                }
-                writeln!(stdout, "----------------------------------\r")?;
-                stdout.flush()?;
-
-                // Reset state: new origin is after the output
-                let (_, _new_row) = cursor::position()?;
-                write!(stdout, "input: \r\n")?;
-                stdout.flush()?;
-                let (_, origin_row) = cursor::position()?;
-                state.buffer.clear();
-                state.cursor_pos = 0;
-                state.origin_row = origin_row;
-                full_redraw(stdout, state)?;
-                return Ok(true);
-            }
-
-            state.buffer.insert(state.cursor_pos, c);
-            state.cursor_pos += 1;
-            full_redraw(stdout, state)?;
-        }
-
-        KeyCode::Backspace => {
-            if state.cursor_pos > 0 {
-                state.cursor_pos -= 1;
-                state.buffer.remove(state.cursor_pos);
-                full_redraw(stdout, state)?;
-            }
-        }
-
-        KeyCode::Enter => {
-            state.buffer.insert(state.cursor_pos, '\n');
-            state.cursor_pos += 1;
-            full_redraw(stdout, state)?;
-        }
-
-        KeyCode::Left => {
-            let ls = line_start(&state.buffer, state.cursor_pos);
-            if state.cursor_pos > ls {
-                state.cursor_pos -= 1;
-                let (line_idx, col) = state.cursor_line_col();
-                move_to(
-                    stdout,
-                    MARKER_WIDTH + col as u16,
-                    state.origin_row + line_idx as u16,
-                )?;
-                stdout.flush()?;
-            }
-        }
-
-        KeyCode::Right => {
-            let le = line_end(&state.buffer, state.cursor_pos);
-            if state.cursor_pos < le {
-                state.cursor_pos += 1;
-                let (line_idx, col) = state.cursor_line_col();
-                move_to(
-                    stdout,
-                    MARKER_WIDTH + col as u16,
-                    state.origin_row + line_idx as u16,
-                )?;
-                stdout.flush()?;
-            }
-        }
-
-        KeyCode::Up => {
-            let (line_idx, col) = state.cursor_line_col();
-            if line_idx > 0 {
-                let cur_ls = line_start(&state.buffer, state.cursor_pos);
-                let prev_ls = line_start(&state.buffer, cur_ls - 1);
-                let prev_le = line_end(&state.buffer, prev_ls);
-                let prev_len = prev_le - prev_ls;
-                let new_col = col.min(prev_len);
-                state.cursor_pos = prev_ls + new_col;
-                move_to(
-                    stdout,
-                    MARKER_WIDTH + new_col as u16,
-                    state.origin_row + (line_idx - 1) as u16,
-                )?;
-                stdout.flush()?;
-            }
-        }
-
-        KeyCode::Down => {
-            let (line_idx, col) = state.cursor_line_col();
-            let le = line_end(&state.buffer, state.cursor_pos);
-            if le < state.buffer.len() {
-                let next_ls = le + 1;
-                let next_le = line_end(&state.buffer, next_ls);
-                let next_len = next_le - next_ls;
-                let new_col = col.min(next_len);
-                state.cursor_pos = next_ls + new_col;
-                move_to(
-                    stdout,
-                    MARKER_WIDTH + new_col as u16,
-                    state.origin_row + (line_idx + 1) as u16,
-                )?;
-                stdout.flush()?;
-            }
-        }
-
-        _ => {}
-    }
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
 
     use crate::{
         new_grammar,
         parsec::words::{EndOfInput, NUMS},
-        runtime::{CompilerBuilder, ComposedCompiler, ParserPass, RuntimeService},
-        scheme::layers::ParseTreeIR,
+        runtime::{BuildTree, CompilerBuilder, Down, End, Here, Observe, ParserPass, Then},
+        scheme::layers::{ParseTreeIR, SourceText},
     };
 
     use super::*;
+
+    type ParseTreePass = Then<SourceText, ParserPass, End<ParseTreeIR>>;
 
     #[test]
     fn test_cli_interface() {
@@ -369,14 +401,11 @@ mod tests {
             primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
         );
 
-        let (pass, _observer) = CompilerBuilder::new()
-            .then_pass(ParserPass::new(grammar))
-            .then_layer(ParseTreeIR::default())
-            .tap();
+        let pass: ParseTreePass =
+            CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
+        let _observer = pass.observe::<Down<Here>>();
 
-        let runtime = RuntimeService::<CliInterface>::new(grammar, move |evt_tx| {
-            ComposedCompiler::from_pass_with_events(pass, evt_tx)
-        });
+        let runtime = pass.build_runtime::<CliInterface<ParseTreePass>>(grammar);
 
         runtime.run().expect("runtime failed");
     }

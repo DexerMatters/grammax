@@ -19,6 +19,7 @@ mime_guess = { version = "2.0.5", optional = true }
 ctrlc = "3.5.2"
 crossterm = "0.29.0"
 tempfile = "3.26.0"
+webbrowser = { version = "1.2.0", optional = true }
 
 [dependencies.tower-lsp]
 version = "*"
@@ -28,7 +29,7 @@ features = ["runtime-agnostic"]
 
 
 [features]
-webui = ["dep:rouille", "dep:mime_guess"]
+webui = ["dep:rouille", "dep:mime_guess", "dep:webbrowser"]
 vsclsp = ["dep:tower-lsp"]
 
 [[bin]]

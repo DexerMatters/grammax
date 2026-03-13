@@ -2,13 +2,13 @@
 use crate::{
     interface::BasicInterface,
     new_grammar,
-    parsec::{tree::GreenId, words::*},
-    runtime::{CompilerBuilder, ComposedCompiler, ParserPass},
-    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery},
+    parsec::words::*,
+    runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
+    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue},
 };
 
 #[cfg(feature = "webui")]
-use crate::{interface::webui::WebPreviewInterface, runtime::RuntimeService};
+use crate::interface::webui::WebPreviewInterface;
 
 #[cfg(feature = "webui")]
 use std::thread;
@@ -29,7 +29,8 @@ fn test_tap_prints_cst_commands() {
         null    -> tt("null")
     );
 
-    let (layer, source_observer) = CompilerBuilder::new().tap();
+    let layer = CompilerBuilder::new();
+    let source_observer = layer.observe::<Here>();
     thread::spawn(move || {
         while let Some(transaction) = source_observer.recv() {
             println!("======Received Source transaction:");
@@ -38,10 +39,8 @@ fn test_tap_prints_cst_commands() {
             }
         }
     });
-    let (pass, observer) = layer
-        .then_pass(ParserPass::new(grammar))
-        .then_layer(ParseTreeIR::default())
-        .tap();
+    let pass = layer.then(ParserPass::new(grammar), ParseTreeIR::default());
+    let observer = pass.observe::<Down<Here>>();
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
@@ -52,9 +51,7 @@ fn test_tap_prints_cst_commands() {
         }
     });
 
-    let runtime = RuntimeService::<WebPreviewInterface>::new(grammar, move |evt_tx| {
-        ComposedCompiler::from_pass_with_events(pass, evt_tx)
-    });
+    let runtime = pass.build_runtime::<WebPreviewInterface<_>>(grammar);
 
     runtime.run().expect("runtime failed");
 }
@@ -71,20 +68,18 @@ fn test_arith_commands() {
         primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
 
-    let (pass, observer) = CompilerBuilder::new()
-        .then_pass(ParserPass::new(grammar))
-        .then_layer(ParseTreeIR::default())
-        .tap();
+    let pass = CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
+    let observer = pass.observe::<Down<Here>>();
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
             println!("======Current parse tree:");
             let result = observer.query(ParseTreeQuery::Path(NodePath::root()));
-            let result = result.expect("Runtime query failed");
-            let tree = result.expect("Query is bad for this layer");
-            let green_id = tree
-                .downcast_ref::<GreenId>()
-                .expect("Value is not a GreenId");
+            let tree = result.expect("Runtime query failed");
+            let green_id = match &tree {
+                ParseTreeValue::GreenId(id) => id,
+                other => panic!("expected GreenId, got {other:?}"),
+            };
             println!("GreenId at root: {:?}", green_id);
 
             println!("======Received transaction:");
@@ -94,10 +89,9 @@ fn test_arith_commands() {
         }
     });
 
-    let runtime = RuntimeService::<BasicInterface>::new(grammar, move |evt_tx| {
-        ComposedCompiler::from_pass_with_events(pass, evt_tx)
-    });
+    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
 
     runtime.insert(0, "1 + 2 * 3").unwrap();
     runtime.replace(0, 1, "4").unwrap();
+    thread::sleep(std::time::Duration::from_millis(100));
 }

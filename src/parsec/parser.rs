@@ -14,7 +14,6 @@ use crate::parsec::recovery::{
 };
 use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
 use crate::parsec::view::View;
-use crate::runtime;
 use crate::scheme::Command;
 use crate::scheme::layers::ParseTreeIR;
 use crate::utils::{LruCache, Span};

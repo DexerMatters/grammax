@@ -35,7 +35,7 @@ runtime.replace(0, 1, "4").unwrap();
 
 Here we use `BasicInterface<Tree>`, which provides simple APIs for inserting and updating the source text. We can call `insert()` and `replace()` on the runtime service to send updates to the compiler, which will then process them and output the results back to the caller.
 
-## Interface
+## Custom Interface
 
 **Interface** is a trait that offers necessary methods for developers to implement their own interfaces. It defines how the compiler interacts with the outside world and what APIs it provides to the caller.
 
@@ -54,19 +54,28 @@ To implement an interface, your struct usually needs to hold a `GlobalEventDispa
 
 There are multiple defined methods in the `Interface` trait to assist you to interact with the compiler. For example, the method `edit_source_text` allows you to send updates to the compiler by specifying the range of the source text to be updated and the new text. The method `query_layer` allows you to query the current state of a layer in the pipeline by sending a query and receiving a response.
 
-The predefined interfaces in Grammax are also tree-parameterized:
+Since locating the layer is statically determined by the type-level path, the interface has to be parameterized by the tree type to specify what layers it can accessThe predefined interfaces in Grammax are also tree-parameterized:
 
 - `BasicInterface<Tree>` only requires that `Tree` contains `SourceText` at `Here`;
 - `CliInterface<Tree>` requires `SourceText` at `Here` and `ParseTreeIR` at `Down<Here>`;
 - `WebPreviewInterface<Tree>` has the same requirement as `CliInterface<Tree>`.
 
+Taking `WebPreviewInterface<Tree>` as an example, the implementation of `Interface<Tree>` for it looks like this:
+
+```rust
+impl<Tree: TypedTree> Interface<Tree> for WebPreviewInterface<Tree>
+where
+    Tree: ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
+```
+
+Here `ContainsPath<Here, Target = SourceText>` means that the tree must contain a layer of `SourceText` at `Here`, and `ContainsPath<Down<Here>, Target = ParseTreeIR>` means that the tree must contain a layer of `ParseTreeIR` at `Down<Here>`. This design lets each interface declare exactly which layers it needs from the compiler tree to radically avoid runtime errors caused by missing layers. 
+
 This design lets each interface declare exactly which layers it needs from the compiler tree.
 
-## Querying the pipeline
+### Querying the pipeline
 
 The code below is adapted from the implementation of `CliInterface<Tree>` to show how to use `query_layer()` to query the current state of a layer in the pipeline.
-
-In the standard interactive tree, `Here` is the source text and `Down<Here>` is the parse tree layer, so `query_layer::<Down<Here>>()` means “query `ParseTreeIR`”.
 
 ```rust
 let messages = match self.query_layer::<Down<Here>>(
@@ -106,24 +115,23 @@ let root_id = match self.query_layer::<Down<Here>>(
     };
 ```
 
-The important change is that you no longer pass a runtime path manually. Instead, the path is encoded in the type argument. For example:
+`query_layer::<Path>(...)` requires you to specify a type-level path to the layer you want to query, an index of the layer and an optional revision ID. The path is the same as the one used in `observe::<Path>()`.
+
+In the standard interactive tree, `Here` is the source text and `Down<Here>` is the parse tree layer, so `query_layer::<Down<Here>>(...)` means “query `ParseTreeIR`”.
 
 - `query_layer::<Here>(...)` queries the source text layer;
-- `query_layer::<Down<Here>>(... )` queries the layer directly below the source text;
+- `query_layer::<Down<Here>>(...)` queries the layer directly below the source text;
 - `query_layer::<Down<Down<Here>>>(...)` queries the next layer below that.
-
-Internally, Grammax still converts these type-level paths into runtime paths. The difference is that interface users work with strongly typed paths instead of constructing `RuntimePath` values by hand.
 
 **Revision** is a concept related to the state of the layer. Each update of the source text will trigger a new revision. The revision ID is a monotonically increasing number that represents the order of the revisions. By specifying a revision ID, you can query the state of the layer after a specific update.
 
-## Editing the source text
+### Editing the source text
 
-There are two methods for editing the source text: `edit_source_text()` and `edit_source_text_till::<Path>()`. They both send updates to the compiler, but the latter also returns the transaction emitted by a chosen layer after the update. This is useful when your frontend wants the updated layer output immediately.
+There are two methods for editing the source text: `edit_source_text(...)` and `edit_source_text_till::<Path>(...)`. They both send updates to the compiler and return a revision ID, but the latter also returns the transaction emitted by a chosen layer after the update. This is useful when your frontend wants the updated layer output immediately.
 
 The code below is adapted from `WebPreviewInterface<Tree>`:
 
 ```rust
-let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
 match body {
     WebAction::ApplyTextEdit { span, text } => this
         .edit_source_text_till::<Down<Here>>(span.start, span.end, &text)
@@ -135,9 +143,4 @@ match body {
 }
 ```
 
-Here `Down<Here>` means that the web frontend wants the transaction emitted by the parse tree layer after the text edit. The return value is a pair:
-
-- the accepted `RevisionId`, and
-- the transaction produced by the selected layer for that revision.
-
-This makes it easy to build frontends that immediately redraw themselves from a selected compiler layer.
+Here `Down<Here>` means that the web frontend wants the transaction emitted by the parse tree layer after the text edit, which consists of commands that update the parse tree according to the new source text. The returned transaction is then converted to JSON and sent back to the caller.

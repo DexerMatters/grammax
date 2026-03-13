@@ -145,7 +145,7 @@ For the branched example above, some useful paths are:
 - `Down<Here>`: `IR1`
 - `Down<Down<Here>>`: `IR2`
 - `Down<Down<Down<Here>>>`: `IR3`
-- `Another<Down<Down<Here>>>`: `IR4`
+- `Down<Down<Another<Here>>>`: `IR4`
 - `Down<Down<Down<Down<Here>>>>`: `IR5`
 
 Once you are comfortable reading these path types, the whole compiler tree becomes statically navigable at compile time.

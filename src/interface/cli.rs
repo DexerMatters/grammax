@@ -34,9 +34,7 @@ pub struct CliInterface<Tree: TypedTree> {
 
 impl<Tree> Interface<Tree> for CliInterface<Tree>
 where
-    Tree: TypedTree
-        + ContainsPath<Here, Target = SourceText>
-        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
+    Tree: ContainsPath<Here, Target = SourceText> + ContainsPath<Down<Here>, Target = ParseTreeIR>,
 {
     fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
         Self {
@@ -97,11 +95,7 @@ where
     ) -> runtime::RuntimeResult<(String, String)> {
         let rev = Some(revision);
 
-        let messages = match <Self as Interface<Tree>>::query_layer::<Down<Here>>(
-            self,
-            rev,
-            ParseTreeQuery::Message,
-        )? {
+        let messages = match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Message)? {
             ParseTreeValue::Messages(m) => m,
             other => {
                 return Err(runtime::RuntimeError::UndefinedBehavior {
@@ -109,11 +103,7 @@ where
                 });
             }
         };
-        let alloc = match <Self as Interface<Tree>>::query_layer::<Down<Here>>(
-            self,
-            rev,
-            ParseTreeQuery::Allocator,
-        )? {
+        let alloc = match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Allocator)? {
             ParseTreeValue::Allocator(a) => a,
             other => {
                 return Err(runtime::RuntimeError::UndefinedBehavior {
@@ -121,18 +111,15 @@ where
                 });
             }
         };
-        let root_id = match <Self as Interface<Tree>>::query_layer::<Down<Here>>(
-            self,
-            rev,
-            ParseTreeQuery::Path(NodePath::root()),
-        )? {
-            ParseTreeValue::GreenId(id) => id,
-            other => {
-                return Err(runtime::RuntimeError::UndefinedBehavior {
-                    message: format!("expected GreenId, got {other:?}"),
-                });
-            }
-        };
+        let root_id =
+            match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Path(NodePath::root()))? {
+                ParseTreeValue::GreenId(id) => id,
+                other => {
+                    return Err(runtime::RuntimeError::UndefinedBehavior {
+                        message: format!("expected GreenId, got {other:?}"),
+                    });
+                }
+            };
 
         let message_text = format_messages_with_source(self.grammar, &messages, source);
         let ast_text = format_ast(self.grammar, &RedNode::root(root_id), &alloc, source);

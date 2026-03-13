@@ -162,9 +162,9 @@ pub struct BasicInterface<Tree: TypedTree> {
     _marker: PhantomData<fn() -> Tree>,
 }
 
-impl<Tree> Interface<Tree> for BasicInterface<Tree>
+impl<Tree: TypedTree> Interface<Tree> for BasicInterface<Tree>
 where
-    Tree: TypedTree + ContainsPath<Here, Target = scheme::SourceText>,
+    Tree: ContainsPath<Here, Target = scheme::SourceText>,
 {
     fn new(ged: GlobalEventDispatcher, _grammar: &'static grammar::Grammar) -> Self {
         Self {
@@ -183,11 +183,11 @@ where
     Tree: TypedTree + ContainsPath<Here, Target = scheme::SourceText>,
 {
     pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
-        <Self as Interface<Tree>>::edit_source_text(self, offset, offset, text)
+        self.edit_source_text(offset, offset, text)
     }
 
     pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
-        <Self as Interface<Tree>>::edit_source_text(self, start, end, "")
+        self.edit_source_text(start, end, "")
     }
 
     pub fn replace(
@@ -196,6 +196,6 @@ where
         end: usize,
         text: &str,
     ) -> runtime::RuntimeResult<runtime::RevisionId> {
-        <Self as Interface<Tree>>::edit_source_text(self, start, end, text)
+        self.edit_source_text(start, end, text)
     }
 }

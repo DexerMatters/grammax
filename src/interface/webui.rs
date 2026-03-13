@@ -58,9 +58,7 @@ pub struct WebPreviewInterface<Tree: TypedTree> {
 
 impl<Tree: TypedTree> Interface<Tree> for WebPreviewInterface<Tree>
 where
-    Tree: TypedTree
-        + ContainsPath<Here, Target = SourceText>
-        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
+    Tree: ContainsPath<Here, Target = SourceText> + ContainsPath<Down<Here>, Target = ParseTreeIR>,
 {
     fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self {
         Self {
@@ -165,21 +163,14 @@ where
             "api/action" => {
                 let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
                 match body {
-                    WebAction::ApplyTextEdit { span, text } => {
-                        <Self as Interface<Tree>>::edit_source_text_till::<Down<Here>>(
-                            self, span.start, span.end, &text,
-                        )
+                    WebAction::ApplyTextEdit { span, text } => self
+                        .edit_source_text_till::<Down<Here>>(span.start, span.end, &text)
                         .map(|(_, transaction)| {
                             rouille::Response::json(&commands_to_web_json(&transaction))
                         })
-                        .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500))
-                    }
+                        .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
                     WebAction::GetSource => {
-                        match <Self as Interface<Tree>>::query_source_text(
-                            self,
-                            None,
-                            utils::Span::new(0, usize::MAX),
-                        ) {
+                        match self.query_source_text(None, utils::Span::new(0, usize::MAX)) {
                             Ok(source) => rouille::Response::json(&source),
                             Err(e) => rouille::Response::json(&e).with_status_code(500),
                         }
@@ -188,7 +179,7 @@ where
                         Ok(commands) => rouille::Response::json(&commands),
                         Err(e) => rouille::Response::json(&e).with_status_code(500),
                     },
-                    WebAction::Shutdown => match <Self as Interface<Tree>>::shutdown(self) {
+                    WebAction::Shutdown => match self.shutdown() {
                         Ok(_) => rouille::Response::json(&serde_json::json!({})),
                         Err(e) => rouille::Response::json(&e).with_status_code(500),
                     },

@@ -114,10 +114,19 @@ pub struct AstArena<T> {
     _marker: PhantomData<fn() -> T>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct AstArenaStorage {
     pub(crate) nodes: Vec<Option<ErasedAstNode>>,
     pub(crate) free: Vec<usize>,
+}
+
+impl<T> Clone for AstArena<T> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: Box::new((*self.storage).clone()),
+            _marker: PhantomData,
+        }
+    }
 }
 
 pub(crate) struct ErasedAstNode {

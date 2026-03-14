@@ -5,10 +5,8 @@ use std::{
     sync::Arc,
 };
 
-use crate::testing::Generating;
-
 /// A trait representing a matcher that lexically matches a portion of the input string.
-pub trait Matcher: Debug + Generating {
+pub trait Matcher: Debug {
     /// Attempts to match the input string starting from the given position.
     ///
     /// Returns `Some(length)` if the match is successful, where `length` is the number of characters matched, and advances the position by that length.
@@ -599,20 +597,5 @@ impl Matcher for TokenizedMatcher {
 
     fn preview(&self) -> Option<&str> {
         self.inner.preview()
-    }
-}
-
-impl crate::testing::Generating for TokenizedMatcher {
-    fn generate(
-        &self,
-        generator: &mut crate::testing::Generator,
-        left: usize,
-        length: usize,
-    ) -> crate::testing::GeneratorResult {
-        self.inner.generate(generator, left, length)
-    }
-
-    fn length_spec(&self) -> crate::testing::LengthSpec {
-        self.inner.length_spec()
     }
 }

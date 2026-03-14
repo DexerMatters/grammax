@@ -1,3 +1,4 @@
+use rustc_hash::FxHashSet;
 use std::{
     any::{Any, TypeId, type_name},
     fmt,
@@ -117,7 +118,8 @@ pub struct AstArena<T> {
 #[derive(Debug, Clone)]
 pub(crate) struct AstArenaStorage {
     pub(crate) nodes: Vec<Option<ErasedAstNode>>,
-    pub(crate) free: Vec<usize>,
+    /// Set of free indices for O(1) lookup and removal in `force_alloc_at`.
+    pub(crate) free: FxHashSet<usize>,
 }
 
 impl<T> Clone for AstArena<T> {
@@ -218,7 +220,7 @@ impl<T> Default for AstArena<T> {
         Self {
             storage: Box::new(AstArenaStorage {
                 nodes: Vec::new(),
-                free: Vec::new(),
+                free: FxHashSet::default(),
             }),
             _marker: PhantomData,
         }
@@ -264,7 +266,9 @@ impl<T> AstArena<T> {
 
     pub(crate) fn insert_erased(&mut self, node: ErasedAstNode) -> ASTCell<()> {
         let node_ty = node.type_name;
-        if let Some(id) = self.storage.free.pop() {
+        // Reuse a free slot (arbitrary order is fine for correctness).
+        if let Some(&id) = self.storage.free.iter().next() {
+            self.storage.free.remove(&id);
             self.storage.nodes[id] = Some(node);
             return self.cell(id, node_ty);
         }
@@ -288,7 +292,7 @@ impl<T> AstArena<T> {
         }
         let prev = self.storage.nodes[raw].take();
         if prev.is_some() {
-            self.storage.free.push(raw);
+            self.storage.free.insert(raw);
         }
         prev
     }
@@ -318,7 +322,8 @@ impl<T> AstArena<T> {
         if index >= self.storage.nodes.len() {
             self.storage.nodes.resize_with(index + 1, || None);
         }
-        self.storage.free.retain(|&i| i != index);
+        // O(1) removal instead of O(n) retain.
+        self.storage.free.remove(&index);
         self.storage.nodes[index] = Some(node);
     }
 }

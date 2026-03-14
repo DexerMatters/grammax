@@ -1,3 +1,5 @@
+use rustc_hash::FxHashMap;
+
 use crate::scheme::{Command, IR, Transaction};
 use crate::utils::Span;
 
@@ -11,10 +13,148 @@ pub enum SourceTextError {
     NotAnInsertionPoint { span: Span },
 }
 
+// ── Gap buffer ─────────────────────────────────────────────────────────────────
+//
+// Layout: `buf[..gap_start]` = text-before-gap,
+//         `buf[gap_start..gap_end]` = unused scratch space (the "gap"),
+//         `buf[gap_end..]` = text-after-gap.
+//
+// Inserting/deleting near the last edit position is O(|delta|); moving the gap
+// costs O(distance) but is amortised O(1) for sequential (LSP-style) edits.
+
+#[derive(Debug, Clone)]
+struct GapBuf {
+    buf: Vec<u8>,
+    gap_start: usize,
+    gap_end: usize,
+}
+
+impl Default for GapBuf {
+    fn default() -> Self {
+        const INIT: usize = 256;
+        Self {
+            buf: vec![0u8; INIT],
+            gap_start: 0,
+            gap_end: INIT,
+        }
+    }
+}
+
+impl GapBuf {
+    fn from_string(s: String) -> Self {
+        const INIT: usize = 256;
+        let gap = INIT.max(s.len() / 4 + INIT);
+        let bytes = s.into_bytes();
+        let text_len = bytes.len();
+        let mut buf = vec![0u8; text_len + gap];
+        // Gap at the front; text follows.
+        buf[gap..].copy_from_slice(&bytes);
+        Self {
+            buf,
+            gap_start: 0,
+            gap_end: gap,
+        }
+    }
+
+    /// Logical byte length of the text.
+    fn len(&self) -> usize {
+        self.buf.len() - (self.gap_end - self.gap_start)
+    }
+
+    /// Move the gap to logical byte position `pos`.
+    fn move_gap_to(&mut self, pos: usize) {
+        if pos == self.gap_start {
+            return;
+        }
+        let gap_size = self.gap_end - self.gap_start;
+        if pos < self.gap_start {
+            // Shift buf[pos..gap_start] right by gap_size.
+            self.buf.copy_within(pos..self.gap_start, pos + gap_size);
+            self.gap_start = pos;
+            self.gap_end = pos + gap_size;
+        } else {
+            // pos > self.gap_start:
+            // Shift buf[gap_end..gap_end + (pos - gap_start)] left to buf[gap_start..].
+            let move_len = pos - self.gap_start;
+            self.buf
+                .copy_within(self.gap_end..self.gap_end + move_len, self.gap_start);
+            self.gap_start = pos;
+            self.gap_end += move_len;
+        }
+    }
+
+    /// Ensure the gap is at least `needed` bytes wide.
+    fn ensure_gap(&mut self, needed: usize) {
+        let current = self.gap_end - self.gap_start;
+        if current >= needed {
+            return;
+        }
+        let extra = (needed - current).max(256);
+        let old_len = self.buf.len();
+        self.buf.resize(old_len + extra, 0);
+        if self.gap_end < old_len {
+            self.buf
+                .copy_within(self.gap_end..old_len, self.gap_end + extra);
+        }
+        self.gap_end += extra;
+    }
+
+    fn insert_str(&mut self, at: usize, s: &str) {
+        let bytes = s.as_bytes();
+        self.move_gap_to(at);
+        self.ensure_gap(bytes.len());
+        self.buf[self.gap_start..self.gap_start + bytes.len()].copy_from_slice(bytes);
+        self.gap_start += bytes.len();
+    }
+
+    fn drain(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        self.move_gap_to(start);
+        // Extend the gap over the deleted region.
+        self.gap_end += end - start;
+    }
+
+    fn replace_range(&mut self, start: usize, end: usize, s: &str) {
+        self.drain(start, end);
+        if !s.is_empty() {
+            self.insert_str(start, s);
+        }
+    }
+
+    /// Materialise the full text into a `String`. O(n) in text length.
+    fn as_string(&self) -> String {
+        let mut v = Vec::with_capacity(self.len());
+        v.extend_from_slice(&self.buf[..self.gap_start]);
+        v.extend_from_slice(&self.buf[self.gap_end..]);
+        // SAFETY: Only valid UTF-8 is ever inserted (callers go through &str).
+        unsafe { String::from_utf8_unchecked(v) }
+    }
+
+    /// Return a substring `[start, end)` as a `String`.
+    fn slice(&self, start: usize, end: usize) -> String {
+        let gap_size = self.gap_end - self.gap_start;
+        let mut v = Vec::with_capacity(end - start);
+        if end <= self.gap_start {
+            v.extend_from_slice(&self.buf[start..end]);
+        } else if start >= self.gap_start {
+            v.extend_from_slice(&self.buf[start + gap_size..end + gap_size]);
+        } else {
+            v.extend_from_slice(&self.buf[start..self.gap_start]);
+            let after_len = end - self.gap_start;
+            v.extend_from_slice(&self.buf[self.gap_end..self.gap_end + after_len]);
+        }
+        unsafe { String::from_utf8_unchecked(v) }
+    }
+}
+
+// ── SourceText ────────────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Default)]
 pub struct SourceText {
-    pub text: String,
-    staging: Vec<Option<String>>,
+    gap: GapBuf,
+    staging: FxHashMap<usize, String>,
 }
 
 impl SourceText {
@@ -25,33 +165,40 @@ impl SourceText {
     /// Construct from an existing string (e.g. initial file contents).
     pub fn from_string(text: String) -> Self {
         Self {
-            text,
-            staging: Vec::new(),
+            gap: GapBuf::from_string(text),
+            staging: FxHashMap::default(),
         }
     }
 
-    // ── helpers ──────────────────────────────────────────────────────────────
+    /// Materialise the current text as a `String`. O(n) in text length;
+    /// called at most once per transaction by the downstream `ParserPass`.
+    pub fn text(&self) -> String {
+        self.gap.as_string()
+    }
+
+    // ── helpers ────────────────────────────────────────────────────────────
 
     fn ensure_staged(&self, id: usize) -> Result<&str, SourceTextError> {
         self.staging
-            .get(id)
-            .and_then(|s| s.as_deref())
+            .get(&id)
+            .map(|s| s.as_str())
             .ok_or(SourceTextError::UnknownStagingId(id))
     }
 
     fn validate_span(&self, span: Span) -> Result<(), SourceTextError> {
-        if span.start <= span.end && span.end <= self.text.len() {
+        let len = self.gap.len();
+        if span.start <= span.end && span.end <= len {
             Ok(())
         } else {
             Err(SourceTextError::InvalidSpan {
                 span,
-                text_len: self.text.len(),
+                text_len: len,
             })
         }
     }
 
     fn clamp_span(&self, span: Span) -> Span {
-        let len = self.text.len();
+        let len = self.gap.len();
         let start = span.start.min(len);
         let end = span.end.min(len);
         Span::new(start.min(end), end)
@@ -70,7 +217,7 @@ impl IR for SourceText {
     fn query(&self, index: Span) -> Result<String, Self::Error> {
         let span = self.clamp_span(index);
         self.validate_span(span)?;
-        Ok(self.text[span.start..span.end].to_owned())
+        Ok(self.gap.slice(span.start, span.end))
     }
 
     /// Clears staging table then applies the transaction directly.
@@ -79,29 +226,26 @@ impl IR for SourceText {
         for command in transaction.iter() {
             match command {
                 Command::Create { id, value } => {
-                    if *id >= self.staging.len() {
-                        self.staging.resize(*id + 1, None);
-                    }
-                    self.staging[*id] = Some(value.clone());
+                    self.staging.insert(*id, value.clone());
                 }
                 Command::Insert { index, id } => {
                     if index.start != index.end {
                         return Err(SourceTextError::NotAnInsertionPoint { span: *index });
                     }
-                    let at = index.start.min(self.text.len());
+                    let at = index.start.min(self.gap.len());
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.text.insert_str(at, &fragment);
+                    self.gap.insert_str(at, &fragment);
                 }
                 Command::Delete { index } => {
                     let span = self.clamp_span(*index);
                     self.validate_span(span)?;
-                    self.text.drain(span.start..span.end);
+                    self.gap.drain(span.start, span.end);
                 }
                 Command::Replace { index, id } => {
                     let span = self.clamp_span(*index);
                     self.validate_span(span)?;
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.text.replace_range(span.start..span.end, &fragment);
+                    self.gap.replace_range(span.start, span.end, &fragment);
                 }
                 Command::SetRoot { .. } => {} // text has no root concept
             }

@@ -1,4 +1,5 @@
 use crate::new_grammar;
+use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
 use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
@@ -96,8 +97,12 @@ fn test_json() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = r#"{
-"a"#;
+    let text = r#"
+{
+"key1": "value1",
+"key2": 123
+}
+"#;
     let result = parser.parse_text(text);
 
     println!("AST:\n{}", result.format_ast());

@@ -709,21 +709,13 @@ impl Zipper {
             child_green = new_parent_green;
         }
 
+        // Only the new root RedNode is needed; the intermediate ancestor chain
+        // is not used by callers, so we do not construct it.
         let root = Rc::new(RedNode {
             parent: None,
             offset: self.steps[0].parent.offset,
             green: ancestor_greens[0],
         });
-
-        let mut chain_parent = root.clone();
-        for (ix, step) in self.steps.iter().enumerate().skip(1) {
-            let next = Rc::new(RedNode {
-                parent: Some(chain_parent),
-                offset: step.parent.offset,
-                green: ancestor_greens[ix],
-            });
-            chain_parent = next;
-        }
 
         ReplaceResult { root }
     }

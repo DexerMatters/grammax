@@ -1,3 +1,5 @@
+use rustc_hash::FxHashMap;
+
 use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
@@ -54,7 +56,8 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         upstream: &SourceText,
         txn: scheme::Transaction<SourceText>,
     ) -> Result<scheme::Transaction<ParseTreeIR>, Self::Error> {
-        let new_text = &upstream.text;
+        let new_text_owned = upstream.text();
+        let new_text = new_text_owned.as_str();
 
         let edit = extract_edit(&txn);
 
@@ -94,32 +97,37 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
 }
 
 fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
-    // Collect staged string lengths indexed by Create id.
-    let mut staged_len: Vec<usize> = Vec::new();
+    // Collect staged string lengths for Create commands.
+    let mut staged_len: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut edit_count = 0usize;
+    let mut result = None;
 
     for cmd in txn {
         match cmd {
             scheme::Command::Create { id, value } => {
-                if *id >= staged_len.len() {
-                    staged_len.resize(*id + 1, 0);
-                }
-                staged_len[*id] = value.len();
+                staged_len.insert(*id, value.len());
             }
             scheme::Command::Delete { index: span } => {
-                return Some((*span, 0));
+                edit_count += 1;
+                result = Some((*span, 0));
             }
             scheme::Command::Insert { index: span, id } => {
-                let new_len = staged_len.get(*id).copied().unwrap_or(0);
-                return Some((*span, new_len));
+                let new_len = staged_len.get(id).copied().unwrap_or(0);
+                edit_count += 1;
+                result = Some((*span, new_len));
             }
             scheme::Command::Replace { index: span, id } => {
-                let new_len = staged_len.get(*id).copied().unwrap_or(0);
-                return Some((*span, new_len));
+                let new_len = staged_len.get(id).copied().unwrap_or(0);
+                edit_count += 1;
+                result = Some((*span, new_len));
             }
             scheme::Command::SetRoot { .. } => {}
         }
     }
-    None
+
+    // Only use incremental reparse for exactly one edit; multi-edit batches
+    // fall through to full reparse to avoid incorrect partial-edit hints.
+    if edit_count == 1 { result } else { None }
 }
 
 /// Prepend a `ParseNodeValue::Messages` Create command (id=0) carrying the

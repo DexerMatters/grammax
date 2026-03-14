@@ -723,16 +723,18 @@ fn emit_lcs_diff(
     let new_mid = &new_children[new_mid_start..new_mid_end];
     let m = old_mid.len();
     let n = new_mid.len();
+    let cols = n + 1;
 
-    // Compute LCS lengths table using greens_align_equivalent
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    // Flat LCS lengths table: dp[i * cols + j] instead of dp[i][j].
+    let mut dp = vec![0usize; (m + 1) * cols];
     for i in (0..m).rev() {
         for j in (0..n).rev() {
-            dp[i][j] = if greens_align_equivalent(alloc, old_mid[i], new_mid[j], align_cache) {
-                1 + dp[i + 1][j + 1]
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
+            dp[i * cols + j] =
+                if greens_align_equivalent(alloc, old_mid[i], new_mid[j], align_cache) {
+                    1 + dp[(i + 1) * cols + (j + 1)]
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+                };
         }
     }
 
@@ -747,7 +749,7 @@ fn emit_lcs_diff(
             matched_pairs.push((i, j));
             i += 1;
             j += 1;
-        } else if j >= n || (i < m && dp[i + 1][j] >= dp[i][j + 1]) {
+        } else if j >= n || (i < m && dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)]) {
             unmatched_old.push(i);
             i += 1;
         } else {
@@ -850,136 +852,94 @@ fn common_suffix_len(
     suffix
 }
 
+/// Shared implementation for both equivalence checks.
+/// `check_width`: if true, nodes must also have equal widths (full structural equality);
+///               if false, only tag and child-count must match (alignment equivalence).
+fn greens_compare(
+    alloc: &TreeAllocRef,
+    old_green: usize,
+    new_green: usize,
+    check_width: bool,
+    cache: &mut FxHashMap<(usize, usize), bool>,
+) -> bool {
+    if old_green == new_green {
+        return true;
+    }
+
+    if let Some(&cached) = cache.get(&(old_green, new_green)) {
+        return cached;
+    }
+
+    let mut stack = vec![(old_green, new_green, false)];
+    while let Some((old_g, new_g, expanded)) = stack.pop() {
+        if old_g == new_g {
+            cache.insert((old_g, new_g), true);
+            continue;
+        }
+        if cache.contains_key(&(old_g, new_g)) {
+            continue;
+        }
+
+        let old_node = alloc.get_node(old_g);
+        let new_node = alloc.get_node(new_g);
+
+        let tag_ok = old_node.tag == new_node.tag;
+        let width_ok = !check_width || old_node.width == new_node.width;
+        let len_ok = old_node.children.len() == new_node.children.len();
+
+        if !tag_ok || !width_ok || !len_ok {
+            cache.insert((old_g, new_g), false);
+            continue;
+        }
+
+        if !expanded {
+            let child_pairs: Vec<_> = old_node
+                .children
+                .iter()
+                .copied()
+                .zip(new_node.children.iter().copied())
+                .collect();
+            drop(old_node);
+            drop(new_node);
+            stack.push((old_g, new_g, true));
+            for (old_child, new_child) in child_pairs.into_iter().rev() {
+                if !cache.contains_key(&(old_child, new_child)) {
+                    stack.push((old_child, new_child, false));
+                }
+            }
+            continue;
+        }
+
+        let equivalent = old_node
+            .children
+            .iter()
+            .copied()
+            .zip(new_node.children.iter().copied())
+            .all(|(oc, nc)| cache.get(&(oc, nc)).copied().unwrap_or(false));
+        cache.insert((old_g, new_g), equivalent);
+    }
+
+    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
+}
+
+#[inline]
 fn greens_equivalent(
     alloc: &TreeAllocRef,
     old_green: usize,
     new_green: usize,
     cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
-    if old_green == new_green {
-        return true;
-    }
-
-    if let Some(&cached) = cache.get(&(old_green, new_green)) {
-        return cached;
-    }
-
-    let mut stack = vec![(old_green, new_green, false)];
-    while let Some((old_green, new_green, expanded)) = stack.pop() {
-        if old_green == new_green {
-            cache.insert((old_green, new_green), true);
-            continue;
-        }
-        if cache.contains_key(&(old_green, new_green)) {
-            continue;
-        }
-
-        let old_node = alloc.get_node(old_green);
-        let new_node = alloc.get_node(new_green);
-
-        if old_node.tag != new_node.tag
-            || old_node.width != new_node.width
-            || old_node.children.len() != new_node.children.len()
-        {
-            cache.insert((old_green, new_green), false);
-            continue;
-        }
-
-        if !expanded {
-            let child_pairs: Vec<_> = old_node
-                .children
-                .iter()
-                .copied()
-                .zip(new_node.children.iter().copied())
-                .collect();
-            drop(old_node);
-            drop(new_node);
-
-            stack.push((old_green, new_green, true));
-            for (old_child, new_child) in child_pairs.into_iter().rev() {
-                if !cache.contains_key(&(old_child, new_child)) {
-                    stack.push((old_child, new_child, false));
-                }
-            }
-            continue;
-        }
-
-        let equivalent = old_node
-            .children
-            .iter()
-            .copied()
-            .zip(new_node.children.iter().copied())
-            .all(|(old_child, new_child)| {
-                cache.get(&(old_child, new_child)).copied().unwrap_or(false)
-            });
-        cache.insert((old_green, new_green), equivalent);
-    }
-
-    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
+    greens_compare(alloc, old_green, new_green, true, cache)
 }
 
+#[inline]
 fn greens_align_equivalent(
     alloc: &TreeAllocRef,
     old_green: usize,
     new_green: usize,
     cache: &mut FxHashMap<(usize, usize), bool>,
 ) -> bool {
-    if old_green == new_green {
-        return true;
-    }
-
-    if let Some(&cached) = cache.get(&(old_green, new_green)) {
-        return cached;
-    }
-
-    let mut stack = vec![(old_green, new_green, false)];
-    while let Some((old_green, new_green, expanded)) = stack.pop() {
-        if old_green == new_green {
-            cache.insert((old_green, new_green), true);
-            continue;
-        }
-        if cache.contains_key(&(old_green, new_green)) {
-            continue;
-        }
-
-        let old_node = alloc.get_node(old_green);
-        let new_node = alloc.get_node(new_green);
-
-        if old_node.tag != new_node.tag || old_node.children.len() != new_node.children.len() {
-            cache.insert((old_green, new_green), false);
-            continue;
-        }
-
-        if !expanded {
-            let child_pairs: Vec<_> = old_node
-                .children
-                .iter()
-                .copied()
-                .zip(new_node.children.iter().copied())
-                .collect();
-            drop(old_node);
-            drop(new_node);
-            stack.push((old_green, new_green, true));
-            for (old_child, new_child) in child_pairs.into_iter().rev() {
-                if !cache.contains_key(&(old_child, new_child)) {
-                    stack.push((old_child, new_child, false));
-                }
-            }
-            continue;
-        }
-
-        let equivalent = old_node
-            .children
-            .iter()
-            .copied()
-            .zip(new_node.children.iter().copied())
-            .all(|(old_child, new_child)| {
-                cache.get(&(old_child, new_child)).copied().unwrap_or(false)
-            });
-        cache.insert((old_green, new_green), equivalent);
-    }
-
-    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
+    greens_compare(alloc, old_green, new_green, false, cache)
 }
 
 fn emit_create_commands_from_green(

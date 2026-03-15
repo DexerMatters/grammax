@@ -6,12 +6,15 @@ use crate::{
     parsec::{
         msg::{ErrorMessage, ParserMessage, ParserMessages},
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
+        view::Viewer,
     },
     scheme::{self, IR},
     utils::Span,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Default, Serialize, serde::Deserialize,
+)]
 pub struct NodePath(pub Vec<usize>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
@@ -31,6 +34,14 @@ impl Default for ParseTreeQuery {
 impl NodePath {
     pub fn root() -> Self {
         Self(Vec::new())
+    }
+
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
+        self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(a, b)| a == b)
+    }
+
+    pub fn overlaps_subtree(&self, other: &Self) -> bool {
+        self.is_prefix_of(other) || other.is_prefix_of(self)
     }
 
     pub fn parent(&self) -> Option<Self> {
@@ -184,7 +195,36 @@ impl ParseTreeIR {
     }
 
     fn width_of(&self, green: usize) -> usize {
-        self.alloc.get_node(green).width
+        self.alloc.width_of(green)
+    }
+
+    pub fn viewer(&self, grammar: &'static crate::grammar::Grammar) -> Viewer {
+        Viewer::new(grammar, self.alloc.clone(), String::new())
+            .with_token_texts(self.token_text.clone())
+    }
+
+    pub fn token_text_of(&self, green: usize) -> Option<&str> {
+        self.token_text.get(&green).map(String::as_str)
+    }
+
+    pub fn offset_at_path(&self, path: &NodePath) -> Option<usize> {
+        let mut current = self.root?;
+        let mut offset = 0;
+        for &ix in &path.0 {
+            let node = self.alloc.node(current);
+            if ix > node.children.len() {
+                return None;
+            }
+            offset += node
+                .children
+                .iter()
+                .take(ix)
+                .map(|&child| self.alloc.width_of(child))
+                .sum::<usize>();
+            let next = *node.children.get(ix)?;
+            current = next;
+        }
+        Some(offset)
     }
 
     fn alloc_from_value(&mut self, value: &ParseNodeValue) -> Option<usize> {
@@ -237,7 +277,7 @@ impl ParseTreeIR {
         };
 
         if parent_path.is_empty() {
-            let node = self.alloc.get_node(current);
+            let node = self.alloc.node(current);
             let mut children = node.children.clone();
             let tag = node.tag.clone();
             let old = current;
@@ -259,7 +299,7 @@ impl ParseTreeIR {
 
         let mut spine: Vec<(usize, usize)> = Vec::new();
         for &ix in parent_path {
-            let node = self.alloc.get_node(current);
+            let node = self.alloc.node(current);
             if ix >= node.children.len() {
                 return;
             }
@@ -269,7 +309,7 @@ impl ParseTreeIR {
             current = next;
         }
 
-        let node = self.alloc.get_node(current);
+        let node = self.alloc.node(current);
         let mut children = node.children.clone();
         let tag = node.tag.clone();
         let old_leaf = current;
@@ -287,7 +327,7 @@ impl ParseTreeIR {
         }
 
         for (ancestor, child_ix) in spine.into_iter().rev() {
-            let node = self.alloc.get_node(ancestor);
+            let node = self.alloc.node(ancestor);
             let mut children = node.children.clone();
             let tag = node.tag.clone();
             drop(node);
@@ -333,7 +373,7 @@ impl ParseTreeIR {
     pub fn green_at_path(&self, path: &NodePath) -> Option<usize> {
         let mut current = self.root?;
         for &ix in &path.0 {
-            let node = self.alloc.get_node(current);
+            let node = self.alloc.node(current);
             if ix >= node.children.len() {
                 return None;
             }
@@ -343,7 +383,7 @@ impl ParseTreeIR {
     }
 
     pub fn value_of_green(&self, green: usize) -> ParseNodeValue {
-        let node = self.alloc.get_node(green);
+        let node = self.alloc.node(green);
         let field = self.fields.get(&green).cloned().unwrap_or_default();
         match &node.tag {
             Tag::Token { rule_ix } => ParseNodeValue::Token {
@@ -378,7 +418,7 @@ impl ParseTreeIR {
         // Iterative DFS to avoid stack overflow on deep/right-skewed trees.
         let mut stack: Vec<(usize, usize)> = vec![(root, root_offset)];
         while let Some((green, offset)) = stack.pop() {
-            let node = self.alloc.get_node(green);
+            let node = self.alloc.node(green);
             let tag = node.tag.clone();
             let width = node.width;
             // Compute child offsets before dropping the node borrow.
@@ -387,7 +427,7 @@ impl ParseTreeIR {
                 node.children
                     .iter()
                     .map(|&child| {
-                        let w = self.alloc.get_node(child).width;
+                        let w = self.alloc.width_of(child);
                         let spec = (child, child_offset);
                         child_offset = child_offset.saturating_add(w);
                         spec
@@ -447,7 +487,7 @@ impl ParseTreeIR {
         let mut stack = vec![root];
         while let Some(green) = stack.pop() {
             if live.insert(green) {
-                let node = self.alloc.get_node(green);
+                let node = self.alloc.node(green);
                 for &child in &node.children {
                     stack.push(child);
                 }

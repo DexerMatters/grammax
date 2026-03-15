@@ -54,6 +54,7 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
     fn transform(
         &mut self,
         upstream: &SourceText,
+        downstream: &ParseTreeIR,
         txn: scheme::Transaction<SourceText>,
     ) -> Result<scheme::Transaction<ParseTreeIR>, Self::Error> {
         let new_text_owned = upstream.text();
@@ -61,16 +62,11 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
 
         let edit = extract_edit(&txn);
 
-        if let Some((span, new_len)) = edit {
-            // A span that starts at 0 and covers the entire current text is a
-            // "replace-all" (e.g. the CLI submitting a full buffer, or the very
-            // first character typed into an empty document).  No incremental
-            // candidate can help here — always use the full-reparse path so the
-            // CST layer receives a correct root-setting Insert command.
-            let old_len = self.parser.text().len();
-            let is_replace_all = span.start == 0 && span.end >= old_len;
-
-            if !is_replace_all {
+        // Only attempt incremental re-parse when a CST already exists.
+        // `downstream.root.is_some()` is the ground truth: if no CST root has
+        // been set yet the reparser has nothing to reuse, and we must full-parse.
+        if downstream.root.is_some() {
+            if let Some((span, new_len)) = edit {
                 let result =
                     self.reparser
                         .handle_edit(&mut self.parser, span, new_len, new_text, None);

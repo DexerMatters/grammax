@@ -1,6 +1,6 @@
 use rustc_hash::FxHashMap;
 use serde::Serialize;
-use std::cell::{self, RefCell};
+use std::cell::UnsafeCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
@@ -165,14 +165,18 @@ pub struct TreeAlloc {
 }
 
 /// A shared reference to the tree allocator.
-pub type TreeAllocRef = Rc<RefCell<TreeAlloc>>;
+pub type TreeAllocRef = Rc<UnsafeCell<TreeAlloc>>;
 
 /// A trait that extends the functionality of the tree allocator reference, providing methods for creating and managing green nodes.
 pub trait TreeAllocRefExt {
     /// Creates a new tree allocator reference.
     fn create() -> Self;
-    /// Retrieves a reference to a green node by its ID.
-    fn get_node(&self, id: GreenId) -> cell::Ref<'_, GreenNode>;
+    /// Retrieves a cloned green node snapshot by its ID.
+    fn get_node(&self, id: GreenId) -> GreenNode;
+    /// Clones a green node snapshot by its ID, avoiding long-lived `RefCell` borrows.
+    fn node(&self, id: GreenId) -> GreenNode;
+    /// Reads a green node width without exposing the underlying borrow.
+    fn width_of(&self, id: GreenId) -> usize;
     /// Allocates a new token node with the given tag and width, returning its ID.
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId;
     /// Allocates a new node with the given tag, children, and width, returning its ID.
@@ -183,14 +187,25 @@ pub trait TreeAllocRefExt {
 
 impl TreeAllocRefExt for TreeAllocRef {
     fn create() -> Self {
-        Rc::new(RefCell::new(TreeAlloc {
+        Rc::new(UnsafeCell::new(TreeAlloc {
             nodes: Vec::new(),
             dedup: FxHashMap::default(),
         }))
     }
 
-    fn get_node(&self, id: GreenId) -> cell::Ref<'_, GreenNode> {
-        cell::Ref::map(self.borrow(), |alloc| &alloc.nodes[id])
+    fn get_node(&self, id: GreenId) -> GreenNode {
+        // SAFETY: TreeAllocRef is single-threaded (`Rc`) and tree reads return owned clones,
+        // so no references to inner storage escape across mutation boundaries.
+        unsafe { (&*self.get()).nodes[id].clone() }
+    }
+
+    fn node(&self, id: GreenId) -> GreenNode {
+        self.get_node(id)
+    }
+
+    fn width_of(&self, id: GreenId) -> usize {
+        // SAFETY: see `get_node`.
+        unsafe { (&*self.get()).nodes[id].width }
     }
 
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId {
@@ -213,7 +228,8 @@ impl TreeAllocRefExt for TreeAllocRef {
             let hash = hasher.finish();
 
             {
-                let borrowed = self.borrow();
+                // SAFETY: see `get_node`.
+                let borrowed = unsafe { &*self.get() };
                 if let Some(indices) = borrowed.dedup.get(&hash) {
                     for &idx in indices {
                         if borrowed.nodes[idx] == node {
@@ -223,13 +239,15 @@ impl TreeAllocRefExt for TreeAllocRef {
                 }
             }
 
-            let mut borrowed = self.borrow_mut();
+            // SAFETY: see `get_node`.
+            let borrowed = unsafe { &mut *self.get() };
             let idx = borrowed.nodes.len();
             borrowed.nodes.push(node);
             borrowed.dedup.entry(hash).or_default().push(idx);
             idx
         } else {
-            let mut borrowed = self.borrow_mut();
+            // SAFETY: see `get_node`.
+            let borrowed = unsafe { &mut *self.get() };
             let idx = borrowed.nodes.len();
             borrowed.nodes.push(node);
             idx

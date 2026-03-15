@@ -592,7 +592,7 @@ trait InstallTree: TypedTree + Sized {
     ) where
         Self::Current: Send + 'static,
         SourceText: Send + 'static,
-        <Self::Current as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <Self::Current as IR>::Value: Clone + Send + Sync + 'static,
         <Self::Current as IR>::Error: Send + fmt::Debug + 'static;
 }
 
@@ -600,7 +600,7 @@ impl<U> InstallTree for End<U>
 where
     U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    U::Value: Clone + Send + Sync + Serialize + 'static,
+    U::Value: Clone + Send + Sync + 'static,
     U::Error: Send + fmt::Debug + 'static,
 {
     fn install(
@@ -649,12 +649,12 @@ impl<U, P, Left> InstallTree for Then<U, P, Left>
 where
     U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    U::Value: Clone + Send + Sync + Serialize + 'static,
+    U::Value: Clone + Send + Sync + 'static,
     U::Error: Send + fmt::Debug + 'static,
     Left: InstallTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
     <Left::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    <Left::Current as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+    <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Error: Send + fmt::Debug + 'static,
     P: scheme::Pass<U, Left::Current> + Send + 'static,
     P::Error: Send + fmt::Debug + 'static,
@@ -692,17 +692,17 @@ impl<U, P1, Left, P2, Right> InstallTree for Fork<U, P1, Left, P2, Right>
 where
     U: IR + Clone + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    U::Value: Clone + Send + Sync + Serialize + 'static,
+    U::Value: Clone + Send + Sync + 'static,
     U::Error: Send + fmt::Debug + 'static,
     Left: InstallTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
     <Left::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    <Left::Current as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+    <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Error: Send + fmt::Debug + 'static,
     Right: InstallTree + SeededTree + TypedTree + 'static,
     Right::Current: IR + Clone + Send + 'static,
     <Right::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    <Right::Current as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+    <Right::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Right::Current as IR>::Error: Send + fmt::Debug + 'static,
     P1: scheme::Pass<U, Left::Current> + Send + 'static,
     P1::Error: Send + fmt::Debug + 'static,
@@ -789,7 +789,7 @@ pub trait BuildTree: TypedTree + Sized {
         Self: TypedTree<Current = SourceText> + 'static,
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Error: Send + fmt::Debug + 'static;
 
     fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Self, I>
@@ -798,7 +798,7 @@ pub trait BuildTree: TypedTree + Sized {
         Self: TypedTree<Current = SourceText> + Send + 'static,
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Error: Send + fmt::Debug + 'static;
 }
 
@@ -811,7 +811,7 @@ where
         Self: TypedTree<Current = SourceText> + 'static,
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Error: Send + fmt::Debug + 'static,
     {
         ComposedCompiler::from_tree(self)
@@ -823,7 +823,7 @@ where
         Self: TypedTree<Current = SourceText> + Send + 'static,
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Error: Send + fmt::Debug + 'static,
     {
         RuntimeService::<Self, I>::new(grammar, move |evt_tx| {
@@ -849,11 +849,11 @@ fn connect_stage<U, D, P>(
 where
     U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    U::Value: Clone + Send + Sync + Serialize + 'static,
+    U::Value: Clone + Send + Sync + 'static,
     U::Error: Send + fmt::Debug + 'static,
     D: IR + Send + 'static,
     D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-    D::Value: Clone + Send + Sync + Serialize + 'static,
+    D::Value: Clone + Send + Sync + 'static,
     D::Error: Send + fmt::Debug + 'static,
     P: scheme::Pass<U, D> + Send + 'static,
     P::Error: Send + fmt::Debug + 'static,
@@ -877,7 +877,7 @@ where
         Arc::new(move |index| query_handle_any::<U>(&upstream_query, index)),
     );
 
-    let downstream_query = pipeline.downstream.query_handle();
+    let downstream_query = pipeline.downstream_query_handle();
     core.insert_query(
         downstream_layer_path.clone(),
         Arc::new({
@@ -1004,7 +1004,10 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         let span = Span::new(0, self.source_len);
         let index = serde_json::to_value(span).ok()?;
         let payload = self
-            .query(self.source_layer_path.clone(), utils::Payload::new(index))
+            .query(
+                self.source_layer_path.clone(),
+                utils::Payload::new_serializable(index),
+            )
             .ok()?;
         payload.downcast::<String>()
     }
@@ -1044,7 +1047,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         Tree: InstallTree + TypedTree<Current = SourceText> + 'static,
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Error: Send + fmt::Debug + 'static,
     {
         Self::from_tree_with_events(spec, None)
@@ -1058,7 +1061,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         Tree: InstallTree + TypedTree<Current = SourceText> + 'static,
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + Serialize + 'static,
+        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Error: Send + fmt::Debug + 'static,
     {
         let layer_path = RuntimePath::root();
@@ -1128,7 +1131,7 @@ fn query_handle_any<R>(
 where
     R: IR,
     R::Ix: DeserializeOwned + Clone + 'static,
-    R::Value: Serialize + Send + Sync + 'static,
+    R::Value: Send + Sync + 'static,
     R::Error: fmt::Debug,
 {
     let typed_index: R::Ix = if let Some(ix) = index.downcast_ref::<R::Ix>() {
@@ -1165,7 +1168,7 @@ fn send_layer_event<R>(
 ) where
     R: IR + 'static,
     R::Ix: Serialize + Clone + Send + Sync + 'static,
-    R::Value: Serialize + Clone + Send + Sync + 'static,
+    R::Value: Clone + Send + Sync + 'static,
 {
     let Some(sender) = clone_event_sender(sender) else {
         return;
@@ -1209,7 +1212,7 @@ fn send_runtime_error_text(
         layer_path: RuntimePath::root(),
         pass_path: RuntimePath::root(),
         is_error: true,
-        payload: utils::Payload::new(serde_json::json!({ "message": msg })),
+        payload: utils::Payload::new_serializable(serde_json::json!({ "message": msg })),
     });
 }
 

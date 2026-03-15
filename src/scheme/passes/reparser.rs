@@ -145,6 +145,7 @@ impl Reparser {
         }
 
         let old_messages = parser.messages.clone();
+        let previous_source_text = parser.text().to_string();
         parser.messages.clear();
         parser.newly_computed_nodes.clear();
         parser.newly_computed_tokens.clear();
@@ -206,6 +207,7 @@ impl Reparser {
                     root_candidate,
                     &old_messages,
                     delta,
+                    &previous_source_text,
                     source_text,
                     metrics.as_deref_mut(),
                 );
@@ -380,6 +382,7 @@ impl Reparser {
                 candidate,
                 &old_messages,
                 delta,
+                &previous_source_text,
                 source_text,
                 metrics.as_deref_mut(),
             );
@@ -477,6 +480,7 @@ impl Reparser {
         candidate: StrategyCandidate,
         old_messages: &ParserMessages,
         delta: isize,
+        old_source_text: &str,
         new_source_text: &str,
         mut metrics: Option<&mut EditMetrics>,
     ) -> EditResult {
@@ -553,6 +557,8 @@ impl Reparser {
             candidate.zipper.node.green,
             candidate.green,
             candidate.zipper.offset,
+            candidate.zipper.offset,
+            old_source_text,
             new_source_text,
             self.current.parent.is_none(),
         );

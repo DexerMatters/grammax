@@ -1,10 +1,16 @@
 #[cfg(feature = "webui")]
+use color_print::cprintln;
+
+#[cfg(feature = "webui")]
 use crate::{
     interface::BasicInterface,
     new_grammar,
-    parsec::words::*,
+    parsec::{view::NodeView, words::*},
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
-    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue},
+    scheme::{
+        layers::{AstArena, AstCell, NodePath, ParseTreeIR},
+        passes::{AstMapper, IncrementalLowerer},
+    },
 };
 
 #[cfg(feature = "webui")]
@@ -59,6 +65,39 @@ fn test_tap_prints_cst_commands() {
 #[cfg(feature = "webui")]
 #[test]
 fn test_arith_commands() {
+    #[derive(Debug, Clone, PartialEq)]
+    enum Expr {
+        Num(usize),
+        Add(AstCell<Expr>, AstCell<Expr>),
+        Mul(AstCell<Expr>, AstCell<Expr>),
+        Error,
+    }
+
+    let mapper = AstMapper::new()
+        .skip_rule("start")
+        .on_error(|ctx, _node| Some(ctx.emit(Expr::Error)))
+        .on_rule("expr", |ctx, node| ctx.forward_first_child(node))
+        .on_rule("primary", |ctx, node| {
+            if let Some(expr_node) = node.try_first_with_rule("expr") {
+                return Some(ctx.forward(expr_node));
+            }
+            let token = node.each().iter().find(|c| c.token_name().is_some())?;
+            let num: usize = ctx.read_text(token).parse().unwrap_or(0);
+            Some(ctx.emit(Expr::Num(num)))
+        })
+        .on_field("lhs:", |ctx, node| ctx.forward_first_child(node))
+        .on_field("rhs:", |ctx, node| ctx.forward_first_child(node))
+        .on_rule("add", |ctx, node| {
+            let lhs = ctx.read_cell(node.try_first_with_field("lhs:")?)?;
+            let rhs = ctx.read_cell(node.try_first_with_field("rhs:")?)?;
+            Some(ctx.emit(Expr::Add(lhs, rhs)))
+        })
+        .on_rule("mul", |ctx, node| {
+            let lhs = ctx.read_cell(node.try_first_with_field("lhs:")?)?;
+            let rhs = ctx.read_cell(node.try_first_with_field("rhs:")?)?;
+            Some(ctx.emit(Expr::Mul(lhs, rhs)))
+        });
+
     let grammar = new_grammar!(
         start where
         start -> r!(expr) + tt(EndOfInput)
@@ -68,23 +107,30 @@ fn test_arith_commands() {
         primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
     );
 
-    let pass = CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
-    let observer = pass.observe::<Down<Here>>();
+    let pass = CompilerBuilder::new()
+        .then(ParserPass::new(grammar), ParseTreeIR::default())
+        .then(IncrementalLowerer::new(grammar, mapper), AstArena::new());
+    let parser_observer = pass.observe::<Down<Here>>();
+    let observer = pass.observe::<Down<Down<Here>>>();
+
+    thread::spawn(move || {
+        while let Some(transaction) = parser_observer.recv() {
+            println!("======Received CST transaction:");
+            for cmd in transaction.iter() {
+                cprintln!("<yellow>CST Command: {:?}</>", cmd);
+            }
+        }
+    });
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
-            println!("======Current parse tree:");
-            let result = observer.query(ParseTreeQuery::Path(NodePath::root()));
-            let tree = result.expect("Runtime query failed");
-            let green_id = match &tree {
-                ParseTreeValue::GreenId(id) => id,
-                other => panic!("expected GreenId, got {other:?}"),
+            let Ok(result) = observer.query(NodePath::root()) else {
+                continue;
             };
-            println!("GreenId at root: {:?}", green_id);
-
-            println!("======Received transaction:");
+            println!("=== Current AST: {:?} ===", result);
+            println!("======Received AST transaction:");
             for cmd in transaction.iter() {
-                println!("{:?}", cmd);
+                cprintln!("<green>AST Command: {:?}</>", cmd);
             }
         }
     });
@@ -92,6 +138,6 @@ fn test_arith_commands() {
     let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
 
     runtime.insert(0, "1 + 2 * 3").unwrap();
-    runtime.replace(0, 1, "4").unwrap();
-    thread::sleep(std::time::Duration::from_millis(100));
+    runtime.replace(0, 1, "x").unwrap();
+    thread::sleep(std::time::Duration::from_millis(10));
 }

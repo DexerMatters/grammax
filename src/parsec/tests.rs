@@ -59,7 +59,7 @@ fn test_simple_arithmetic_precedence() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "ddd+5";
+    let text = "s+3";
     let result = parser.parse_text(text);
 
     let output = result.format_ast();

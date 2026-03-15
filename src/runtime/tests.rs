@@ -32,10 +32,7 @@ fn test_json() {
 
     let compiler = CompilerBuilder::new()
         .then(ParserPass::new(grammar), ParseTreeIR::default())
-        .then(
-            IncrementalLowerer::new(grammar, ()),
-            AstArena::<()>::default(),
-        );
+        .then(IncrementalLowerer::new(grammar, ()), AstArena::default());
 
     let compiler = compiler.build_runtime::<BasicInterface<_>>(grammar);
 

@@ -352,16 +352,26 @@ fn json_for<T: serde::Serialize + 'static>(any: &dyn Any) -> serde_json::Value {
 
 struct Inner {
     data: Box<dyn Any + Send + Sync>,
-    to_json: fn(&dyn Any) -> serde_json::Value,
+    to_json: Option<fn(&dyn Any) -> serde_json::Value>,
+    type_name: &'static str,
 }
 
 pub(crate) struct Payload(Box<Inner>);
 
 impl Payload {
-    pub fn new<T: serde::Serialize + Send + Sync + 'static>(value: T) -> Self {
+    pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
         Self(Box::new(Inner {
             data: Box::new(value),
-            to_json: json_for::<T>,
+            to_json: None,
+            type_name: std::any::type_name::<T>(),
+        }))
+    }
+
+    pub fn new_serializable<T: serde::Serialize + Send + Sync + 'static>(value: T) -> Self {
+        Self(Box::new(Inner {
+            data: Box::new(value),
+            to_json: Some(json_for::<T>),
+            type_name: std::any::type_name::<T>(),
         }))
     }
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
@@ -384,7 +394,10 @@ impl Payload {
     }
 
     pub fn to_json(&self) -> serde_json::Value {
-        (self.0.to_json)(self.0.data.as_ref())
+        self.0
+            .to_json
+            .map(|to_json| to_json(self.0.data.as_ref()))
+            .unwrap_or(serde_json::Value::Null)
     }
 }
 
@@ -396,7 +409,11 @@ impl serde::Serialize for Payload {
 
 impl std::fmt::Debug for Payload {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Payload({:?})", self.to_json())
+        if self.0.to_json.is_some() {
+            write!(f, "Payload({:?})", self.to_json())
+        } else {
+            write!(f, "Payload(<opaque:{}>)", self.0.type_name)
+        }
     }
 }
 

@@ -42,8 +42,7 @@ pub trait Interface<Tree: TypedTree> {
     ) -> runtime::RuntimeResult<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value>
     where
         Tree: ContainsPath<Path>,
-        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value:
-            Serialize + Send + Sync + 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value: Send + Sync + 'static,
         <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
         Self: Sized,
     {
@@ -52,7 +51,7 @@ pub trait Interface<Tree: TypedTree> {
             runtime::RuntimeRequest::QueryLayer {
                 layer_path: <Tree as ContainsPath<Path>>::runtime_path(),
                 revision,
-                index: utils::Payload::new(index),
+                index: utils::Payload::new_serializable(index),
             },
         )? {
             runtime::RuntimeSignal::QueryResult { value, .. } => value

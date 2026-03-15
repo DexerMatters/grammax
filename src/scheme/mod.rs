@@ -80,9 +80,15 @@ pub trait IR {
 pub trait Pass<U: IR, D: IR> {
     type Error;
 
+    /// Transform an upstream transaction into a downstream transaction.
+    ///
+    /// `upstream` is the upstream IR **after** the transaction has been applied.
+    /// `downstream` is the downstream IR **before** the transaction is applied
+    /// (i.e. the current accumulated state of the layer below).
     fn transform(
         &mut self,
         upstream: &U,
+        downstream: &D,
         txn: Transaction<U>,
     ) -> Result<Transaction<D>, Self::Error>;
 }
@@ -117,68 +123,11 @@ impl<Repr: IR> QueryHandle<Repr> {
     }
 }
 
-pub(crate) struct IRInstance<Repr: IR + Send + 'static>
-where
-    Repr::Ix: Send + Sync,
-    Repr::Value: Send + Sync,
-    Repr::Error: Send,
-{
-    handle: JoinHandle<()>,
-    sender: channel::Sender<Transaction<Repr>>,
-    query_sender: channel::Sender<QueryMsg<Repr>>,
-}
-
-impl<Repr: IR + Send + 'static> IRInstance<Repr>
-where
-    Repr::Ix: Send + Sync,
-    Repr::Value: Send + Sync,
-    Repr::Error: Send,
-{
-    pub fn new(repr: Repr) -> Self {
-        let (sender, txn_rx) = channel::unbounded::<Transaction<Repr>>();
-        let (query_sender, query_rx) = channel::unbounded::<QueryMsg<Repr>>();
-        let handle = thread::spawn(move || {
-            let mut repr = repr;
-            loop {
-                crossbeam::select! {
-                    recv(txn_rx) -> msg => match msg {
-                        Ok(txn) => { let _ = repr.apply_transaction(txn); }
-                        Err(_) => {
-                            for msg in query_rx.try_iter() {
-                                let _ = msg.reply.send(repr.query(msg.index));
-                            }
-                            break;
-                        }
-                    },
-                    recv(query_rx) -> msg => match msg {
-                        Ok(QueryMsg { index, reply }) => {
-                            let _ = reply.send(repr.query(index));
-                        }
-                        Err(_) => {}
-                    },
-                }
-            }
-        });
-        IRInstance {
-            handle,
-            sender,
-            query_sender,
-        }
-    }
-    pub fn query_handle(&self) -> QueryHandle<Repr> {
-        QueryHandle {
-            sender: self.query_sender.clone(),
-        }
-    }
-
-    pub fn shutdown(self) {
-        drop(self.sender);
-        let _ = self.handle.join();
-    }
-}
-
-/// Concurrent wrapper for one pipeline stage:
-/// owns upstream IR + pass in a worker thread and streams downstream transactions.
+/// Concurrent wrapper for one pipeline stage.
+///
+/// Both the upstream IR and the downstream IR live in the **same** worker
+/// thread, so `Pass::transform` can receive `&D` (the current downstream
+/// state) with no cloning and no unsafe code.
 pub struct Pipeline<U, P, D>
 where
     U: IR + 'static,
@@ -195,7 +144,7 @@ where
     handle: JoinHandle<()>,
     sender: channel::Sender<Transaction<U>>,
     upstream_query_sender: channel::Sender<QueryMsg<U>>,
-    pub(crate) downstream: IRInstance<D>,
+    downstream_query_sender: channel::Sender<QueryMsg<D>>,
     _pass: PhantomData<P>,
 }
 
@@ -238,14 +187,14 @@ where
         UF: FnOnce() -> U + Send + 'static,
         PF: FnOnce() -> P + Send + 'static,
     {
-        let downstream = IRInstance::new(downstream);
-        let downstream_sender = downstream.sender.clone();
         let (sender, receiver) = channel::unbounded::<Transaction<U>>();
         let (upstream_query_sender, upstream_query_rx) = channel::unbounded::<QueryMsg<U>>();
+        let (downstream_query_sender, downstream_query_rx) = channel::unbounded::<QueryMsg<D>>();
 
         let handle = thread::spawn(move || {
             let mut upstream = make_upstream();
             let mut pass = make_pass();
+            let mut downstream = downstream;
             loop {
                 crossbeam::select! {
                     recv(receiver) -> msg => match msg {
@@ -256,17 +205,21 @@ where
                                 continue;
                             }
 
-                            if let Ok(downstream_txn) = pass.transform(&upstream, for_pass) {
-                                let cloned = std::sync::Arc::clone(&downstream_txn);
-                                let _ = downstream_sender.send(cloned);
-                                if let Some(tap) = tap_sender.as_ref() {
-                                    let _ = tap.send(downstream_txn);
+                            if let Ok(downstream_txn) = pass.transform(&upstream, &downstream, for_pass) {
+                                let for_tap = std::sync::Arc::clone(&downstream_txn);
+                                if downstream.apply_transaction(downstream_txn).is_ok() {
+                                    if let Some(tap) = &tap_sender {
+                                        let _ = tap.send(for_tap);
+                                    }
                                 }
                             }
                         }
                         Err(_) => {
                             for msg in upstream_query_rx.try_iter() {
                                 let _ = msg.reply.send(upstream.query(msg.index));
+                            }
+                            for msg in downstream_query_rx.try_iter() {
+                                let _ = msg.reply.send(downstream.query(msg.index));
                             }
                             break;
                         }
@@ -276,7 +229,13 @@ where
                             let _ = reply.send(upstream.query(index));
                         }
                         Err(_) => {}
-                    }
+                    },
+                    recv(downstream_query_rx) -> msg => match msg {
+                        Ok(QueryMsg { index, reply }) => {
+                            let _ = reply.send(downstream.query(index));
+                        }
+                        Err(_) => {}
+                    },
                 }
             }
         });
@@ -285,7 +244,7 @@ where
             handle,
             sender,
             upstream_query_sender,
-            downstream,
+            downstream_query_sender,
             _pass: PhantomData,
         }
     }
@@ -304,14 +263,21 @@ where
         }
     }
 
+    pub fn downstream_query_handle(&self) -> QueryHandle<D> {
+        QueryHandle {
+            sender: self.downstream_query_sender.clone(),
+        }
+    }
+
     pub fn query_upstream(&self, index: U::Ix) -> Option<Result<U::Value, U::Error>> {
         self.upstream_query_handle().query(index)
     }
 
     pub fn shutdown(self) {
+        // Closing the sender causes the worker thread to break out of its
+        // select loop and drop upstream + downstream + pass.
         drop(self.sender);
         let _ = self.handle.join();
-        self.downstream.shutdown();
     }
 }
 

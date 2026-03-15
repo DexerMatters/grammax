@@ -1,6 +1,14 @@
-use rustc_hash::FxHashSet;
+/// Path-based AST arena storage and transaction support.
+///
+/// The new design:
+/// - Arena stores type-erased nodes indexed by NodePath (tree structure)
+/// - Transactions operate on paths, enabling incremental updates
+/// - Commands use paths, not flat slot indices
+/// - Direct path-based storage via BTreeMap
 use std::{
     any::{Any, TypeId, type_name},
+    cell::Cell,
+    collections::BTreeMap,
     fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -8,87 +16,140 @@ use std::{
 };
 
 use crate::scheme;
+use crate::scheme::layers::NodePath;
 
-pub struct ASTCell<T> {
-    pub(crate) raw: usize,
+thread_local! {
+    static AST_CELL_CLONE_ARENA: Cell<Option<NonNull<()>>> = const { Cell::new(None) };
+}
+
+pub struct AstCell<T> {
+    pub(crate) path: NodePath,
     pub(crate) arena: Option<NonNull<()>>,
     pub(crate) arena_ty: Option<&'static str>,
     pub(crate) _marker: PhantomData<fn() -> T>,
 }
-
-impl<T> Copy for ASTCell<T> {}
-
-impl<T> Clone for ASTCell<T> {
+impl<T> Clone for AstCell<T> {
     fn clone(&self) -> Self {
-        *self
-    }
-}
-
-// SAFETY: `ASTCell<T>` is just a stable index + a raw arena pointer used only
-// for `Debug` formatting. The arena is always owned by the same owner that
-// hands out the cell, so sending the cell between threads is safe as long as
-// `T` itself is `Send`.
-unsafe impl<T: Send> Send for ASTCell<T> {}
-
-impl<T> fmt::Debug for ASTCell<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if let Some(arena) = self.arena {
-            // SAFETY: `arena` comes from `AstArena`; node slots are stable.
-            let arena = unsafe { &*arena.cast::<AstArenaStorage>().as_ptr() };
-            if let Some(node) = arena.nodes.get(self.raw).and_then(|slot| slot.as_ref()) {
-                return node.fmt_value(f);
-            }
+        Self {
+            path: self.path.clone(),
+            arena: self
+                .arena
+                .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get())),
+            arena_ty: self.arena_ty,
+            _marker: PhantomData,
         }
-        f.debug_tuple("ASTCell").field(&self.raw).finish()
     }
 }
 
-impl<T> PartialEq for ASTCell<T> {
+unsafe impl<T: Send> Send for AstCell<T> {}
+unsafe impl<T: Sync> Sync for AstCell<T> {}
+
+impl<T: fmt::Debug + 'static> fmt::Debug for AstCell<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let arena = self
+            .arena
+            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
+
+        if let Some(value) = self.deref_debug_value(arena) {
+            return AST_CELL_CLONE_ARENA.with(|current| {
+                let prev = current.replace(arena);
+                let result = value.fmt(f);
+                current.set(prev);
+                result
+            });
+        }
+
+        f.debug_struct("AstCell")
+            .field("path", &self.path)
+            .field("type", &self.arena_ty)
+            .finish()
+    }
+}
+
+impl<T> PartialEq for AstCell<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.raw == other.raw && self.arena == other.arena
+        self.path == other.path && self.arena == other.arena
     }
 }
 
-impl<T> Eq for ASTCell<T> {}
+impl<T> Eq for AstCell<T> {}
 
-impl<T> Hash for ASTCell<T> {
+impl<T> Hash for AstCell<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.raw.hash(state);
+        self.path.hash(state);
         self.arena.hash(state);
     }
 }
 
-impl<T> PartialOrd for ASTCell<T> {
+impl<T> PartialOrd for AstCell<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
 
-impl<T> Ord for ASTCell<T> {
+impl<T> Ord for AstCell<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.arena
             .cmp(&other.arena)
-            .then_with(|| self.raw.cmp(&other.raw))
+            .then_with(|| self.path.cmp(&other.path))
     }
 }
 
-impl<T> ASTCell<T> {
-    pub const fn new(raw: usize) -> Self {
+impl<T> AstCell<T> {
+    pub fn new(path: NodePath) -> Self {
         Self {
-            raw,
+            path,
             arena: None,
             arena_ty: None,
             _marker: PhantomData,
         }
     }
 
-    pub const fn into_raw(self) -> usize {
-        self.raw
+    pub fn from_path(path: &NodePath) -> Self {
+        Self::new(path.clone())
     }
 
-    pub(crate) const fn cast<U>(self) -> ASTCell<U> {
-        ASTCell {
-            raw: self.raw,
+    pub fn path(&self) -> &NodePath {
+        &self.path
+    }
+
+    pub fn get<'a>(&self, arena: &'a AstArena<T>) -> Option<&'a T>
+    where
+        T: 'static,
+    {
+        arena.get(&self.path)
+    }
+
+    pub fn cloned(&self, arena: &AstArena<T>) -> Option<T>
+    where
+        T: Clone + 'static,
+    {
+        self.get(arena).cloned()
+    }
+
+    fn deref_debug_value(&self, arena: Option<NonNull<()>>) -> Option<&T>
+    where
+        T: fmt::Debug + 'static,
+    {
+        let storage = arena?.cast::<AstArenaStorage>();
+        // SAFETY: `arena` is only produced from `AstArena::storage_ptr()` and the
+        // storage outlives queried values for the duration of formatting.
+        let storage = unsafe { storage.as_ref() };
+        storage
+            .nodes
+            .get(&self.path)
+            .and_then(ErasedAstNode::downcast_ref::<T>)
+    }
+
+    /// Cast the phantom type parameter to `U`.
+    ///
+    /// The cell itself is just a `NodePath`; the type parameter is only a
+    /// compile-time hint for typed retrieval.  Use this when the mapper
+    /// operates in heterogeneous mode (`AstMapAny`) but the stored value
+    /// is known to be of type `U` at the call site.
+    pub fn cast<U>(self) -> AstCell<U> {
+        AstCell {
+            path: self.path,
             arena: self.arena,
             arena_ty: self.arena_ty,
             _marker: PhantomData,
@@ -96,15 +157,153 @@ impl<T> ASTCell<T> {
     }
 }
 
+impl<T> serde::Serialize for AstCell<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.path.serialize(serializer)
+    }
+}
+
+impl<'de, T> serde::Deserialize<'de> for AstCell<T> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let path = NodePath::deserialize(deserializer)?;
+        Ok(Self::new(path))
+    }
+}
+
 pub type AstDelta<T> = Vec<scheme::Command<AstArena<T>>>;
+
+// ── AstMapAny ─────────────────────────────────────────────────────────────────
+
+/// A type-erased AST value produced by a heterogeneous `AstMapper`.
+///
+/// `AstMapper` visitors can emit values of any concrete type
+/// (`Expr`, `Type`, …) via [`AstMapCtx::emit`].  All emitted values are
+/// stored as `AstMapAny` inside the downstream `AstArena<AstMapAny>`.
+///
+/// Retrieve a typed reference at query time with [`AstMapAny::downcast_ref`],
+/// or let the observer return the raw `AstMapAny` (its `Debug` impl
+/// transparently delegates to the inner value's formatter).
+pub struct AstMapAny(pub(crate) ErasedAstNode);
+
+impl AstMapAny {
+    /// Wrap any owned value in `AstMapAny`.
+    pub fn new<T>(value: T) -> Self
+    where
+        T: fmt::Debug + Clone + PartialEq + Send + 'static,
+    {
+        AstMapAny(ErasedAstNode::new(value))
+    }
+
+    /// Return a reference to the inner value if it is of type `T`.
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+
+    /// Consume the wrapper and return the inner value as `T`.
+    pub fn downcast<T: Send + 'static>(self) -> Option<T> {
+        self.0.into_downcast()
+    }
+
+    /// Name of the concrete stored type (for diagnostics).
+    pub fn type_name(&self) -> &'static str {
+        self.0.type_name
+    }
+}
+
+impl fmt::Debug for AstMapAny {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        (self.0.debug_fn)(&self.0.value, f)
+    }
+}
+
+impl Clone for AstMapAny {
+    fn clone(&self) -> Self {
+        AstMapAny(self.0.clone())
+    }
+}
+
+impl PartialEq for AstMapAny {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.type_id != other.0.type_id {
+            return false;
+        }
+        (self.0.eq_fn)(&self.0.value, &other.0.value)
+    }
+}
+
+unsafe impl Send for AstMapAny {}
+unsafe impl Sync for AstMapAny {}
+
+pub(crate) struct AstTxnBuilder<T>
+where
+    T: fmt::Debug + Clone + PartialEq + Send + 'static,
+{
+    ops: AstDelta<T>,
+    next_staging_id: usize,
+}
+
+impl<T> Default for AstTxnBuilder<T>
+where
+    T: fmt::Debug + Clone + PartialEq + Send + 'static,
+{
+    fn default() -> Self {
+        Self {
+            ops: Vec::new(),
+            next_staging_id: 0,
+        }
+    }
+}
+
+impl<T> AstTxnBuilder<T>
+where
+    T: fmt::Debug + Clone + PartialEq + Send + 'static,
+{
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    fn stage(&mut self, value: T) -> usize {
+        let id = self.next_staging_id;
+        self.next_staging_id += 1;
+        self.ops.push(scheme::Command::Create { id, value });
+        id
+    }
+
+    /// Stage a value and insert it at the given path
+    pub(crate) fn insert_value(&mut self, path: NodePath, value: T) {
+        let id = self.stage(value);
+        self.ops.push(scheme::Command::Insert { index: path, id });
+    }
+
+    /// Stage a value and replace the existing node at the given path
+    pub(crate) fn replace_value(&mut self, path: NodePath, value: T) {
+        let id = self.stage(value);
+        self.ops.push(scheme::Command::Replace { index: path, id });
+    }
+
+    /// Delete the node at the given path
+    pub(crate) fn delete(&mut self, path: NodePath) {
+        self.ops.push(scheme::Command::Delete { index: path });
+    }
+
+    pub(crate) fn finish(self) -> AstDelta<T> {
+        self.ops
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AstArenaError {
-    MissingIndex {
-        index: usize,
+    MissingPath {
+        path: NodePath,
     },
     TypeMismatch {
-        index: usize,
+        path: NodePath,
         expected: &'static str,
     },
 }
@@ -117,9 +316,9 @@ pub struct AstArena<T> {
 
 #[derive(Debug, Clone)]
 pub(crate) struct AstArenaStorage {
-    pub(crate) nodes: Vec<Option<ErasedAstNode>>,
-    /// Set of free indices for O(1) lookup and removal in `force_alloc_at`.
-    pub(crate) free: FxHashSet<usize>,
+    /// Path-based storage for all AST nodes
+    pub(crate) nodes: BTreeMap<NodePath, ErasedAstNode>,
+    pub(crate) root: Option<NodePath>,
 }
 
 impl<T> Clone for AstArena<T> {
@@ -209,18 +408,14 @@ impl ErasedAstNode {
     pub(crate) fn into_downcast<U: Send + 'static>(self) -> Option<U> {
         self.value.downcast::<U>().ok().map(|value| *value)
     }
-
-    pub(crate) fn fmt_value(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        (self.debug_fn)(&self.value, f)
-    }
 }
 
 impl<T> Default for AstArena<T> {
     fn default() -> Self {
         Self {
             storage: Box::new(AstArenaStorage {
-                nodes: Vec::new(),
-                free: FxHashSet::default(),
+                nodes: BTreeMap::new(),
+                root: None,
             }),
             _marker: PhantomData,
         }
@@ -232,81 +427,132 @@ impl<T> AstArena<T> {
         Self::default()
     }
 
-    pub fn insert<U>(&mut self, node: U) -> ASTCell<U>
+    pub fn root_path(&self) -> Option<&NodePath> {
+        self.storage.root.as_ref()
+    }
+
+    /// Insert a new value at the given path (path must not already exist)
+    pub fn insert<U>(&mut self, path: NodePath, node: U) -> AstCell<U>
     where
         U: fmt::Debug + Clone + PartialEq + Send + 'static,
     {
-        self.insert_erased(ErasedAstNode::new(node)).cast()
+        let cell = self
+            .insert_erased(path.clone(), ErasedAstNode::new(node))
+            .cast();
+        self.refresh_root();
+        cell
     }
 
-    pub fn set<U>(&mut self, id: ASTCell<U>, node: U)
+    /// Update the value at the given path (path must exist)
+    pub fn set<U>(&mut self, path: NodePath, node: U)
     where
         U: fmt::Debug + Clone + PartialEq + Send + 'static,
     {
-        self.set_erased(id.cast(), ErasedAstNode::new(node));
+        self.set_erased(path, ErasedAstNode::new(node));
+        self.refresh_root();
     }
 
-    pub fn remove<U>(&mut self, id: ASTCell<U>) -> Option<U>
+    /// Remove the node at the given path
+    pub fn remove<U>(&mut self, path: NodePath) -> Option<U>
     where
         U: Send + 'static,
     {
-        self.remove_erased(id.cast())
-            .and_then(ErasedAstNode::into_downcast)
+        let removed = self
+            .remove_erased(path)
+            .and_then(ErasedAstNode::into_downcast);
+        self.refresh_root();
+        removed
     }
 
-    pub fn get<U>(&self, id: ASTCell<U>) -> Option<&U>
+    /// Query the node at the given path
+    pub fn get<U>(&self, path: &NodePath) -> Option<&U>
     where
         U: 'static,
     {
-        self.get_erased(id.cast())
+        self.resolve_path(path)
+            .and_then(|path| self.get_erased(path))
             .and_then(ErasedAstNode::downcast_ref)
     }
 
-    // ── crate-internal helpers used by IncrementalLowerer ──────────────────
-
-    pub(crate) fn insert_erased(&mut self, node: ErasedAstNode) -> ASTCell<()> {
-        let node_ty = node.type_name;
-        // Reuse a free slot (arbitrary order is fine for correctness).
-        if let Some(&id) = self.storage.free.iter().next() {
-            self.storage.free.remove(&id);
-            self.storage.nodes[id] = Some(node);
-            return self.cell(id, node_ty);
-        }
-        let id = self.storage.nodes.len();
-        self.storage.nodes.push(Some(node));
-        self.cell(id, node_ty)
+    pub fn get_by_cell<U>(&self, cell: &AstCell<U>) -> Option<&U>
+    where
+        U: 'static,
+    {
+        self.get(cell.path())
     }
 
-    pub(crate) fn set_erased(&mut self, id: ASTCell<()>, node: ErasedAstNode) {
-        let raw = id.into_raw();
-        if raw >= self.storage.nodes.len() {
-            self.storage.nodes.resize_with(raw + 1, || None);
-        }
-        self.storage.nodes[raw] = Some(node);
+    pub fn cloned_by_cell<U>(&self, cell: &AstCell<U>) -> Option<U>
+    where
+        U: Clone + 'static,
+    {
+        self.get_by_cell(cell).cloned()
     }
 
-    pub(crate) fn remove_erased(&mut self, id: ASTCell<()>) -> Option<ErasedAstNode> {
-        let raw = id.into_raw();
-        if raw >= self.storage.nodes.len() {
-            return None;
-        }
-        let prev = self.storage.nodes[raw].take();
-        if prev.is_some() {
-            self.storage.free.insert(raw);
-        }
-        prev
+    pub(crate) fn insert_erased(&mut self, path: NodePath, node: ErasedAstNode) -> AstCell<()> {
+        self.storage.nodes.insert(path.clone(), node);
+        self.cell(path)
     }
 
-    pub(crate) fn get_erased(&self, id: ASTCell<()>) -> Option<&ErasedAstNode> {
-        self.storage
+    pub(crate) fn set_erased(&mut self, path: NodePath, node: ErasedAstNode) {
+        self.storage.nodes.insert(path, node);
+    }
+
+    pub(crate) fn remove_erased(&mut self, path: NodePath) -> Option<ErasedAstNode> {
+        self.storage.nodes.remove(&path)
+    }
+
+    pub(crate) fn get_erased(&self, path: &NodePath) -> Option<&ErasedAstNode> {
+        self.storage.nodes.get(path)
+    }
+
+    /// Retrieve the stored node wrapped in [`AstMapAny`].
+    ///
+    /// Unlike `get::<T>()` this always succeeds as long as the path exists —
+    /// it simply wraps the underlying [`ErasedAstNode`] without downcasting.
+    /// Use it in heterogeneous pipelines where the arena's stored type is
+    /// `AstMapAny` and you need to compare or forward the erased value.
+    pub fn get_erased_as_any(&self, path: &NodePath) -> Option<AstMapAny> {
+        let path = self.resolve_path(path)?;
+        self.get_erased(path).map(|n| AstMapAny(n.clone()))
+    }
+
+    pub fn get_cell(&self, path: &NodePath) -> Option<AstCell<T>>
+    where
+        T: 'static,
+    {
+        let resolved = self.resolve_path(path)?.clone();
+        self.get_erased(&resolved).map(|node| AstCell {
+            path: resolved,
+            arena: Some(self.storage_ptr()),
+            arena_ty: Some(node.type_name),
+            _marker: PhantomData,
+        })
+    }
+
+    fn resolve_path<'a>(&'a self, path: &'a NodePath) -> Option<&'a NodePath> {
+        if path.0.is_empty() {
+            self.storage.root.as_ref()
+        } else {
+            Some(path)
+        }
+    }
+
+    fn refresh_root(&mut self) {
+        self.storage.root = self
+            .storage
             .nodes
-            .get(id.into_raw())
-            .and_then(|slot| slot.as_ref())
+            .keys()
+            .min_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)))
+            .cloned();
     }
 
-    fn cell<U>(&self, raw: usize, node_ty: &'static str) -> ASTCell<U> {
-        ASTCell {
-            raw,
+    fn cell(&self, path: NodePath) -> AstCell<()> {
+        let node_ty = self
+            .get_erased(&path)
+            .map(|n| n.type_name)
+            .unwrap_or("unknown");
+        AstCell {
+            path,
             arena: Some(self.storage_ptr()),
             arena_ty: Some(node_ty),
             _marker: PhantomData,
@@ -316,65 +562,92 @@ impl<T> AstArena<T> {
     fn storage_ptr(&self) -> NonNull<()> {
         NonNull::from(self.storage.as_ref()).cast()
     }
-
-    /// Force-allocate an erased node at a specific raw index (used by IR impl).
-    pub(crate) fn force_alloc_at(&mut self, index: usize, node: ErasedAstNode) {
-        if index >= self.storage.nodes.len() {
-            self.storage.nodes.resize_with(index + 1, || None);
-        }
-        // O(1) removal instead of O(n) retain.
-        self.storage.free.remove(&index);
-        self.storage.nodes[index] = Some(node);
-    }
 }
 
 impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena<T> {
-    type Ix = usize;
+    type Ix = NodePath;
     type Value = T;
     type Error = AstArenaError;
 
-    fn query(&self, index: usize) -> Result<T, Self::Error> {
-        let Some(node) = self.get_erased(ASTCell::<()>::new(index)) else {
-            return Err(AstArenaError::MissingIndex { index });
+    fn query(&self, index: NodePath) -> Result<T, Self::Error> {
+        let query_path = index;
+        let Some(path) = self.resolve_path(&query_path) else {
+            return Err(AstArenaError::MissingPath { path: query_path });
         };
 
-        node.downcast_ref::<T>()
-            .cloned()
-            .ok_or(AstArenaError::TypeMismatch {
-                index,
-                expected: type_name::<T>(),
-            })
+        let Some(node) = self.get_erased(path) else {
+            return Err(AstArenaError::MissingPath { path: query_path });
+        };
+
+        // Special case: when T == AstMapAny, wrap the stored ErasedAstNode
+        // instead of trying to downcast the concrete stored type to AstMapAny.
+        if TypeId::of::<T>() == TypeId::of::<AstMapAny>() {
+            let map_any = AstMapAny(node.clone());
+            let boxed: Box<dyn Any> = Box::new(map_any);
+            return boxed
+                .downcast::<T>()
+                .map(|b| *b)
+                .map_err(|_| AstArenaError::TypeMismatch {
+                    path: query_path,
+                    expected: type_name::<T>(),
+                });
+        }
+
+        AST_CELL_CLONE_ARENA.with(|slot| {
+            let prev = slot.replace(Some(self.storage_ptr()));
+            let result = node
+                .downcast_ref::<T>()
+                .cloned()
+                .ok_or(AstArenaError::TypeMismatch {
+                    path: query_path,
+                    expected: type_name::<T>(),
+                });
+            slot.set(prev);
+            result
+        })
     }
+
     fn apply_transaction(&mut self, txn: scheme::Transaction<Self>) -> Result<(), Self::Error> {
-        let mut staging: Vec<Option<ErasedAstNode>> = Vec::new();
+        use std::collections::HashMap;
+
+        // Is T == AstMapAny?  If so we must *unwrap* the inner ErasedAstNode
+        // rather than double-boxing it (AstMapAny already IS an ErasedAstNode).
+        let is_any = TypeId::of::<T>() == TypeId::of::<AstMapAny>();
+
+        // Staging area: usize ID -> ErasedAstNode
+        let mut staging: HashMap<usize, ErasedAstNode> = HashMap::new();
+
         for cmd in txn.iter() {
             match cmd {
                 scheme::Command::Create { id, value } => {
-                    if *id >= staging.len() {
-                        staging.resize_with(*id + 1, || None);
-                    }
-                    staging[*id] = Some(ErasedAstNode::new(value.clone()));
+                    let erased = if is_any {
+                        // SAFETY: is_any guarantees T == AstMapAny at runtime.
+                        let boxed: Box<dyn Any + Send> = Box::new(value.clone());
+                        boxed.downcast::<AstMapAny>().expect("T==AstMapAny").0
+                    } else {
+                        ErasedAstNode::new(value.clone())
+                    };
+                    staging.insert(*id, erased);
                 }
                 scheme::Command::Insert { index, id } => {
-                    if let Some(slot) = staging.get_mut(*id) {
-                        if let Some(node) = slot.take() {
-                            self.force_alloc_at(*index, node);
-                        }
+                    if let Some(node) = staging.remove(id) {
+                        self.set_erased(index.clone(), node);
                     }
                 }
                 scheme::Command::Replace { index, id } => {
-                    if let Some(slot) = staging.get_mut(*id) {
-                        if let Some(node) = slot.take() {
-                            self.set_erased(ASTCell::<()>::new(*index), node);
-                        }
+                    if let Some(node) = staging.remove(id) {
+                        self.set_erased(index.clone(), node);
                     }
                 }
                 scheme::Command::Delete { index } => {
-                    self.remove_erased(ASTCell::<()>::new(*index));
+                    self.remove_erased(index.clone());
                 }
-                scheme::Command::SetRoot { .. } => {}
+                scheme::Command::SetRoot { id: _ } => {
+                    // SetRoot with staging: reserved for future root tracking
+                }
             }
         }
+        self.refresh_root();
         Ok(())
     }
 }

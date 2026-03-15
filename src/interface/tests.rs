@@ -8,7 +8,7 @@ use crate::{
     parsec::{view::NodeView, words::*},
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
-        layers::{AstArena, AstCell, NodePath, ParseTreeIR},
+        layers::{AstArena, AstCell, AstVec, NodePath, ParseTreeIR},
         passes::{AstMapper, IncrementalLowerer},
     },
 };
@@ -22,6 +22,65 @@ use std::thread;
 #[cfg(feature = "webui")]
 #[test]
 fn test_tap_prints_cst_commands() {
+    #[derive(Debug, Clone, PartialEq)]
+    enum Json {
+        Object(AstVec<Json>),        // children in arena: Pair nodes
+        Pair(String, AstCell<Json>), // key text, typed value cell
+        Array(AstVec<Json>),         // children in arena: Json nodes
+        String(String),
+        Number(f64),
+        Boolean(bool),
+        Null,
+        Error,
+    }
+
+    let mapper = AstMapper::new()
+        .skip_rule("start")
+        .on_error(|ctx, _node| Some(ctx.emit(Json::Error)))
+        // json is purely a dispatch-level rule; forward straight through.
+        .on_rule("json", |ctx, node| ctx.forward_first_child(node))
+        // object: emit a stable AstVec rooted at this node's path.
+        // Pair nodes are stored as direct-ish children in the arena.
+        .on_rule("object", |ctx, node| {
+            Some(ctx.emit(Json::Object(ctx.collect_vec(node))))
+        })
+        // pair: read key text from CST; resolve value through the mapper.
+        .on_rule("pair", |ctx, node| {
+            // key: navigate to the `string` node and grab the STRING token (child 1).
+            let key_str_node = node.try_first_with_field("key")?;
+            let key = key_str_node
+                .try_nth(1)
+                .map(|n| ctx.read_text(n))
+                .unwrap_or_default();
+            // value: ctx.read_cell resolves through json → concrete type → anchor path.
+            let value: AstCell<Json> = ctx.read_cell(node.try_first_with_field("value")?)?;
+            Some(ctx.emit(Json::Pair(key, value)))
+        })
+        // array: emit a stable AstVec; Json children are at descendant paths.
+        .on_rule("array", |ctx, node| {
+            Some(ctx.emit(Json::Array(ctx.collect_vec(node))))
+        })
+        // string: middle child (index 1) is the STRING token content (no quotes).
+        .on_rule("string", |ctx, node| {
+            let content = node
+                .try_nth(1)
+                .map(|n| ctx.read_text(n))
+                .unwrap_or_default();
+            Some(ctx.emit(Json::String(content)))
+        })
+        .on_rule("number", |ctx, node| {
+            let n: f64 = ctx.read_text(node).parse().unwrap_or(0.0);
+            Some(ctx.emit(Json::Number(n)))
+        })
+        .on_rule("boolean", |ctx, node| {
+            Some(ctx.emit(Json::Boolean(ctx.read_text(node) == "true")))
+        })
+        .on_rule("null", |ctx, _node| Some(ctx.emit(Json::Null)))
+        // key field: read text directly in the pair handler above; nothing to store.
+        .skip_field("key")
+        // value field: forward into the json node so `read_cell` resolves it.
+        .on_field("value", |ctx, node| ctx.forward_first_child(node));
+
     let grammar = new_grammar!(
         start where
         start   -> r!(json) + tt(EndOfInput)
@@ -35,31 +94,40 @@ fn test_tap_prints_cst_commands() {
         null    -> tt("null")
     );
 
-    let layer = CompilerBuilder::new();
-    let source_observer = layer.observe::<Here>();
+    let pass = CompilerBuilder::new()
+        .then(ParserPass::new(grammar), ParseTreeIR::default())
+        .then(
+            IncrementalLowerer::new(grammar, mapper),
+            AstArena::default(),
+        );
+    let cst_observer = pass.observe::<Down<Here>>();
+    let ast_observer = pass.observe::<Down<Down<Here>>>();
     thread::spawn(move || {
-        while let Some(transaction) = source_observer.recv() {
-            println!("======Received Source transaction:");
+        while let Some(transaction) = cst_observer.recv() {
+            println!("=== CST transaction ===");
             for cmd in transaction.iter() {
-                println!("Source Command: {:?}", cmd);
-            }
-        }
-    });
-    let pass = layer.then(ParserPass::new(grammar), ParseTreeIR::default());
-    let observer = pass.observe::<Down<Here>>();
-
-    thread::spawn(move || {
-        while let Some(transaction) = observer.recv() {
-            println!("======Received CST transaction:");
-            for cmd in transaction.iter() {
-                println!("CST Command: {:?}", cmd);
+                println!("CST Command  {:?}", cmd);
             }
         }
     });
 
-    let runtime = pass.build_runtime::<WebPreviewInterface<_>>(grammar);
+    thread::spawn(move || {
+        while let Some(transaction) = ast_observer.recv() {
+            if let Ok(root) = ast_observer.query(NodePath::root()) {
+                println!("=== Current JSON AST: {:?} ===", root);
+            }
+            println!("=== AST transaction ===");
+            for cmd in transaction.iter() {
+                println!("AST Command  {:?}", cmd);
+            }
+        }
+    });
 
-    runtime.run().expect("runtime failed");
+    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
+    runtime
+        .insert(0, r#"{"name": "John", "age": 30, "is_student": false}"#)
+        .unwrap();
+    thread::sleep(std::time::Duration::from_millis(10));
 }
 
 #[cfg(feature = "webui")]

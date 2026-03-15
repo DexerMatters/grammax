@@ -36,8 +36,19 @@ impl NodePath {
         Self(Vec::new())
     }
 
+    /// Return the `index`-th direct child of this path.
+    pub fn child(&self, index: usize) -> Self {
+        let mut path = self.0.clone();
+        path.push(index);
+        Self(path)
+    }
+
     pub fn is_prefix_of(&self, other: &Self) -> bool {
         self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(a, b)| a == b)
+    }
+
+    pub fn is_direct_child_of(&self, parent: &Self) -> bool {
+        self.0.len() == parent.0.len() + 1 && parent.is_prefix_of(self)
     }
 
     pub fn overlaps_subtree(&self, other: &Self) -> bool {

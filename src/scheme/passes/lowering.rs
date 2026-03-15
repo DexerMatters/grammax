@@ -13,7 +13,9 @@ use crate::{
     },
     scheme::{
         self,
-        layers::{AstArena, AstCell, AstDelta, AstMapAny, AstTxnBuilder, NodePath, ParseTreeIR},
+        layers::{
+            AstArena, AstCell, AstDelta, AstMapAny, AstTxnBuilder, AstVec, NodePath, ParseTreeIR,
+        },
     },
 };
 
@@ -114,6 +116,25 @@ impl<'a> AstMapCtx<'a> {
     pub fn forward_first_child(&self, node: &NodeView) -> Option<AstMapIntent> {
         let child = node.each().first()?;
         Some(AstMapIntent::forward(child.path().clone()))
+    }
+
+    /// Build an [`AstVec`] rooted at `parent`'s CST path.
+    ///
+    /// The returned handle is **path-stable**: its identity is the parent's
+    /// CST path, so the parent node's stored value does **not** change when
+    /// children are inserted or removed.  Individual elements are managed by
+    /// their own handler registrations and stored at direct-child paths of
+    /// `parent`.
+    ///
+    /// ```ignore
+    /// .on_rule("list", |ctx, node| {
+    ///     Some(ctx.emit(Expr::List(ctx.collect_vec(node))))
+    /// })
+    /// // Elements handled separately:
+    /// .on_rule("item", |ctx, node| Some(ctx.emit(Expr::Item(...))))
+    /// ```
+    pub fn collect_vec<U>(&self, parent: &NodeView) -> AstVec<U> {
+        AstVec::new(parent.path().clone())
     }
 
     /// All parser-level diagnostics for the current transaction.

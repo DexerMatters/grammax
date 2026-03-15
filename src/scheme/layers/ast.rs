@@ -240,6 +240,151 @@ impl PartialEq for AstMapAny {
 unsafe impl Send for AstMapAny {}
 unsafe impl Sync for AstMapAny {}
 
+pub struct AstVec<T> {
+    pub(crate) base: NodePath,
+    pub(crate) arena: Option<NonNull<()>>,
+    pub(crate) _marker: PhantomData<fn() -> T>,
+}
+
+impl<T> Clone for AstVec<T> {
+    fn clone(&self) -> Self {
+        Self {
+            base: self.base.clone(),
+            arena: self
+                .arena
+                .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get())),
+            _marker: PhantomData,
+        }
+    }
+}
+
+/// Two `AstVec`s are equal when they share the same `base` path.
+///
+/// Element content is intentionally excluded so that the parent node value
+/// remains **stable** when children are added or removed, enabling fine-grained
+/// incremental updates.
+impl<T> PartialEq for AstVec<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.base == other.base
+    }
+}
+
+impl<T: fmt::Debug + 'static> fmt::Debug for AstVec<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let arena_ptr = self
+            .arena
+            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
+
+        let mut list = f.debug_list();
+        if let Some(ptr) = arena_ptr {
+            // SAFETY: arena pointer is valid for the duration of formatting,
+            // same guarantee as in AstCell::deref_debug_value.
+            let storage = unsafe { ptr.cast::<AstArenaStorage>().as_ref() };
+            for (path, node) in storage.iter_mapped_children(&self.base) {
+                if let Some(val) = node.downcast_ref::<T>() {
+                    AST_CELL_CLONE_ARENA.with(|current| {
+                        let prev = current.replace(Some(ptr));
+                        list.entry(val);
+                        current.set(prev);
+                    });
+                } else {
+                    list.entry(&format_args!("<type mismatch at {:?}>", path));
+                }
+            }
+        } else {
+            // No arena available: show the base path instead of empty list
+            return f.debug_struct("AstVec").field("base", &self.base).finish();
+        }
+        list.finish()
+    }
+}
+
+unsafe impl<T: Send> Send for AstVec<T> {}
+unsafe impl<T: Sync> Sync for AstVec<T> {}
+
+impl<T> AstVec<T> {
+    /// Create a new `AstVec` rooted at `base`.
+    ///
+    /// Prefer using [`AstMapCtx::collect_vec`] inside a mapper handler, which
+    /// supplies the correct base path automatically.
+    pub fn new(base: NodePath) -> Self {
+        Self {
+            base,
+            arena: None,
+            _marker: PhantomData,
+        }
+    }
+
+    /// The base path — direct children of this path in the arena are the
+    /// vector's elements.
+    pub fn base(&self) -> &NodePath {
+        &self.base
+    }
+
+    /// Return typed cells for every element currently in the arena.
+    ///
+    /// Each element must have been stored by an `AstMapper` handler that emits
+    /// a value of type `T` at a direct-child path of the base.
+    pub fn cells(&self) -> Vec<AstCell<T>> {
+        let arena_ptr = self
+            .arena
+            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
+
+        let Some(ptr) = arena_ptr else {
+            return Vec::new();
+        };
+        // SAFETY: same guarantee as AstCell::deref_debug_value.
+        let storage = unsafe { ptr.cast::<AstArenaStorage>().as_ref() };
+        storage
+            .iter_mapped_children(&self.base)
+            .into_iter()
+            .map(|(path, node)| AstCell {
+                path,
+                arena: Some(ptr),
+                arena_ty: Some(node.type_name),
+                _marker: PhantomData,
+            })
+            .collect()
+    }
+
+    /// Iterate resolved values using an explicit arena reference.
+    ///
+    /// Prefer this over [`cells`] when you already have the arena at hand and
+    /// want to avoid collecting a temporary `Vec`.
+    pub fn iter_in<'a>(&self, arena: &'a AstArena<T>) -> impl Iterator<Item = &'a T>
+    where
+        T: 'static,
+    {
+        let paths: Vec<NodePath> = arena
+            .storage
+            .iter_mapped_children(&self.base)
+            .into_iter()
+            .map(|(p, _)| p)
+            .collect();
+        paths.into_iter().filter_map(move |p| arena.get(&p))
+    }
+
+    /// Number of elements currently in the arena under this base.
+    ///
+    /// Requires an arena pointer to be populated (e.g. inside a Debug context
+    /// or after retrieval from the arena via `query`).
+    pub fn len_in(&self, arena: &AstArena<T>) -> usize
+    where
+        T: 'static,
+    {
+        arena.storage.iter_mapped_children(&self.base).len()
+    }
+}
+
+impl<T> serde::Serialize for AstVec<T> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.base.serialize(serializer)
+    }
+}
+
 pub(crate) struct AstTxnBuilder<T>
 where
     T: fmt::Debug + Clone + PartialEq + Send + 'static,
@@ -319,6 +464,40 @@ pub(crate) struct AstArenaStorage {
     /// Path-based storage for all AST nodes
     pub(crate) nodes: BTreeMap<NodePath, ErasedAstNode>,
     pub(crate) root: Option<NodePath>,
+}
+
+impl AstArenaStorage {
+    /// Return the "mapped children" of `base` — all arena paths that are
+    /// descendants of `base` but **not** descendants of any other mapped
+    /// ancestor between `base` and themselves.
+    ///
+    /// Concretely, this finds the shallowest set of paths P where:
+    /// - `base` is a strict prefix of P (P is a descendant of base)
+    /// - no other path Q in the arena satisfies `base ⊂ Q ⊂ P` as prefixes
+    ///
+    /// This handles `sep`-desugared grammars where list elements are at
+    /// non-uniform depths (e.g. `P.1.0`, `P.2.1.0`, `P.2.2.1.0`, …) but
+    /// are still logically "one level" below the containing list node.
+    pub(crate) fn iter_mapped_children(&self, base: &NodePath) -> Vec<(NodePath, &ErasedAstNode)> {
+        let start = base.child(0);
+        let mut result = Vec::new();
+        let mut last_included: Option<NodePath> = None;
+        for (path, node) in self
+            .nodes
+            .range(start..)
+            .take_while(|(p, _)| base.is_prefix_of(p))
+        {
+            // Skip paths that are descendants of an already-included mapped node.
+            if let Some(ref last) = last_included {
+                if last.is_prefix_of(path) {
+                    continue;
+                }
+            }
+            last_included = Some(path.clone());
+            result.push((path.clone(), node));
+        }
+        result
+    }
 }
 
 impl<T> Clone for AstArena<T> {

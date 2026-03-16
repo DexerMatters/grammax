@@ -74,7 +74,8 @@ fn translate_dsl_grammar(result: parsec::Result<'_>) -> Result<&'static Grammar,
     let mut registry_map = FxHashMap::default();
     let mut start_rule = None;
     for rule_view in root.each_with_rule("rule") {
-        let (name, node): (&'static str, GrammarNode) = rule_view.view(&viewer);
+        let (name, node): (String, GrammarNode) = rule_view.view(&viewer);
+        let name: &'static str = Box::leak(name.into_boxed_str());
         if start_rule.is_none() {
             start_rule = Some(name);
         }
@@ -91,36 +92,28 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
     result
         .viewer()
         .on_token::<bool, _>("!", |_viewer, _node| ViewAction::Exact(true))
-        .on_field::<&'static str, _>("name", |_viewer, node| {
-            let name = node.text_trimmed();
-            ViewAction::Exact(leak_str(&name))
+        .on_field::<String, _>("name", |_viewer, node| {
+            ViewAction::Exact(node.text_trimmed())
         })
-        .on_field::<&'static str, _>("field_name", |_viewer, node| {
-            let name = node.text_trimmed();
-            ViewAction::Exact(leak_str(&name))
+        .on_field::<String, _>("field_name", |_viewer, node| {
+            ViewAction::Exact(node.text_trimmed())
         })
-        .on_field::<GrammarNode, _>("definition", |viewer, node| {
+        .on_field("definition", |viewer, node| {
             ViewAction::Exact(node[0].view::<GrammarNode>(viewer))
         })
-        .on_field::<GrammarNode, _>("sep", |viewer, node| {
+        .on_field("sep", |viewer, node| {
             ViewAction::Exact(node[0].view::<GrammarNode>(viewer))
         })
-        .on_rule::<GrammarNode, _>("expr", |_viewer, _node| ViewAction::Relay)
-        .on_rule::<GrammarNode, _>("primary", |_viewer, _node| ViewAction::Relay)
-        .on_rule::<String, _>("token", |_viewer, node| {
-            ViewAction::Exact(node.text_trimmed().to_string())
-        })
-        .on_rule::<String, _>("literal", |viewer, node| {
-            ViewAction::Exact(node[1].view::<String>(viewer))
-        })
-        .on_rule::<(&'static str, GrammarNode), _>("rule", |viewer, node| {
+        .on_rule("expr", |_viewer, _node| ViewAction::<GrammarNode>::Relay)
+        .on_rule("primary", |_viewer, _node| ViewAction::<GrammarNode>::Relay)
+        .on_rule::<(String, GrammarNode), _>("rule", |viewer, node| {
             ViewAction::Exact((
-                node.first_with_field("name").view::<&'static str>(viewer),
+                node.first_with_field("name").view::<String>(viewer),
                 node.first_with_field("definition")
                     .view::<GrammarNode>(viewer),
             ))
         })
-        .on_rule::<GrammarNode, _>("alternative", |viewer, node| {
+        .on_rule("alternative", |viewer, node| {
             let exprs: Vec<_> = node
                 .each_with_rule("expr")
                 .into_iter()
@@ -141,7 +134,7 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
                 _ => GrammarNode::Alternative(flattened, span),
             })
         })
-        .on_rule::<GrammarNode, _>("sequence", |viewer, node| {
+        .on_rule("sequence", |viewer, node| {
             let exprs: Vec<_> = node
                 .each_with_rule("expr")
                 .into_iter()
@@ -162,15 +155,17 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
                 _ => GrammarNode::Sequence(flattened, span),
             })
         })
-        .on_rule::<GrammarNode, _>("fields", |viewer, node| {
-            let field_name = node
-                .first_with_field("field_name")
-                .view::<&'static str>(viewer);
+        .on_rule("fields", |viewer, node| {
+            let field_name = node.first_with_field("field_name").view::<String>(viewer);
             let expr = node.first_with_rule("expr").view::<GrammarNode>(viewer);
 
-            ViewAction::Exact(GrammarNode::Field(field_name, Box::new(expr), node.span()))
+            ViewAction::Exact(GrammarNode::Field(
+                Box::new(field_name).leak(),
+                Box::new(expr),
+                node.span(),
+            ))
         })
-        .on_rule::<GrammarNode, _>("drop", |viewer, node| {
+        .on_rule("drop", |viewer, node| {
             let expr = node.first_with_rule("expr").view::<GrammarNode>(viewer);
             let count = node.last().view::<usize>(viewer);
 
@@ -180,21 +175,21 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
                 span: node.span(),
             })
         })
-        .on_rule::<GrammarNode, _>("some", |viewer, node| {
+        .on_rule("some", |viewer, node| {
             let expr = node.first_with_rule("expr").view::<GrammarNode>(viewer);
             let sep = node
                 .try_first_with_field("sep")
                 .map(|field| field.view::<GrammarNode>(viewer));
             ViewAction::Exact(repetition_node(expr, sep, 1, node.span()))
         })
-        .on_rule::<GrammarNode, _>("many", |viewer, node| {
+        .on_rule("many", |viewer, node| {
             let expr = node.first_with_rule("expr").view::<GrammarNode>(viewer);
             let sep = node
                 .try_first_with_field("sep")
                 .map(|field| field.view::<GrammarNode>(viewer));
             ViewAction::Exact(repetition_node(expr, sep, 0, node.span()))
         })
-        .on_rule::<GrammarNode, _>("terminal", |viewer, node| {
+        .on_rule("terminal", |viewer, node| {
             if let Some(expr) = node.try_first_with_rule("expr") {
                 return ViewAction::Exact(expr.view::<GrammarNode>(viewer));
             }
@@ -207,7 +202,7 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
 
             if let Some(token) = primary.try_first_with_rule("token") {
                 return ViewAction::Exact(grammar_token_from_text(
-                    &token.view::<String>(viewer),
+                    &token.text_trimmed(),
                     token.span(),
                     is_raw,
                 ));
@@ -215,12 +210,12 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
 
             let literal = primary.try_first_with_rule("literal").unwrap();
             ViewAction::Exact(grammar_literal_from_text(
-                &literal.view::<String>(viewer),
+                &literal[1].text_normalized(),
                 literal.span(),
                 is_raw,
             ))
         })
-        .on_rule::<GrammarNode, _>("reference", |_viewer, node| {
+        .on_rule("reference", |_viewer, node| {
             ViewAction::Exact(GrammarNode::UnboundReference(
                 node.text_trimmed(),
                 node.span(),
@@ -233,20 +228,13 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
                 false,
             ))
         })
-        .on_rule::<GrammarNode, _>("literal", |viewer, node| {
+        .on_rule::<GrammarNode, _>("literal", |_viewer, node| {
             ViewAction::Exact(grammar_literal_from_text(
-                &node[1].view::<String>(viewer),
+                &node[1].text_normalized(),
                 node.span(),
                 false,
             ))
         })
-        .on_error::<GrammarNode, _>(|_viewer, node| {
-            panic!("Unexpected parse error: {}", node.display())
-        })
-}
-
-fn leak_str(text: &str) -> &'static str {
-    Box::leak(text.to_string().into_boxed_str())
 }
 
 fn repetition_node(
@@ -273,83 +261,29 @@ fn repetition_node(
     }
 }
 
-fn normalize_escaped_string(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars();
-
-    while let Some(ch) = chars.next() {
-        if ch != '\\' {
-            out.push(ch);
-            continue;
-        }
-
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('r') => out.push('\r'),
-            Some('t') => out.push('\t'),
-            Some('"') => out.push('"'),
-            Some('\\') => out.push('\\'),
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-
-    out
-}
-
 fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNode {
-    let matcher: Arc<dyn Matcher + Send + Sync> = match token_name {
-        "IDENT" => {
-            if raw {
-                Arc::new(words::IDENT)
-            } else {
-                Arc::new(words::token(words::IDENT))
-            }
-        }
-        "STRING" => {
-            if raw {
-                Arc::new(words::STRING)
-            } else {
-                Arc::new(words::token(words::STRING))
-            }
-        }
-        "NUMBER" => {
-            if raw {
-                Arc::new(words::NUMS)
-            } else {
-                Arc::new(words::token(words::NUMS))
-            }
-        }
-        "ALPHANUMS" => {
-            if raw {
-                Arc::new(words::ALPHANUMS)
-            } else {
-                Arc::new(words::token(words::ALPHANUMS))
-            }
-        }
-        "ALPHABETS" => {
-            if raw {
-                Arc::new(words::ALPHAS)
-            } else {
-                Arc::new(words::token(words::ALPHAS))
-            }
-        }
-        "EOF" => {
-            if raw {
-                Arc::new(words::EndOfInput)
-            } else {
-                Arc::new(words::token(words::EndOfInput))
-            }
-        }
+    fn mk(raw: bool, matcher: impl Matcher + Send + Sync + 'static, span: Span) -> GrammarNode {
+        let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
+            Arc::new(matcher)
+        } else {
+            Arc::new(words::token(matcher))
+        };
+        GrammarNode::Terminal(matcher, span)
+    }
+    match token_name {
+        "IDENT" => mk(raw, IDENT, span),
+        "STRING" => mk(raw, STRING, span),
+        "NUMBER" => mk(raw, NUMS, span),
+        "ALPHANUMS" => mk(raw, words::ALPHANUMS, span),
+        "ALPHABETS" => mk(raw, words::ALPHAS, span),
+        "EOF" => mk(raw, EndOfInput, span),
         t => panic!("Unsupported token type: {}", t),
-    };
-    GrammarNode::Terminal(matcher, span)
+    }
 }
 
 fn grammar_literal_from_text(text: &str, span: Span, raw: bool) -> GrammarNode {
     let text = text.trim();
-    let text = normalize_escaped_string(text);
-    let text = Box::leak(text.into_boxed_str()) as &'static str;
+    let text = Box::leak(text.to_string().into_boxed_str()) as &'static str;
     let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
         Arc::new(text)
     } else {
@@ -396,6 +330,8 @@ null     -> "null"
         match result {
             Ok(translated_grammar) => {
                 println!("Translated Grammar:\n{}", translated_grammar.table);
+                let result = translated_grammar.parse(r#"{"a":12}"#).format_ast();
+                println!("Parsed AST:\n{}", result);
             }
             Err(e) => {
                 println!("Error translating grammar: {:?}", e);

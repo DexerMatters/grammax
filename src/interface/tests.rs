@@ -5,16 +5,13 @@ use color_print::cprintln;
 use crate::{
     interface::BasicInterface,
     new_grammar,
-    parsec::{view::NodeView, words::*},
+    parsec::words::*,
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
         layers::{AstArena, AstCell, AstVec, NodePath, ParseTreeIR},
         passes::{AstMapper, IncrementalLowerer},
     },
 };
-
-#[cfg(feature = "webui")]
-use crate::interface::webui::WebPreviewInterface;
 
 #[cfg(feature = "webui")]
 use std::thread;
@@ -124,8 +121,10 @@ fn test_tap_prints_cst_commands() {
         }
     });
 
-    let runtime = pass.build_runtime::<WebPreviewInterface<_>>(grammar);
-    runtime.run().expect("Failed to run runtime");
+    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
+    runtime
+        .insert(0, r#"{"key1": "value1", "key2": 123}"#)
+        .unwrap();
 }
 
 #[cfg(feature = "webui")]

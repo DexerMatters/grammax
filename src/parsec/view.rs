@@ -103,11 +103,17 @@ impl NodeView {
     pub fn text(&self) -> String {
         let node = self.alloc.node(self.green);
         if matches!(&node.tag, Tag::Token { .. } | Tag::Error(_)) {
-            return self
-                .token_texts
-                .get(&self.green)
-                .cloned()
-                .unwrap_or_default();
+            if let Some(text) = self.token_texts.get(&self.green) {
+                return text.clone();
+            }
+            // Fall back to source slice when token_texts is not populated.
+            if !self.source.is_empty() {
+                let width = node.width;
+                let start = self.offset.min(self.source.len());
+                let end = self.offset.saturating_add(width).min(self.source.len());
+                return self.source[start..end].to_string();
+            }
+            return String::new();
         }
 
         if !self.source.is_empty() {
@@ -130,6 +136,31 @@ impl NodeView {
 
     pub fn text_trimmed(&self) -> String {
         self.text().trim().to_string()
+    }
+
+    pub fn text_normalized(&self) -> String {
+        let input = self.text();
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars();
+
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                out.push(ch);
+                continue;
+            }
+
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => out.push(other),
+                None => out.push('\\'),
+            }
+        }
+
+        out
     }
 
     pub fn span_bytes(&self) -> (usize, usize) {

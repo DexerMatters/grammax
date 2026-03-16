@@ -147,12 +147,14 @@ where
 
         let (handler, sender_to_stop) = server.stoppable();
 
+        // Clone the sender for the ctrl+c handler before moving it
+        let sender_clone = sender_to_stop.clone();
         ctrlc::set_handler(move || {
-            cprintln!("Stopping web preview server...");
-            sender_to_stop.send(()).unwrap();
+            cprintln!("\nStopping web preview server...");
+            let _ = sender_clone.send(());
         })
         .map_err(|e| runtime::RuntimeError::InvalidRequest {
-            message: e.to_string(),
+            message: format!("Failed to set Ctrl+C handler: {}", e),
         })?;
 
         let _ = handler.join();

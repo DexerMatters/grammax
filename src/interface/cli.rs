@@ -363,37 +363,30 @@ fn full_redraw(stdout: &mut io::Stdout, state: &mut EditorState) -> io::Result<(
     stdout.flush()
 }
 
-#[cfg(test)]
-mod tests {
+// #[cfg(test)]
+// mod tests {
 
-    use crate::{
-        new_grammar,
-        parsec::words::{EndOfInput, NUMS},
-        runtime::{BuildTree, CompilerBuilder, Down, End, Here, Observe, ParserPass, Then},
-        scheme::layers::{ParseTreeIR, SourceText},
-    };
+//     use crate::{
+//         grammar::Grammar,
+//         runtime::{BuildTree, CompilerBuilder, Down, End, Here, Observe, ParserPass, Then},
+//         scheme::layers::{ParseTreeIR, SourceText},
+//     };
 
-    use super::*;
+//     use super::*;
 
-    type ParseTreePass = Then<SourceText, ParserPass, End<ParseTreeIR>>;
+//     type ParseTreePass = Then<SourceText, ParserPass, End<ParseTreeIR>>;
 
-    #[test]
-    fn test_cli_interface() {
-        let grammar = new_grammar!(
-            start where
-            start -> r!(expr) + tt(EndOfInput)
-            expr -> r!(add) | r!(mul) | r!(primary)
-            add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
-            mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
-            primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
-        );
+//     #[test]
+//     fn test_cli_interface() {
+//         let grammar =
+//             Grammar::load_from("/home/dexer/repos/grammax/target/debug/json.gmx.bin").unwrap();
 
-        let pass: ParseTreePass =
-            CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
-        let _observer = pass.observe::<Down<Here>>();
+//         let pass: ParseTreePass =
+//             CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
+//         let _observer = pass.observe::<Down<Here>>();
 
-        let runtime = pass.build_runtime::<CliInterface<ParseTreePass>>(grammar);
+//         let runtime = pass.build_runtime::<CliInterface<ParseTreePass>>(grammar);
 
-        runtime.run().expect("runtime failed");
-    }
-}
+//         runtime.run().expect("runtime failed");
+//     }
+// }

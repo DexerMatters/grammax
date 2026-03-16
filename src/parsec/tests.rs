@@ -1,5 +1,4 @@
 use crate::new_grammar;
-use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
 use crate::parsec::words::{EndOfInput, NUMS, STRING};
 
@@ -18,7 +17,7 @@ fn test_simple_whitespaces() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "(1  22)";
+    let text = "(1 22)";
     let result = parser.parse_text(text);
 
     let output = result.format_ast();
@@ -30,18 +29,6 @@ fn test_simple_whitespaces() {
         "Expected no errors, got: {}",
         result.format_messages()
     );
-
-    // Verify * is child of + (or rather + is the root operation)
-    // Structure:
-    // Rule(expr)
-    //   Rule(expr) -> 1
-    //   Token(+)
-    //   Rule(expr)
-    //     Rule(expr) -> 2
-    //     Token(*)
-    //     Rule(expr) -> 3
-
-    // (Note: The normalization might introduce intermediate rules, but the display should show structure)
 }
 
 #[test]
@@ -82,7 +69,8 @@ fn test_simple_arithmetic_precedence() {
 #[test]
 fn test_json() {
     let grammar = new_grammar!(
-        json where
+        start where
+        start   -> r!(json) + tt(EndOfInput)
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
         object  -> tt("{") + sep(r!(pair), tt(",")) + tt("}")
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))

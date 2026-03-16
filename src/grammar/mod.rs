@@ -36,43 +36,6 @@ macro_rules! r {
     };
 }
 
-/// A macro that introduces an embedded DSL for defining grammars in more ergonomic way than using `Grammar::new` directly.
-///
-/// # Example
-/// ```
-/// use grammax::{new_grammar, r};
-/// use grammax::grammar::dsl::{t, tt};
-/// use grammax::parsec::words::{EndOfInput, NUMS};
-///
-/// let grammar = new_grammar! {
-///     start where
-///     start -> r!(expr) + t(EndOfInput)
-///     expr -> r!(expr) + tt("+") + r!(term) | r!(term)
-///     term -> t(NUMS) | tt("(") + r!(expr) + tt(")")
-/// };
-/// ```
-///
-/// is equivalent to:
-///
-/// ```
-/// use grammax::grammar::{dsl::{GrammarNode, t, tt}, Grammar};
-/// use grammax::parsec::words::{EndOfInput, NUMS};
-/// use grammax::r;
-///
-/// fn start() -> GrammarNode {
-///     r!(expr) + t(EndOfInput)
-/// }
-///
-/// fn expr() -> GrammarNode {
-///     r!(expr) + tt("+") + r!(term) | r!(term)
-/// }
-///
-/// fn term() -> GrammarNode {
-///     t(NUMS) | tt("(") + r!(expr) + tt(")")
-/// }
-///
-/// let grammar = Grammar::new(start(), "start");
-/// ```
 #[macro_export]
 macro_rules! new_grammar {
 	($start: ident where $($name: ident -> $node: expr)*) => {
@@ -342,7 +305,7 @@ impl Grammar {
     }
 
     /// Load a grammar from a grammax binary file.
-    pub fn load_from(path: &Path) -> io::Result<&'static Self> {
+    pub fn load_from(path: impl AsRef<Path>) -> io::Result<&'static Self> {
         let bytes = fs::read(path)?;
         let grammar = cache::deserialize_grammar_file(&bytes)?;
         Ok(Box::leak(Box::new(grammar)))

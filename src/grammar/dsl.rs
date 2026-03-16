@@ -91,13 +91,13 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
     result
         .viewer()
         .on_token::<bool, _>("!", |_viewer, _node| ViewAction::Exact(true))
-        .on_field::<&'static str, _>("name", |viewer, node| {
-            let name = node[0].view::<String>(viewer);
-            ViewAction::Exact(leak_str(name.trim()))
+        .on_field::<&'static str, _>("name", |_viewer, node| {
+            let name = node.text_trimmed();
+            ViewAction::Exact(leak_str(&name))
         })
-        .on_field::<&'static str, _>("field_name", |viewer, node| {
-            let name = node[0].view::<String>(viewer);
-            ViewAction::Exact(leak_str(name.trim()))
+        .on_field::<&'static str, _>("field_name", |_viewer, node| {
+            let name = node.text_trimmed();
+            ViewAction::Exact(leak_str(&name))
         })
         .on_field::<GrammarNode, _>("definition", |viewer, node| {
             ViewAction::Exact(node[0].view::<GrammarNode>(viewer))
@@ -107,8 +107,8 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
         })
         .on_rule::<GrammarNode, _>("expr", |_viewer, _node| ViewAction::Relay)
         .on_rule::<GrammarNode, _>("primary", |_viewer, _node| ViewAction::Relay)
-        .on_rule::<String, _>("token", |viewer, node| {
-            ViewAction::Exact(node[0].view::<String>(viewer).trim().to_string())
+        .on_rule::<String, _>("token", |_viewer, node| {
+            ViewAction::Exact(node.text_trimmed().to_string())
         })
         .on_rule::<String, _>("literal", |viewer, node| {
             ViewAction::Exact(node[1].view::<String>(viewer))
@@ -222,13 +222,13 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
         })
         .on_rule::<GrammarNode, _>("reference", |_viewer, node| {
             ViewAction::Exact(GrammarNode::UnboundReference(
-                node[0].text_trimmed(),
+                node.text_trimmed(),
                 node.span(),
             ))
         })
-        .on_rule::<GrammarNode, _>("token", |viewer, node| {
+        .on_rule::<GrammarNode, _>("token", |_viewer, node| {
             ViewAction::Exact(grammar_token_from_text(
-                &node[0].view::<String>(viewer),
+                &node.text_trimmed(),
                 node.span(),
                 false,
             ))
@@ -341,7 +341,7 @@ fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNo
                 Arc::new(words::token(words::EndOfInput))
             }
         }
-        _ => panic!("Unsupported token type: {}", token_name),
+        t => panic!("Unsupported token type: {}", t),
     };
     GrammarNode::Terminal(matcher, span)
 }

@@ -2,9 +2,7 @@ use std::fmt::Display;
 
 use crossbeam::channel;
 
-use crate::utils::Span;
-
-use super::payload::Payload;
+use crate::utils::{Payload, Span};
 
 pub type RevisionId = u64;
 
@@ -38,9 +36,9 @@ impl Display for RuntimePath {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct RuntimeEvent {
+pub(crate) struct RuntimeEvent {
     pub revision: RevisionId,
     pub layer_path: RuntimePath,
     pub pass_path: RuntimePath,
@@ -48,23 +46,18 @@ pub struct RuntimeEvent {
     pub payload: Payload,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RuntimeSignalKind {
-    Accepted,
-    Event,
-    QueryResult,
-    Ack,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum RuntimeSignal {
+pub(crate) enum RuntimeSignal {
     Accepted {
         revision: RevisionId,
     },
-    Event {
-        event: RuntimeEvent,
+    /// Returned by `ApplyAndFetch`: the transaction produced by the requested
+    /// layer for this edit, delivered once the pipeline has settled.
+    EditResult {
+        revision: RevisionId,
+        layer_path: RuntimePath,
+        value: Payload,
     },
     QueryResult {
         layer_path: RuntimePath,
@@ -73,70 +66,24 @@ pub enum RuntimeSignal {
     Ack,
 }
 
-impl RuntimeSignal {
-    pub fn kind(&self) -> RuntimeSignalKind {
-        match self {
-            Self::Accepted { .. } => RuntimeSignalKind::Accepted,
-            Self::Event { .. } => RuntimeSignalKind::Event,
-            Self::QueryResult { .. } => RuntimeSignalKind::QueryResult,
-            Self::Ack => RuntimeSignalKind::Ack,
-        }
-    }
-
-    pub fn revision(&self) -> Option<RevisionId> {
-        match self {
-            Self::Accepted { revision } => Some(*revision),
-            Self::Event { event } => Some(event.revision),
-            Self::QueryResult { .. } | Self::Ack => None,
-        }
-    }
-
-    pub fn event(&self) -> Option<&RuntimeEvent> {
-        match self {
-            Self::Event { event } => Some(event),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct RuntimeSelector {
-    pub revision: Option<RevisionId>,
-    pub kind: Option<RuntimeSignalKind>,
-}
-
-impl RuntimeSelector {
-    pub fn any() -> Self {
-        Self::default()
-    }
-
-    pub fn events() -> Self {
-        Self::default().with_kind(RuntimeSignalKind::Event)
-    }
-
-    pub fn revision(revision: RevisionId) -> Self {
-        Self {
-            revision: Some(revision),
-            ..Self::default()
-        }
-    }
-
-    pub fn with_kind(mut self, kind: RuntimeSignalKind) -> Self {
-        self.kind = Some(kind);
-        self
-    }
-}
-
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum RuntimeRequest {
+pub(crate) enum RuntimeRequest {
+    /// Fire-and-forget edit; replies immediately with `Accepted { revision }`.
     ApplyTextEdit {
         span: Span,
         text: String,
     },
+    /// Edit and wait for `layer_path` to settle; replies with `EditResult`
+    /// containing the `Transaction<I>` produced by that layer.
+    ApplyAndFetch {
+        span: Span,
+        text: String,
+        layer_path: RuntimePath,
+    },
     QueryLayer {
         layer_path: RuntimePath,
+        revision: Option<RevisionId>,
         index: Payload,
     },
     Shutdown,
@@ -149,6 +96,8 @@ pub enum RuntimeError {
     ChannelClosed,
     InvalidQuery,
     InvalidRequest { message: String },
+    UnexpectedRequestType,
+    UndefinedBehavior { message: String },
 }
 
 impl Display for RuntimeError {
@@ -158,14 +107,16 @@ impl Display for RuntimeError {
             Self::ChannelClosed => write!(f, "Runtime channel is closed"),
             Self::InvalidQuery => write!(f, "Invalid query"),
             Self::InvalidRequest { message } => write!(f, "Invalid request: {}", message),
+            Self::UnexpectedRequestType => write!(f, "Unexpected request type"),
+            Self::UndefinedBehavior { message } => write!(f, "Undefined behavior: {}", message),
         }
     }
 }
 
-pub type RuntimeResult<T = RuntimeSignal> = Result<T, RuntimeError>;
+pub(crate) type RuntimeResult<T = RuntimeSignal> = Result<T, RuntimeError>;
 
 #[derive(Debug)]
-pub struct RuntimeEnvelope {
+pub(crate) struct RuntimeEnvelope {
     pub request: RuntimeRequest,
     pub reply: channel::Sender<RuntimeResult>,
 }

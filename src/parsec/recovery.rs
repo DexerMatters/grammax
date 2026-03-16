@@ -17,6 +17,7 @@ pub struct RecoveryCacheKey {
     stack_state: usize,
     pos: usize,
     string_opened: bool,
+    scope_hash: u64,
 }
 
 pub type RecoveryCache = FxHashMap<RecoveryCacheKey, Vec<Vec<RepairOp>>>;
@@ -243,17 +244,21 @@ pub fn recover(
     string_opened: bool,
     config: &RecoveryConfig,
     cache: Option<&mut RecoveryCache>,
+    bridge_specs: &[BridgeSpec],
+    open_scope_stack: &[OpenScopeToken],
 ) -> Vec<Vec<RepairOp>> {
     if stack.is_empty() {
         return Vec::new();
     }
 
     let stack_hash = hash_stack_slice(stack);
+    let scope_hash = hash_open_scopes(open_scope_stack);
     let cache_key = RecoveryCacheKey {
         stack_hash,
         stack_state: *stack.last().unwrap(),
         pos,
         string_opened,
+        scope_hash,
     };
     if let Some(cache) = cache.as_ref() {
         if let Some(hit) = cache.get(&cache_key) {
@@ -359,7 +364,15 @@ pub fn recover(
             }
 
             // CR Insert
-            for next in cr_insert(analysis, productions, &insert_candidates, &cfg) {
+            for next in cr_insert(
+                analysis,
+                productions,
+                &insert_candidates,
+                &token_stream,
+                &cfg,
+                bridge_specs,
+                open_scope_stack,
+            ) {
                 if next.cost < buckets.len() {
                     buckets[next.cost].push_back(next);
                 }
@@ -440,13 +453,29 @@ fn cr_insert(
     analysis: &GrammarStateAnalysis,
     productions: &[Production],
     insert_candidates: &[Vec<usize>],
+    tokens: &TokenStream,
     cfg: &Config,
+    bridge_specs: &[BridgeSpec],
+    open_scope_stack: &[OpenScopeToken],
 ) -> Vec<Config> {
     let mut result = Vec::new();
 
     // Get expected terminals at current state
     if let Some(candidates) = insert_candidates.get(cfg.stack.state) {
-        for &term_ix in candidates {
+        let preferred = prioritize_insert_candidates(
+            candidates,
+            tokens,
+            cfg.pos,
+            bridge_specs,
+            open_scope_stack,
+        );
+
+        for term_ix in preferred.iter().copied().chain(
+            candidates
+                .iter()
+                .copied()
+                .filter(|term_ix| !preferred.contains(term_ix)),
+        ) {
             // Try to shift this inserted terminal
             if let Some(new_stack) = simulate_shift(analysis, productions, &cfg.stack, term_ix) {
                 let new_repairs = RepairMerge::new(RepairOp::Insert(term_ix), cfg.repairs.clone());
@@ -464,6 +493,56 @@ fn cr_insert(
     }
 
     result
+}
+
+fn prioritize_insert_candidates(
+    candidates: &[usize],
+    tokens: &TokenStream,
+    pos: usize,
+    bridge_specs: &[BridgeSpec],
+    open_scope_stack: &[OpenScopeToken],
+) -> Vec<usize> {
+    if candidates.len() <= 1 {
+        return candidates.to_vec();
+    }
+
+    let (lookahead, _) = lex_at_stream(tokens, pos);
+    if lookahead == EOF_TOKEN || lookahead == UNKNOWN_TOKEN {
+        return candidates.to_vec();
+    }
+
+    let candidate_set = candidates.iter().copied().collect::<HashSet<_>>();
+
+    for open_scope in open_scope_stack.iter().rev() {
+        let Some(spec) = bridge_specs
+            .iter()
+            .find(|spec| spec.open == open_scope.term_idx)
+        else {
+            continue;
+        };
+
+        if !spec.included.contains(&lookahead)
+            && !spec
+                .precedence
+                .iter()
+                .any(|rule| rule.before.contains(&lookahead))
+        {
+            continue;
+        }
+
+        let mut prioritized = Vec::new();
+        for rule in &spec.precedence {
+            if rule.before.contains(&lookahead) && candidate_set.contains(&rule.terminal) {
+                prioritized.push(rule.terminal);
+            }
+        }
+
+        if !prioritized.is_empty() {
+            return prioritized;
+        }
+    }
+
+    candidates.to_vec()
 }
 
 // CR Delete: Delete next token (Figure 5)
@@ -947,6 +1026,14 @@ fn hash_stack_slice(stack: &[usize]) -> u64 {
     for &state in stack {
         let next = hash_stack(cur, state);
         cur = Some(next);
+    }
+    cur.unwrap_or_else(|| hash_stack(None, 0))
+}
+
+fn hash_open_scopes(open_scope_stack: &[OpenScopeToken]) -> u64 {
+    let mut cur: Option<u64> = None;
+    for scope in open_scope_stack {
+        cur = Some(hash_stack(cur, scope.term_idx));
     }
     cur.unwrap_or_else(|| hash_stack(None, 0))
 }

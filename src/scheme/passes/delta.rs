@@ -2,20 +2,24 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    runtime::Command,
-    runtime::Payload,
-    scheme::layers::{NodePath, ParseNodeValue, ParseTreeQuery},
+    scheme::layers::{NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue},
 };
 
 const MAX_LCS_CELLS: usize = 4096;
+
+type Command = crate::scheme::Command<ParseTreeIR>;
+type EqCache = FxHashMap<(usize, usize, usize, usize, bool), bool>;
+type AlignCache = FxHashMap<(usize, usize), bool>;
 
 pub(crate) fn generate_commands_incremental(
     alloc: &TreeAllocRef,
     path: &NodePath,
     old_green: usize,
     new_green: usize,
+    old_green_offset: usize,
     new_green_offset: usize,
-    source_text: &str,
+    old_source_text: &str,
+    new_source_text: &str,
     current_is_root: bool,
 ) -> Vec<Command> {
     let mut commands = Vec::new();
@@ -27,8 +31,10 @@ pub(crate) fn generate_commands_incremental(
         alloc,
         old_green,
         new_green,
+        old_green_offset,
         new_green_offset,
-        source_text,
+        old_source_text,
+        new_source_text,
         path,
         current_is_root,
         &mut commands,
@@ -40,47 +46,155 @@ pub(crate) fn generate_commands_incremental(
     commands
 }
 
-/// Generate a full-tree snapshot as commands: creates every node and inserts the root.
-/// Used to bootstrap a fresh client that has no prior tree state.
+/// Generate a full-tree snapshot as a minimal command sequence:
+/// N `Create` commands (post-order, leaves first) followed by a single
+/// root `Insert` that sets the CST root.
+///
+/// The lowering pass detects the root `Insert` and performs its own DFS
+/// over the newly-applied upstream CST to discover all dirty anchors.
+/// This keeps the transaction size at O(N) instead of O(2N).
 pub(crate) fn generate_commands_for_full_tree(
     alloc: &TreeAllocRef,
     root_green: usize,
     source_text: &str,
 ) -> Vec<Command> {
-    let mut commands = Vec::new();
+    let mut creates: Vec<Command> = Vec::new();
     let mut next_node_id = 1usize;
 
-    let node_id = emit_create_commands_from_green(
+    let root_id = collect_full_tree_creates(
         alloc,
         root_green,
         0,
         source_text,
-        &mut commands,
+        &mut creates,
         &mut next_node_id,
     );
 
-    commands.push(Command::Insert {
+    creates.push(Command::Insert {
         index: ParseTreeQuery::Path(NodePath(vec![])),
-        id: node_id,
+        id: root_id,
     });
+    creates
+}
 
-    commands
+/// Recursively collect `Create` commands for `green` (post-order).
+///
+/// Single-child Field nodes are **transparent**: the child is promoted
+/// directly in the parent's children list (the Field node itself is never
+/// created).  This mirrors the path convention used by `emit_commands_for_delta`
+/// so CST paths are consistent between full-parse and incremental transactions.
+///
+/// Returns the staging ID assigned to this node (or its promoted child).
+fn collect_full_tree_creates(
+    alloc: &TreeAllocRef,
+    green: usize,
+    offset: usize,
+    source_text: &str,
+    creates: &mut Vec<Command>,
+    next_node_id: &mut usize,
+) -> usize {
+    let node = alloc.get_node(green);
+
+    // Single-child Field: transparent — skip the wrapper, promote the child.
+    if let Tag::Field { .. } = &node.tag {
+        if node.children.len() == 1 {
+            return collect_full_tree_creates(
+                alloc,
+                node.children[0],
+                offset,
+                source_text,
+                creates,
+                next_node_id,
+            );
+        }
+    }
+
+    // Process children post-order so staging IDs are emitted before parents.
+    let mut child_staging_ids: Vec<usize> = Vec::new();
+    let mut child_offset = offset;
+    for &child_green in &node.children {
+        let child_width = alloc.get_node(child_green).width;
+        let child_id = collect_full_tree_creates(
+            alloc,
+            child_green,
+            child_offset,
+            source_text,
+            creates,
+            next_node_id,
+        );
+        child_staging_ids.push(child_id);
+        child_offset += child_width;
+    }
+
+    let node_id = *next_node_id;
+    *next_node_id = next_node_id.saturating_add(1);
+
+    let field = String::new();
+    match &node.tag {
+        Tag::Token { rule_ix } => {
+            let text =
+                token_text_for_node(&node.tag, offset, node.width, source_text).unwrap_or_default();
+            creates.push(Command::Create {
+                id: node_id,
+                value: ParseTreeValue::Node(ParseNodeValue::Token {
+                    rule_ix: *rule_ix,
+                    text,
+                    field,
+                }),
+            });
+        }
+        Tag::Error(err) => {
+            let text =
+                token_text_for_node(&node.tag, offset, node.width, source_text).unwrap_or_default();
+            creates.push(Command::Create {
+                id: node_id,
+                value: ParseTreeValue::Node(ParseNodeValue::Error {
+                    error: err.clone(),
+                    text,
+                    field,
+                }),
+            });
+        }
+        Tag::Rule { rule_ix, .. } | Tag::Field { rule_ix, .. } => {
+            creates.push(Command::Create {
+                id: node_id,
+                value: ParseTreeValue::Node(ParseNodeValue::Node {
+                    rule_ix: *rule_ix,
+                    children: child_staging_ids,
+                    field,
+                }),
+            });
+        }
+    }
+
+    node_id
 }
 
 fn emit_commands_for_delta(
     alloc: &TreeAllocRef,
     old_green: usize,
     new_green: usize,
+    old_green_offset: usize,
     new_green_offset: usize,
-    source_text: &str,
+    old_source_text: &str,
+    new_source_text: &str,
     path: &NodePath,
     _current_is_root: bool,
     out: &mut Vec<Command>,
     next_node_id: &mut usize,
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
-    align_cache: &mut FxHashMap<(usize, usize), bool>,
+    eq_cache: &mut EqCache,
+    align_cache: &mut AlignCache,
 ) {
-    if old_green == new_green || greens_equivalent(alloc, old_green, new_green, eq_cache) {
+    if greens_equivalent(
+        alloc,
+        old_green,
+        new_green,
+        old_green_offset,
+        new_green_offset,
+        old_source_text,
+        new_source_text,
+        eq_cache,
+    ) {
         return;
     }
 
@@ -94,7 +208,7 @@ fn emit_commands_for_delta(
             path,
             new_green,
             new_green_offset,
-            source_text,
+            new_source_text,
             out,
             next_node_id,
         );
@@ -116,8 +230,10 @@ fn emit_commands_for_delta(
                 alloc,
                 old_child,
                 new_child,
+                old_green_offset,
                 new_green_offset,
-                source_text,
+                old_source_text,
+                new_source_text,
                 path,
                 false,
                 out,
@@ -139,15 +255,34 @@ fn emit_commands_for_delta(
             path,
             new_green,
             new_green_offset,
-            source_text,
+            new_source_text,
             out,
             next_node_id,
         );
         return;
     }
 
-    let prefix = common_prefix_len(alloc, old_children, new_children, eq_cache);
-    let suffix = common_suffix_len(alloc, old_children, new_children, prefix, eq_cache);
+    let prefix = common_prefix_len(
+        alloc,
+        old_children,
+        new_children,
+        old_green_offset,
+        new_green_offset,
+        old_source_text,
+        new_source_text,
+        eq_cache,
+    );
+    let suffix = common_suffix_len(
+        alloc,
+        old_children,
+        new_children,
+        old_green_offset,
+        new_green_offset,
+        prefix,
+        old_source_text,
+        new_source_text,
+        eq_cache,
+    );
 
     let old_mid_start = prefix;
     let old_mid_end = old_children.len().saturating_sub(suffix);
@@ -175,7 +310,7 @@ fn emit_commands_for_delta(
                 alloc,
                 insert_child,
                 insert_offset,
-                source_text,
+                new_source_text,
                 out,
                 next_node_id,
             );
@@ -212,8 +347,10 @@ fn emit_commands_for_delta(
         old_mid_end,
         new_mid_start,
         new_mid_end,
+        old_green_offset,
         new_green_offset,
-        source_text,
+        old_source_text,
+        new_source_text,
         out,
         next_node_id,
         eq_cache,
@@ -231,8 +368,10 @@ fn emit_commands_for_delta(
         old_mid_end,
         new_mid_start,
         new_mid_end,
+        old_green_offset,
         new_green_offset,
-        source_text,
+        old_source_text,
+        new_source_text,
         out,
         next_node_id,
         eq_cache,
@@ -250,8 +389,10 @@ fn emit_commands_for_delta(
         old_mid_end,
         new_mid_start,
         new_mid_end,
+        old_green_offset,
         new_green_offset,
-        source_text,
+        old_source_text,
+        new_source_text,
         out,
         next_node_id,
         eq_cache,
@@ -271,7 +412,7 @@ fn emit_commands_for_delta(
             new_mid_start,
             new_mid_end,
             new_green_offset,
-            source_text,
+            new_source_text,
             out,
             next_node_id,
         );
@@ -287,8 +428,10 @@ fn emit_commands_for_delta(
         old_mid_end,
         new_mid_start,
         new_mid_end,
+        old_green_offset,
         new_green_offset,
-        source_text,
+        old_source_text,
+        new_source_text,
         out,
         next_node_id,
         eq_cache,
@@ -403,12 +546,14 @@ fn try_emit_by_greedy_tag_match(
     old_mid_end: usize,
     new_mid_start: usize,
     new_mid_end: usize,
+    old_green_offset: usize,
     new_green_offset: usize,
-    source_text: &str,
+    old_source_text: &str,
+    new_source_text: &str,
     out: &mut Vec<Command>,
     next_node_id: &mut usize,
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
-    align_cache: &mut FxHashMap<(usize, usize), bool>,
+    eq_cache: &mut EqCache,
+    align_cache: &mut AlignCache,
 ) -> bool {
     let old_mid = &old_children[old_mid_start..old_mid_end];
     let new_mid = &new_children[new_mid_start..new_mid_end];
@@ -484,7 +629,13 @@ fn try_emit_by_greedy_tag_match(
             let old_child = old_mid[old_rel];
             let mut child_path = path.clone();
             child_path.0.push(current_index);
-            let child_offset = child_offset_at(
+            let old_child_offset = child_offset_at(
+                alloc,
+                old_children,
+                old_green_offset,
+                old_mid_start + old_rel,
+            );
+            let new_child_offset = child_offset_at(
                 alloc,
                 new_children,
                 new_green_offset,
@@ -494,8 +645,10 @@ fn try_emit_by_greedy_tag_match(
                 alloc,
                 old_child,
                 new_child,
-                child_offset,
-                source_text,
+                old_child_offset,
+                new_child_offset,
+                old_source_text,
+                new_source_text,
                 &child_path,
                 false,
                 &mut buf,
@@ -517,7 +670,7 @@ fn try_emit_by_greedy_tag_match(
                 alloc,
                 new_child,
                 insert_offset,
-                source_text,
+                new_source_text,
                 &mut buf,
                 &mut child_node_id,
             );
@@ -556,12 +709,14 @@ fn try_emit_insertions_as_subsequence_aligned(
     old_mid_end: usize,
     new_mid_start: usize,
     new_mid_end: usize,
+    old_green_offset: usize,
     new_green_offset: usize,
-    source_text: &str,
+    old_source_text: &str,
+    new_source_text: &str,
     out: &mut Vec<Command>,
     next_node_id: &mut usize,
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
-    align_cache: &mut FxHashMap<(usize, usize), bool>,
+    eq_cache: &mut EqCache,
+    align_cache: &mut AlignCache,
 ) -> bool {
     let old_mid = &old_children[old_mid_start..old_mid_end];
     let new_mid = &new_children[new_mid_start..new_mid_end];
@@ -599,7 +754,7 @@ fn try_emit_insertions_as_subsequence_aligned(
             &insert_path,
             insert_child,
             insert_offset,
-            source_text,
+            new_source_text,
             out,
             next_node_id,
         );
@@ -608,7 +763,13 @@ fn try_emit_insertions_as_subsequence_aligned(
     for (old_rel, new_rel) in matches {
         let mut child_path = path.clone();
         child_path.0.push(old_mid_start + new_rel);
-        let child_offset = child_offset_at(
+        let old_child_offset = child_offset_at(
+            alloc,
+            old_children,
+            old_green_offset,
+            old_mid_start + old_rel,
+        );
+        let new_child_offset = child_offset_at(
             alloc,
             new_children,
             new_green_offset,
@@ -618,8 +779,10 @@ fn try_emit_insertions_as_subsequence_aligned(
             alloc,
             old_mid[old_rel],
             new_mid[new_rel],
-            child_offset,
-            source_text,
+            old_child_offset,
+            new_child_offset,
+            old_source_text,
+            new_source_text,
             &child_path,
             false,
             out,
@@ -642,12 +805,14 @@ fn try_emit_deletions_as_subsequence_aligned(
     old_mid_end: usize,
     new_mid_start: usize,
     new_mid_end: usize,
+    old_green_offset: usize,
     new_green_offset: usize,
-    source_text: &str,
+    old_source_text: &str,
+    new_source_text: &str,
     out: &mut Vec<Command>,
     next_node_id: &mut usize,
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
-    align_cache: &mut FxHashMap<(usize, usize), bool>,
+    eq_cache: &mut EqCache,
+    align_cache: &mut AlignCache,
 ) -> bool {
     let old_mid = &old_children[old_mid_start..old_mid_end];
     let new_mid = &new_children[new_mid_start..new_mid_end];
@@ -667,14 +832,22 @@ fn try_emit_deletions_as_subsequence_aligned(
         {
             let mut child_path = path.clone();
             child_path.0.push(current_index);
-            let child_offset =
-                child_offset_at(alloc, old_children, new_green_offset, current_index);
+            let old_child_offset =
+                child_offset_at(alloc, old_children, old_green_offset, current_index);
+            let new_child_offset = child_offset_at(
+                alloc,
+                new_children,
+                new_green_offset,
+                new_mid_start + new_ix,
+            );
             emit_commands_for_delta(
                 alloc,
                 old_child,
                 new_mid[new_ix],
-                child_offset,
-                source_text,
+                old_child_offset,
+                new_child_offset,
+                old_source_text,
+                new_source_text,
                 &child_path,
                 false,
                 &mut buf,
@@ -712,27 +885,31 @@ fn emit_lcs_diff(
     old_mid_end: usize,
     new_mid_start: usize,
     new_mid_end: usize,
+    old_green_offset: usize,
     new_green_offset: usize,
-    source_text: &str,
+    old_source_text: &str,
+    new_source_text: &str,
     out: &mut Vec<Command>,
     next_node_id: &mut usize,
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
-    align_cache: &mut FxHashMap<(usize, usize), bool>,
+    eq_cache: &mut EqCache,
+    align_cache: &mut AlignCache,
 ) {
     let old_mid = &old_children[old_mid_start..old_mid_end];
     let new_mid = &new_children[new_mid_start..new_mid_end];
     let m = old_mid.len();
     let n = new_mid.len();
+    let cols = n + 1;
 
-    // Compute LCS lengths table using greens_align_equivalent
-    let mut dp = vec![vec![0usize; n + 1]; m + 1];
+    // Flat LCS lengths table: dp[i * cols + j] instead of dp[i][j].
+    let mut dp = vec![0usize; (m + 1) * cols];
     for i in (0..m).rev() {
         for j in (0..n).rev() {
-            dp[i][j] = if greens_align_equivalent(alloc, old_mid[i], new_mid[j], align_cache) {
-                1 + dp[i + 1][j + 1]
-            } else {
-                dp[i + 1][j].max(dp[i][j + 1])
-            };
+            dp[i * cols + j] =
+                if greens_align_equivalent(alloc, old_mid[i], new_mid[j], align_cache) {
+                    1 + dp[(i + 1) * cols + (j + 1)]
+                } else {
+                    dp[(i + 1) * cols + j].max(dp[i * cols + (j + 1)])
+                };
         }
     }
 
@@ -747,7 +924,7 @@ fn emit_lcs_diff(
             matched_pairs.push((i, j));
             i += 1;
             j += 1;
-        } else if j >= n || (i < m && dp[i + 1][j] >= dp[i][j + 1]) {
+        } else if j >= n || (i < m && dp[(i + 1) * cols + j] >= dp[i * cols + (j + 1)]) {
             unmatched_old.push(i);
             i += 1;
         } else {
@@ -780,7 +957,7 @@ fn emit_lcs_diff(
             &insert_path,
             new_mid[new_rel],
             insert_offset,
-            source_text,
+            new_source_text,
             out,
             next_node_id,
         );
@@ -790,7 +967,13 @@ fn emit_lcs_diff(
     for (old_rel, new_rel) in matched_pairs {
         let mut child_path = path.clone();
         child_path.0.push(new_mid_start + new_rel);
-        let child_offset = child_offset_at(
+        let old_child_offset = child_offset_at(
+            alloc,
+            old_children,
+            old_green_offset,
+            old_mid_start + old_rel,
+        );
+        let new_child_offset = child_offset_at(
             alloc,
             new_children,
             new_green_offset,
@@ -800,8 +983,10 @@ fn emit_lcs_diff(
             alloc,
             old_mid[old_rel],
             new_mid[new_rel],
-            child_offset,
-            source_text,
+            old_child_offset,
+            new_child_offset,
+            old_source_text,
+            new_source_text,
             &child_path,
             false,
             out,
@@ -816,13 +1001,30 @@ fn common_prefix_len(
     alloc: &TreeAllocRef,
     old_children: &[usize],
     new_children: &[usize],
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
+    old_base_offset: usize,
+    new_base_offset: usize,
+    old_source_text: &str,
+    new_source_text: &str,
+    eq_cache: &mut EqCache,
 ) -> usize {
     let mut prefix = 0usize;
+    let mut old_offset = old_base_offset;
+    let mut new_offset = new_base_offset;
     while prefix < old_children.len()
         && prefix < new_children.len()
-        && greens_equivalent(alloc, old_children[prefix], new_children[prefix], eq_cache)
+        && greens_equivalent(
+            alloc,
+            old_children[prefix],
+            new_children[prefix],
+            old_offset,
+            new_offset,
+            old_source_text,
+            new_source_text,
+            eq_cache,
+        )
     {
+        old_offset += alloc.get_node(old_children[prefix]).width;
+        new_offset += alloc.get_node(new_children[prefix]).width;
         prefix += 1;
     }
     prefix
@@ -832,8 +1034,12 @@ fn common_suffix_len(
     alloc: &TreeAllocRef,
     old_children: &[usize],
     new_children: &[usize],
+    old_base_offset: usize,
+    new_base_offset: usize,
     prefix: usize,
-    eq_cache: &mut FxHashMap<(usize, usize), bool>,
+    old_source_text: &str,
+    new_source_text: &str,
+    eq_cache: &mut EqCache,
 ) -> usize {
     let mut suffix = 0usize;
     while suffix < old_children.len().saturating_sub(prefix)
@@ -842,6 +1048,20 @@ fn common_suffix_len(
             alloc,
             old_children[old_children.len() - 1 - suffix],
             new_children[new_children.len() - 1 - suffix],
+            child_offset_at(
+                alloc,
+                old_children,
+                old_base_offset,
+                old_children.len() - 1 - suffix,
+            ),
+            child_offset_at(
+                alloc,
+                new_children,
+                new_base_offset,
+                new_children.len() - 1 - suffix,
+            ),
+            old_source_text,
+            new_source_text,
             eq_cache,
         )
     {
@@ -850,79 +1070,114 @@ fn common_suffix_len(
     suffix
 }
 
+/// Shared implementation for both equivalence checks.
+/// `check_width`: if true, nodes must also have equal widths (full structural equality);
+///               if false, only tag and child-count must match (alignment equivalence).
+fn greens_compare(
+    alloc: &TreeAllocRef,
+    old_green: usize,
+    new_green: usize,
+    old_offset: usize,
+    new_offset: usize,
+    old_source_text: &str,
+    new_source_text: &str,
+    check_width: bool,
+    cache: &mut EqCache,
+) -> bool {
+    if !check_width && old_green == new_green {
+        return true;
+    }
+
+    let key = (old_green, new_green, old_offset, new_offset, check_width);
+    if let Some(&cached) = cache.get(&key) {
+        return cached;
+    }
+
+    let old_node = alloc.get_node(old_green);
+    let new_node = alloc.get_node(new_green);
+
+    let equivalent = if old_node.tag != new_node.tag
+        || old_node.children.len() != new_node.children.len()
+        || (check_width && old_node.width != new_node.width)
+    {
+        false
+    } else if old_node.children.is_empty() && new_node.children.is_empty() {
+        if check_width {
+            match token_text_for_node(&old_node.tag, old_offset, old_node.width, old_source_text)
+                .zip(token_text_for_node(
+                    &new_node.tag,
+                    new_offset,
+                    new_node.width,
+                    new_source_text,
+                )) {
+                Some((old_text, new_text)) => old_text == new_text,
+                None => true,
+            }
+        } else {
+            true
+        }
+    } else {
+        let mut old_child_offset = old_offset;
+        let mut new_child_offset = new_offset;
+        let mut all_equal = true;
+
+        for (&old_child, &new_child) in old_node.children.iter().zip(new_node.children.iter()) {
+            if !greens_compare(
+                alloc,
+                old_child,
+                new_child,
+                old_child_offset,
+                new_child_offset,
+                old_source_text,
+                new_source_text,
+                check_width,
+                cache,
+            ) {
+                all_equal = false;
+                break;
+            }
+
+            old_child_offset += alloc.get_node(old_child).width;
+            new_child_offset += alloc.get_node(new_child).width;
+        }
+
+        all_equal
+    };
+
+    cache.insert(key, equivalent);
+    equivalent
+}
+
+#[inline]
 fn greens_equivalent(
     alloc: &TreeAllocRef,
     old_green: usize,
     new_green: usize,
-    cache: &mut FxHashMap<(usize, usize), bool>,
+    old_offset: usize,
+    new_offset: usize,
+    old_source_text: &str,
+    new_source_text: &str,
+    cache: &mut EqCache,
 ) -> bool {
-    if old_green == new_green {
-        return true;
-    }
-
-    if let Some(&cached) = cache.get(&(old_green, new_green)) {
-        return cached;
-    }
-
-    let mut stack = vec![(old_green, new_green, false)];
-    while let Some((old_green, new_green, expanded)) = stack.pop() {
-        if old_green == new_green {
-            cache.insert((old_green, new_green), true);
-            continue;
-        }
-        if cache.contains_key(&(old_green, new_green)) {
-            continue;
-        }
-
-        let old_node = alloc.get_node(old_green);
-        let new_node = alloc.get_node(new_green);
-
-        if old_node.tag != new_node.tag
-            || old_node.width != new_node.width
-            || old_node.children.len() != new_node.children.len()
-        {
-            cache.insert((old_green, new_green), false);
-            continue;
-        }
-
-        if !expanded {
-            let child_pairs: Vec<_> = old_node
-                .children
-                .iter()
-                .copied()
-                .zip(new_node.children.iter().copied())
-                .collect();
-            drop(old_node);
-            drop(new_node);
-
-            stack.push((old_green, new_green, true));
-            for (old_child, new_child) in child_pairs.into_iter().rev() {
-                if !cache.contains_key(&(old_child, new_child)) {
-                    stack.push((old_child, new_child, false));
-                }
-            }
-            continue;
-        }
-
-        let equivalent = old_node
-            .children
-            .iter()
-            .copied()
-            .zip(new_node.children.iter().copied())
-            .all(|(old_child, new_child)| {
-                cache.get(&(old_child, new_child)).copied().unwrap_or(false)
-            });
-        cache.insert((old_green, new_green), equivalent);
-    }
-
-    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
+    greens_compare(
+        alloc,
+        old_green,
+        new_green,
+        old_offset,
+        new_offset,
+        old_source_text,
+        new_source_text,
+        true,
+        cache,
+    )
 }
 
+#[inline]
 fn greens_align_equivalent(
     alloc: &TreeAllocRef,
     old_green: usize,
     new_green: usize,
-    cache: &mut FxHashMap<(usize, usize), bool>,
+    cache: &mut AlignCache,
 ) -> bool {
     if old_green == new_green {
         return true;
@@ -932,54 +1187,22 @@ fn greens_align_equivalent(
         return cached;
     }
 
-    let mut stack = vec![(old_green, new_green, false)];
-    while let Some((old_green, new_green, expanded)) = stack.pop() {
-        if old_green == new_green {
-            cache.insert((old_green, new_green), true);
-            continue;
-        }
-        if cache.contains_key(&(old_green, new_green)) {
-            continue;
-        }
+    let old_node = alloc.get_node(old_green);
+    let new_node = alloc.get_node(new_green);
 
-        let old_node = alloc.get_node(old_green);
-        let new_node = alloc.get_node(new_green);
-
-        if old_node.tag != new_node.tag || old_node.children.len() != new_node.children.len() {
-            cache.insert((old_green, new_green), false);
-            continue;
-        }
-
-        if !expanded {
-            let child_pairs: Vec<_> = old_node
-                .children
-                .iter()
-                .copied()
-                .zip(new_node.children.iter().copied())
-                .collect();
-            drop(old_node);
-            drop(new_node);
-            stack.push((old_green, new_green, true));
-            for (old_child, new_child) in child_pairs.into_iter().rev() {
-                if !cache.contains_key(&(old_child, new_child)) {
-                    stack.push((old_child, new_child, false));
-                }
-            }
-            continue;
-        }
-
-        let equivalent = old_node
+    let equivalent = old_node.tag == new_node.tag
+        && old_node.children.len() == new_node.children.len()
+        && old_node
             .children
             .iter()
             .copied()
             .zip(new_node.children.iter().copied())
             .all(|(old_child, new_child)| {
-                cache.get(&(old_child, new_child)).copied().unwrap_or(false)
+                greens_align_equivalent(alloc, old_child, new_child, cache)
             });
-        cache.insert((old_green, new_green), equivalent);
-    }
 
-    cache.get(&(old_green, new_green)).copied().unwrap_or(false)
+    cache.insert((old_green, new_green), equivalent);
+    equivalent
 }
 
 fn emit_create_commands_from_green(
@@ -1095,7 +1318,7 @@ fn emit_create_commands_from_green_with_field(
                         .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Token {
+                    value: ParseTreeValue::Node(ParseNodeValue::Token {
                         rule_ix: *rule_ix,
                         text,
                         field,
@@ -1108,7 +1331,7 @@ fn emit_create_commands_from_green_with_field(
                         .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Error {
+                    value: ParseTreeValue::Node(ParseNodeValue::Error {
                         error: err.clone(),
                         text,
                         field,
@@ -1118,7 +1341,7 @@ fn emit_create_commands_from_green_with_field(
             Tag::Rule { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Node {
+                    value: ParseTreeValue::Node(ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,
@@ -1128,7 +1351,7 @@ fn emit_create_commands_from_green_with_field(
             Tag::Field { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: Payload::new(ParseNodeValue::Node {
+                    value: ParseTreeValue::Node(ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,

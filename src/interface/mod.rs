@@ -1,6 +1,17 @@
 use crossbeam::channel;
+use serde::Serialize;
+use std::marker::PhantomData;
 
-use crate::{grammar, runtime, utils};
+use crate::{
+    grammar,
+    runtime::{
+        self,
+        compiler::{ContainsPath, Here, TypedTree},
+        dispatcher::GlobalEventDispatcher,
+    },
+    scheme::{self},
+    utils,
+};
 
 pub mod cli;
 #[cfg(feature = "vsclsp")]
@@ -11,108 +22,179 @@ pub mod webui;
 #[cfg(test)]
 mod tests;
 
-pub trait Interface {
-    fn new(
-        sender: channel::Sender<runtime::RuntimeEnvelope>,
-        grammar: &'static grammar::Grammar,
-    ) -> Self
+pub trait Interface<Tree: TypedTree> {
+    fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self
     where
         Self: Sized;
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope>;
-    fn request(&self, request: runtime::RuntimeRequest) -> runtime::RuntimeResult {
-        let (reply_tx, reply_rx) = channel::bounded(1);
-        let envelope = runtime::RuntimeEnvelope {
-            request,
-            reply: reply_tx,
-        };
-        match self.sender().try_send(envelope) {
-            Ok(()) => reply_rx
-                .recv()
-                .map_err(|_| runtime::RuntimeError::ChannelClosed)?,
-            Err(channel::TrySendError::Full(_)) => Err(runtime::RuntimeError::QueueFull),
-            Err(channel::TrySendError::Disconnected(_)) => {
-                Err(runtime::RuntimeError::ChannelClosed)
-            }
-        }
-    }
-}
+    fn ged(&self) -> &GlobalEventDispatcher;
 
-pub struct BasicInterface {
-    sender: channel::Sender<runtime::RuntimeEnvelope>,
-}
-
-impl Interface for BasicInterface {
-    fn new(
-        sender: channel::Sender<runtime::RuntimeEnvelope>,
-        _grammar: &'static grammar::Grammar,
-    ) -> Self {
-        Self { sender }
-    }
-
-    fn sender(&self) -> &channel::Sender<runtime::RuntimeEnvelope> {
-        &self.sender
-    }
-}
-
-impl BasicInterface {
-    pub fn update(&self, start: usize, end: usize, text: &str) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::ApplyTextEdit {
-            span: utils::Span::new(start, end),
-            text: text.to_string(),
-        })
-    }
-
-    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult {
-        self.update(offset, offset, text)
-    }
-
-    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult {
-        self.update(start, end, "")
-    }
-
-    pub fn query_layer<I>(
-        &self,
-        layer_path: runtime::RuntimePath,
-        index: I,
-    ) -> runtime::RuntimeResult<runtime::Payload>
+    fn shutdown(&self) -> runtime::RuntimeResult<()>
     where
-        I: serde::Serialize + Send + Sync + 'static,
+        Self: Sized,
     {
-        let expected_layer = layer_path;
-        let signal = self.request(runtime::RuntimeRequest::QueryLayer {
-            layer_path: expected_layer.clone(),
-            index: runtime::Payload::new(index),
-        })?;
+        request(self, runtime::RuntimeRequest::Shutdown).map(|_| ())
+    }
 
-        match signal {
-            runtime::RuntimeSignal::QueryResult {
-                layer_path: returned_layer,
-                value,
-            } if returned_layer == expected_layer => Ok(value),
-            runtime::RuntimeSignal::QueryResult { layer_path, .. } => {
-                Err(runtime::RuntimeError::InvalidRequest {
-                    message: format!(
-                        "query layer mismatch: expected {expected_layer}, got {layer_path}"
-                    ),
-                })
-            }
-            other => Err(runtime::RuntimeError::InvalidRequest {
+    fn query_layer<Path>(
+        &self,
+        revision: Option<runtime::RevisionId>,
+        index: <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix,
+    ) -> runtime::RuntimeResult<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value>
+    where
+        Tree: ContainsPath<Path>,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value: Send + Sync + 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
+        Self: Sized,
+    {
+        match request(
+            self,
+            runtime::RuntimeRequest::QueryLayer {
+                layer_path: <Tree as ContainsPath<Path>>::runtime_path(),
+                revision,
+                index: utils::Payload::new_serializable(index),
+            },
+        )? {
+            runtime::RuntimeSignal::QueryResult { value, .. } => value
+                .downcast::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value>()
+                .ok_or_else(|| runtime::RuntimeError::UnexpectedRequestType),
+            other => Err(runtime::RuntimeError::UndefinedBehavior {
                 message: format!("unexpected signal for query request: {other:?}"),
             }),
         }
     }
 
-    pub fn query_source_text(&self, span: utils::Span) -> runtime::RuntimeResult<String> {
-        let payload = self.query_layer(runtime::RuntimePath::root(), span)?;
-
-        payload.downcast_ref::<String>().cloned().ok_or_else(|| {
-            runtime::RuntimeError::InvalidRequest {
-                message: "source text query result was not a String".to_string(),
-            }
-        })
+    fn query_source_text(
+        &self,
+        revision: Option<runtime::RevisionId>,
+        span: utils::Span,
+    ) -> runtime::RuntimeResult<String>
+    where
+        Tree: ContainsPath<Here, Target = scheme::SourceText>,
+        Self: Sized,
+    {
+        self.query_layer::<Here>(revision, span)
     }
 
-    pub fn shutdown(&self) -> runtime::RuntimeResult {
-        self.request(runtime::RuntimeRequest::Shutdown)
+    fn edit_source_text(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> runtime::RuntimeResult<runtime::RevisionId>
+    where
+        Self: Sized,
+    {
+        match request(
+            self,
+            runtime::RuntimeRequest::ApplyTextEdit {
+                span: utils::Span::new(start, end),
+                text: text.to_string(),
+            },
+        )? {
+            runtime::RuntimeSignal::Accepted { revision } => Ok(revision),
+            other => Err(runtime::RuntimeError::UndefinedBehavior {
+                message: format!("unexpected signal for apply request: {other:?}"),
+            }),
+        }
+    }
+
+    fn edit_source_text_till<Path>(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> runtime::RuntimeResult<(
+        runtime::RevisionId,
+        scheme::Transaction<<Tree as ContainsPath<Path>>::Target>,
+    )>
+    where
+        Tree: ContainsPath<Path>,
+        <Tree as ContainsPath<Path>>::Target: scheme::IR + 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value:
+            Serialize + Send + Sync + 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
+        Self: Sized,
+    {
+        match request(
+            self,
+            runtime::RuntimeRequest::ApplyAndFetch {
+                span: utils::Span::new(start, end),
+                text: text.to_string(),
+                layer_path: <Tree as ContainsPath<Path>>::runtime_path(),
+            },
+        )? {
+            runtime::RuntimeSignal::EditResult {
+                value, revision, ..
+            } => Ok((
+                revision,
+                value
+                    .downcast::<scheme::Transaction<<Tree as ContainsPath<Path>>::Target>>()
+                    .ok_or_else(|| runtime::RuntimeError::UnexpectedRequestType)?,
+            )),
+            other => Err(runtime::RuntimeError::UndefinedBehavior {
+                message: format!("unexpected signal for ApplyAndFetch: {other:?}"),
+            }),
+        }
+    }
+}
+
+fn request<Tree: TypedTree, I: Interface<Tree>>(
+    this: &I,
+    request: runtime::RuntimeRequest,
+) -> runtime::RuntimeResult {
+    let (reply_tx, reply_rx) = channel::bounded(1);
+    let envelope = runtime::RuntimeEnvelope {
+        request,
+        reply: reply_tx,
+    };
+    match this.ged().envelope_tx().try_send(envelope) {
+        Ok(()) => reply_rx
+            .recv()
+            .map_err(|_| runtime::RuntimeError::ChannelClosed)?,
+        Err(channel::TrySendError::Full(_)) => Err(runtime::RuntimeError::QueueFull),
+        Err(channel::TrySendError::Disconnected(_)) => Err(runtime::RuntimeError::ChannelClosed),
+    }
+}
+
+pub struct BasicInterface<Tree: TypedTree> {
+    ged: GlobalEventDispatcher,
+    _marker: PhantomData<fn() -> Tree>,
+}
+
+impl<Tree: TypedTree> Interface<Tree> for BasicInterface<Tree>
+where
+    Tree: ContainsPath<Here, Target = scheme::SourceText>,
+{
+    fn new(ged: GlobalEventDispatcher, _grammar: &'static grammar::Grammar) -> Self {
+        Self {
+            ged,
+            _marker: PhantomData,
+        }
+    }
+
+    fn ged(&self) -> &GlobalEventDispatcher {
+        &self.ged
+    }
+}
+
+impl<Tree> BasicInterface<Tree>
+where
+    Tree: TypedTree + ContainsPath<Here, Target = scheme::SourceText>,
+{
+    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.edit_source_text(offset, offset, text)
+    }
+
+    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.edit_source_text(start, end, "")
+    }
+
+    pub fn replace(
+        &self,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.edit_source_text(start, end, text)
     }
 }

@@ -8,18 +8,21 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
-    scheme::layers::cst::Command,
-    scheme::layers::cst::NodePath,
-    scheme::passes::{
-        delta,
-        metrics::EditMetrics,
-        strategy::{
-            CandidateScore, EditKind, StrategyCandidate, StrategyContext, count_errors,
-            pick_candidate,
+    scheme::{
+        layers::{ParseTreeIR, cst::NodePath},
+        passes::{
+            delta,
+            metrics::EditMetrics,
+            strategy::{
+                CandidateScore, EditKind, StrategyCandidate, StrategyContext, count_errors,
+                pick_candidate,
+            },
         },
     },
     utils::Span,
 };
+
+type Command = crate::scheme::Command<ParseTreeIR>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct EditResult {
@@ -142,6 +145,7 @@ impl Reparser {
         }
 
         let old_messages = parser.messages.clone();
+        let previous_source_text = parser.text().to_string();
         parser.messages.clear();
         parser.newly_computed_nodes.clear();
         parser.newly_computed_tokens.clear();
@@ -203,6 +207,7 @@ impl Reparser {
                     root_candidate,
                     &old_messages,
                     delta,
+                    &previous_source_text,
                     source_text,
                     metrics.as_deref_mut(),
                 );
@@ -377,6 +382,7 @@ impl Reparser {
                 candidate,
                 &old_messages,
                 delta,
+                &previous_source_text,
                 source_text,
                 metrics.as_deref_mut(),
             );
@@ -474,6 +480,7 @@ impl Reparser {
         candidate: StrategyCandidate,
         old_messages: &ParserMessages,
         delta: isize,
+        old_source_text: &str,
         new_source_text: &str,
         mut metrics: Option<&mut EditMetrics>,
     ) -> EditResult {
@@ -550,6 +557,8 @@ impl Reparser {
             candidate.zipper.node.green,
             candidate.green,
             candidate.zipper.offset,
+            candidate.zipper.offset,
+            old_source_text,
             new_source_text,
             self.current.parent.is_none(),
         );
@@ -706,21 +715,13 @@ impl Zipper {
             child_green = new_parent_green;
         }
 
+        // Only the new root RedNode is needed; the intermediate ancestor chain
+        // is not used by callers, so we do not construct it.
         let root = Rc::new(RedNode {
             parent: None,
             offset: self.steps[0].parent.offset,
             green: ancestor_greens[0],
         });
-
-        let mut chain_parent = root.clone();
-        for (ix, step) in self.steps.iter().enumerate().skip(1) {
-            let next = Rc::new(RedNode {
-                parent: Some(chain_parent),
-                offset: step.parent.offset,
-                green: ancestor_greens[ix],
-            });
-            chain_parent = next;
-        }
 
         ReplaceResult { root }
     }

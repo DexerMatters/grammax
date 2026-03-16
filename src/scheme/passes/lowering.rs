@@ -1,754 +1,612 @@
-//! Pass 2→3: the incremental semantic lowerer.
-//!
-//! [`IncrementalLowerer<T, M>`] implements [`scheme::Pass<RedGreenTreeIR, AstArena<T>>`]:
-//! given a [`RedGreenTreeIR`] transaction (the parser commands), it produces
-//! an [`AstDelta<T>`] transaction that drives the [`AstArena<T>`] downstream.
-//!
-//! User code supplies an [`AstMapper<T>`] (typically [`RuleMap<T>`]) that maps
-//! each green parse-tree node to an AST value, an alias, or skips it. The
-//! lowerer caches the green tree in its own shadow map so it does not need to
-//! re-parse from scratch on every edit.
+//! Pass 2→3: incremental CST→AST transaction transformation through `AstMapper`.
 
-use std::{any::type_name, fmt, marker::PhantomData};
+use std::{cell::RefCell, fmt, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::scheme::layers::ast::ErasedAstNode;
 use crate::{
     grammar::Grammar,
-    parsec::tree::{GreenId, Tag, TreeAllocRefExt},
+    parsec::{
+        msg::ParserMessages,
+        tree::{Tag, TreeAllocRefExt},
+        view::NodeView,
+    },
     scheme::{
         self,
         layers::{
-            ASTCell, AstArena, AstDelta, Command, NodePath, ParseNodeValue, ParseTreeQuery,
-            RedGreenTreeIR,
+            AstArena, AstCell, AstDelta, AstMapAny, AstTxnBuilder, AstVec, NodePath, ParseTreeIR,
         },
     },
 };
 
-// ============================================================================
-// MapOutput — what the user's mapper returns for each green node
-// ============================================================================
+type CstCommand = crate::scheme::Command<ParseTreeIR>;
+type MapperHandler = Arc<dyn Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapIntent> + Send + Sync>;
 
-/// The result of mapping a single green parse-tree node to an AST value.
-pub struct MapOutput<T> {
-    pub(crate) kind: MapOutputKind,
-    _marker: PhantomData<fn() -> T>,
-}
-
-pub(crate) enum MapOutputKind {
-    Node(ErasedAstNode),
-    Alias(ASTCell<()>),
-    ForwardChild(usize),
+#[derive(Debug, Clone, PartialEq)]
+pub enum AstMapAction {
     Skip,
+    /// This CST node's AST slot is wherever `target_cst_path` resolves to.
+    Forward(NodePath),
+    Emit(AstMapAny),
 }
 
-impl<T> MapOutput<T> {
-    /// The node maps to a concrete AST value of some type `U`.
-    pub fn node<U>(node: U) -> Self
-    where
-        U: fmt::Debug + Clone + PartialEq + Send + 'static,
-    {
+#[derive(Debug, Clone)]
+pub struct AstMapIntent {
+    pub action: AstMapAction,
+    /// Override the anchor CST path (default: the emitting node's own path).
+    pub anchor: Option<NodePath>,
+}
+
+impl AstMapIntent {
+    fn new(action: AstMapAction) -> Self {
         Self {
-            kind: MapOutputKind::Node(ErasedAstNode::new(node)),
-            _marker: PhantomData,
+            action,
+            anchor: None,
         }
     }
 
-    /// The node forwards the AST of child at `index` (transparent wrapper).
-    pub fn forward_child(index: usize) -> Self {
-        Self {
-            kind: MapOutputKind::ForwardChild(index),
-            _marker: PhantomData,
-        }
-    }
-
-    /// The node shares the same AST cell as an existing node.
-    pub fn alias<U>(id: ASTCell<U>) -> Self {
-        Self {
-            kind: MapOutputKind::Alias(id.cast()),
-            _marker: PhantomData,
-        }
-    }
-
-    /// The node produces no AST value.
     pub fn skip() -> Self {
-        Self {
-            kind: MapOutputKind::Skip,
-            _marker: PhantomData,
-        }
+        Self::new(AstMapAction::Skip)
+    }
+
+    pub fn emit(value: AstMapAny) -> Self {
+        Self::new(AstMapAction::Emit(value))
+    }
+
+    /// Forward: this CST node's AST slot is wherever `cst_path` resolves.
+    pub fn forward(cst_path: NodePath) -> Self {
+        Self::new(AstMapAction::Forward(cst_path))
+    }
+
+    pub fn with_anchor_path(mut self, path: NodePath) -> Self {
+        self.anchor = Some(path);
+        self
+    }
+
+    pub fn with_anchor_node(mut self, node: &NodeView) -> Self {
+        self.anchor = Some(node.path().clone());
+        self
     }
 }
 
-// ============================================================================
-// Query interface — passed to AstMapper callbacks
-// ============================================================================
+pub type AstNode = NodeView;
 
-/// A read-only view of a green node, passed to [`AstMapper::map`].
-pub struct GreenQuery<'a, T> {
-    grammar: &'a Grammar,
-    greens: &'a FxHashMap<GreenId, GreenNode<T>>,
-    source_text: &'a str,
-    green: GreenId,
+pub struct AstMapCtx<'a> {
+    pub upstream: &'a ParseTreeIR,
+    resolve_ast_path: &'a dyn Fn(&NodeView) -> Option<NodePath>,
+}
+
+impl<'a> AstMapCtx<'a> {
+    /// Resolve `node` to its AST anchor and return a typed `AstCell`.
+    /// The phantom type `U` is inferred from usage context (e.g. the field
+    /// type in the emitted enum variant).
+    pub fn read_cell<U>(&self, node: &NodeView) -> Option<AstCell<U>> {
+        let ast_path = (self.resolve_ast_path)(node)?;
+        Some(AstCell::from_path(&ast_path))
+    }
+
+    /// Read the trimmed source text of a CST node.
+    pub fn read_text(&self, node: &NodeView) -> String {
+        node.text_trimmed()
+    }
+
+    /// Type-erase and emit `value` as the AST result for this CST node.
+    ///
+    /// Works for *any* `Debug + Clone + PartialEq + Send + 'static` type.
+    /// In a heterogeneous mapper you can call `ctx.emit(Expr::Num(1))` in
+    /// one handler and `ctx.emit(Type::Int)` in another.
+    pub fn emit<V>(&self, value: V) -> AstMapIntent
+    where
+        V: fmt::Debug + Clone + PartialEq + Send + 'static,
+    {
+        AstMapIntent::emit(AstMapAny::new(value))
+    }
+
+    /// Produce a `Forward` intent to resolve at the given node's path.
+    pub fn forward(&self, node: &NodeView) -> AstMapIntent {
+        AstMapIntent::forward(node.path().clone())
+    }
+
+    /// Produce a `Skip` intent.
+    pub fn skip(&self) -> AstMapIntent {
+        AstMapIntent::skip()
+    }
+
+    /// Forward to the first child, or `None` if there are no children.
+    pub fn forward_first_child(&self, node: &NodeView) -> Option<AstMapIntent> {
+        let child = node.each().first()?;
+        Some(AstMapIntent::forward(child.path().clone()))
+    }
+
+    /// Build an [`AstVec`] rooted at `parent`'s CST path.
+    ///
+    /// The returned handle is **path-stable**: its identity is the parent's
+    /// CST path, so the parent node's stored value does **not** change when
+    /// children are inserted or removed.  Individual elements are managed by
+    /// their own handler registrations and stored at direct-child paths of
+    /// `parent`.
+    ///
+    /// ```ignore
+    /// .on_rule("list", |ctx, node| {
+    ///     Some(ctx.emit(Expr::List(ctx.collect_vec(node))))
+    /// })
+    /// // Elements handled separately:
+    /// .on_rule("item", |ctx, node| Some(ctx.emit(Expr::Item(...))))
+    /// ```
+    pub fn collect_vec<U>(&self, parent: &NodeView) -> AstVec<U> {
+        AstVec::new(parent.path().clone())
+    }
+
+    /// All parser-level diagnostics for the current transaction.
+    pub fn parser_messages(&self) -> ParserMessages {
+        self.upstream.parser_messages()
+    }
+
+    /// Returns `true` if the current transaction has any parser errors.
+    pub fn has_errors(&self) -> bool {
+        !self.upstream.parser_messages().is_empty()
+    }
 }
 
 #[derive(Clone)]
-struct GreenNode<T> {
-    children: Vec<GreenId>,
-    offset: usize,
-    width: usize,
-    token_text: Option<String>,
-    tag: Tag,
-    binding: Option<ASTCell<T>>,
+pub struct AstMapper {
+    rule_visitors: FxHashMap<&'static str, MapperHandler>,
+    field_visitors: FxHashMap<&'static str, MapperHandler>,
+    token_visitors: FxHashMap<&'static str, MapperHandler>,
+    error_visitor: Option<MapperHandler>,
+    skip_rules: FxHashSet<&'static str>,
+    skip_fields: FxHashSet<&'static str>,
 }
 
-impl<'a, T> GreenQuery<'a, T> {
-    pub fn green(&self) -> GreenId {
-        self.green
-    }
-
-    pub fn tag(&self) -> &Tag {
-        &self.greens[&self.green].tag
-    }
-
-    pub fn rule_name(&self) -> Option<&'a str> {
-        match self.tag() {
-            Tag::Rule { rule_ix, .. } => Some(self.grammar.name(*rule_ix)),
-            _ => None,
-        }
-    }
-
-    pub fn span(&self) -> (usize, usize) {
-        let node = &self.greens[&self.green];
-        let start = node.offset.min(self.source_text.len());
-        let end = start.saturating_add(node.width).min(self.source_text.len());
-        (start, end)
-    }
-
-    pub fn text(&self) -> &'a str {
-        let node = &self.greens[&self.green];
-        if let Some(text) = &node.token_text {
-            return text;
-        }
-        let (start, end) = self.span();
-        self.source_text.get(start..end).unwrap_or("")
-    }
-
-    pub fn text_trimmed(&self) -> &'a str {
-        self.text().trim()
-    }
-
-    pub fn children(&self) -> Vec<GreenQuery<'a, T>> {
-        let node = &self.greens[&self.green];
-        node.children
-            .iter()
-            .map(|&child| GreenQuery {
-                grammar: self.grammar,
-                greens: self.greens,
-                source_text: self.source_text,
-                green: child,
-            })
-            .collect()
-    }
-
-    pub fn child_asts(&self) -> Vec<Option<ASTCell<T>>> {
-        let node = &self.greens[&self.green];
-        node.children
-            .iter()
-            .map(|&child| self.greens[&child].binding)
-            .collect()
-    }
-
-    pub fn child_at(&self, index: usize) -> Option<GreenQuery<'a, T>> {
-        let node = &self.greens[&self.green];
-        node.children.get(index).map(|&child| GreenQuery {
-            grammar: self.grammar,
-            greens: self.greens,
-            source_text: self.source_text,
-            green: child,
-        })
-    }
-
-    pub fn child_with_field(&self, field_name: &'static str) -> Option<GreenQuery<'a, T>> {
-        let node = &self.greens[&self.green];
-        for &child_id in &node.children {
-            let child_node = &self.greens[&child_id];
-            if matches!(
-                &child_node.tag,
-                Tag::Field { name, .. } if *name == field_name
-            ) {
-                return Some(GreenQuery {
-                    grammar: self.grammar,
-                    greens: self.greens,
-                    source_text: self.source_text,
-                    green: child_id,
-                });
-            }
-        }
-        None
-    }
-
-    pub fn children_with_rule(&self, rule_name: &str) -> Vec<GreenQuery<'a, T>> {
-        let node = &self.greens[&self.green];
-        let mut result = Vec::new();
-        for &child_id in &node.children {
-            let mut actual_id = child_id;
-            let child_node = &self.greens[&child_id];
-            if matches!(&child_node.tag, Tag::Field { .. }) {
-                if let Some(&inner_id) = child_node.children.first() {
-                    actual_id = inner_id;
-                }
-            }
-            let actual_node = &self.greens[&actual_id];
-            if let Tag::Rule { rule_ix, .. } = &actual_node.tag {
-                if self.grammar.name(*rule_ix) == rule_name {
-                    result.push(GreenQuery {
-                        grammar: self.grammar,
-                        greens: self.greens,
-                        source_text: self.source_text,
-                        green: actual_id,
-                    });
-                }
-            }
-        }
-        result
-    }
-
-    pub fn first_child_with_rule(&self, rule_name: &str) -> Option<GreenQuery<'a, T>> {
-        self.children_with_rule(rule_name).into_iter().next()
-    }
-
-    pub fn first_child_ast<U>(&self) -> Option<ASTCell<U>> {
-        let node = &self.greens[&self.green];
-        if let Some(&child_id) = node.children.first() {
-            return self.greens[&child_id].binding.map(|id| id.cast::<U>());
-        }
-        None
-    }
-
-    pub fn mapped_children<U>(&self) -> Vec<ASTCell<U>> {
-        self.child_asts()
-            .into_iter()
-            .filter_map(|binding| binding.map(|id| id.cast::<U>()))
-            .collect()
-    }
-}
-
-// ============================================================================
-// AstMapper trait — user-supplied logic
-// ============================================================================
-
-/// Maps a green parse-tree node to an AST value (or skips/aliases it).
-pub trait AstMapper<T> {
-    fn map(&self, cx: &GreenQuery<'_, T>) -> MapOutput<T>;
-}
-
-impl AstMapper<()> for () {
-    fn map(&self, _: &GreenQuery<'_, ()>) -> MapOutput<()> {
-        MapOutput::skip()
-    }
-}
-
-/// What to do when no mapper rule matches a node.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FallbackMode {
-    Skip,
-    ForwardFirstChild,
-}
-
-impl Default for FallbackMode {
-    fn default() -> Self {
-        Self::ForwardFirstChild
-    }
-}
-
-type RuleMapperFn<T> = dyn for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static;
-
-/// A rule-based [`AstMapper<T>`] that dispatches on rule name / rule index /
-/// token kind / field kind.
-pub struct RuleMap<T> {
-    rules_ix: FxHashMap<usize, Box<RuleMapperFn<T>>>,
-    rules_name: FxHashMap<String, Box<RuleMapperFn<T>>>,
-    tokens: FxHashMap<usize, Box<RuleMapperFn<T>>>,
-    fields: FxHashMap<usize, Box<RuleMapperFn<T>>>,
-    error: Option<Box<RuleMapperFn<T>>>,
-    fallback: FallbackMode,
-}
-
-impl<T> Default for RuleMap<T> {
+impl Default for AstMapper {
     fn default() -> Self {
         Self {
-            rules_ix: FxHashMap::default(),
-            rules_name: FxHashMap::default(),
-            tokens: FxHashMap::default(),
-            fields: FxHashMap::default(),
-            error: None,
-            fallback: FallbackMode::default(),
+            rule_visitors: FxHashMap::default(),
+            field_visitors: FxHashMap::default(),
+            token_visitors: FxHashMap::default(),
+            error_visitor: None,
+            skip_rules: FxHashSet::default(),
+            skip_fields: FxHashSet::default(),
         }
     }
 }
 
-impl<T> RuleMap<T> {
+impl From<()> for AstMapper {
+    fn from(_: ()) -> Self {
+        Self::new()
+    }
+}
+
+impl AstMapper {
     pub fn new() -> Self {
         Self::default()
     }
 
-    pub fn with_fallback(mut self, fallback: FallbackMode) -> Self {
-        self.fallback = fallback;
-        self
-    }
-
-    pub fn on_rule<F>(mut self, rule_name: impl Into<String>, mapper: F) -> Self
+    pub fn on_rule<F>(mut self, rule_name: &'static str, visitor: F) -> Self
     where
-        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapIntent> + Send + Sync + 'static,
     {
-        self.rules_name.insert(rule_name.into(), Box::new(mapper));
+        self.rule_visitors.insert(rule_name, Arc::new(visitor));
         self
     }
 
-    pub fn on_rule_ix<F>(mut self, rule_ix: usize, mapper: F) -> Self
+    pub fn on_field<F>(mut self, field_name: &'static str, visitor: F) -> Self
     where
-        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapIntent> + Send + Sync + 'static,
     {
-        self.rules_ix.insert(rule_ix, Box::new(mapper));
+        self.field_visitors.insert(field_name, Arc::new(visitor));
         self
     }
 
-    pub fn on_token<F>(mut self, rule_ix: usize, mapper: F) -> Self
+    pub fn on_token<F>(mut self, token_name: &'static str, visitor: F) -> Self
     where
-        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapIntent> + Send + Sync + 'static,
     {
-        self.tokens.insert(rule_ix, Box::new(mapper));
+        self.token_visitors.insert(token_name, Arc::new(visitor));
         self
     }
 
-    pub fn on_field<F>(mut self, rule_ix: usize, mapper: F) -> Self
+    pub fn on_error<F>(mut self, visitor: F) -> Self
     where
-        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapIntent> + Send + Sync + 'static,
     {
-        self.fields.insert(rule_ix, Box::new(mapper));
+        self.error_visitor = Some(Arc::new(visitor));
         self
     }
 
-    pub fn on_error<F>(mut self, mapper: F) -> Self
-    where
-        F: for<'a> Fn(&GreenQuery<'a, T>) -> MapOutput<T> + Send + Sync + 'static,
-    {
-        self.error = Some(Box::new(mapper));
+    pub fn skip_rule(mut self, rule_name: &'static str) -> Self {
+        self.skip_rules.insert(rule_name);
         self
     }
 
-    fn fallback(&self) -> MapOutput<T> {
-        match self.fallback {
-            FallbackMode::Skip => MapOutput::skip(),
-            FallbackMode::ForwardFirstChild => MapOutput::forward_child(0),
-        }
+    pub fn skip_field(mut self, field_name: &'static str) -> Self {
+        self.skip_fields.insert(field_name);
+        self
     }
-}
 
-impl<T> AstMapper<T> for RuleMap<T> {
-    fn map(&self, cx: &GreenQuery<'_, T>) -> MapOutput<T> {
-        match cx.tag() {
-            Tag::Rule { rule_ix, .. } => {
-                if let Some(mapper) = self.rules_ix.get(rule_ix) {
-                    return (mapper)(cx);
-                }
-                if let Some(rule_name) = cx.rule_name() {
-                    if let Some(mapper) = self.rules_name.get(rule_name) {
-                        return (mapper)(cx);
-                    }
-                }
-                self.fallback()
+    pub fn map(&self, ctx: &AstMapCtx<'_>, node: &NodeView) -> AstMapIntent {
+        self.dispatch(ctx, node)
+    }
+
+    fn dispatch(&self, ctx: &AstMapCtx<'_>, node: &NodeView) -> AstMapIntent {
+        if let Some(field_name) = node.field_name() {
+            if let Some(visitor) = self.field_visitors.get(field_name) {
+                return visitor(ctx, node).unwrap_or_else(AstMapIntent::skip);
             }
-            Tag::Token { rule_ix } => self
-                .tokens
-                .get(rule_ix)
-                .map(|f| (f)(cx))
-                .unwrap_or_else(|| self.fallback()),
-            Tag::Field { rule_ix, .. } => self
-                .fields
-                .get(rule_ix)
-                .map(|f| (f)(cx))
-                .unwrap_or_else(|| self.fallback()),
-            Tag::Error(_) => self
-                .error
-                .as_ref()
-                .map(|f| (f)(cx))
-                .unwrap_or_else(|| self.fallback()),
+            debug_assert!(
+                self.skip_fields.contains(field_name),
+                "AstMapper: no handler registered for field '{field_name}'. \
+                 Add .on_field(\"{field_name}\", ...) or .skip_field(\"{field_name}\")."
+            );
+            return AstMapIntent::skip();
         }
+
+        if let Some(rule_name) = node.rule_name() {
+            if let Some(visitor) = self.rule_visitors.get(rule_name) {
+                return visitor(ctx, node).unwrap_or_else(AstMapIntent::skip);
+            }
+            debug_assert!(
+                self.skip_rules.contains(rule_name),
+                "AstMapper: no handler registered for rule '{rule_name}'. \
+                 Add .on_rule(\"{rule_name}\", ...) or .skip_rule(\"{rule_name}\")."
+            );
+            return AstMapIntent::skip();
+        }
+
+        if let Some(token_name) = node.token_name() {
+            if let Some(visitor) = self.token_visitors.get(token_name) {
+                return visitor(ctx, node).unwrap_or_else(AstMapIntent::skip);
+            }
+            return AstMapIntent::skip();
+        }
+
+        if node.error().is_some() {
+            if let Some(visitor) = &self.error_visitor {
+                return visitor(ctx, node).unwrap_or_else(AstMapIntent::skip);
+            }
+        }
+
+        AstMapIntent::skip()
     }
 }
 
-// ============================================================================
-// IncrementalLowerer — the Pass<RedGreenTreeIR, AstArena<T>>
-// ============================================================================
-
-/// The semantic loweringPass (Layer 2 → Layer 3).
-///
-/// Maintains a shadow copy of the green parse tree indexed by stable
-/// [`GreenId`]s. On each call to [`apply_parse_delta_with_source`], it:
-///
-/// 1. Applies the parse-tree delta to its internal shadow tree.
-/// 2. Marks affected nodes as dirty.
-/// 3. Re-runs the [`AstMapper`] over dirty nodes.
-/// 4. Emits an [`AstDelta<T>`] describing what changed in the [`AstArena<T>`].
-///
-/// [`apply_parse_delta_with_source`]: IncrementalLowerer::apply_parse_delta_with_source
-pub struct IncrementalLowerer<T, M> {
+pub struct IncrementalLowerer {
     grammar: &'static Grammar,
-    mapper: M,
-    greens: FxHashMap<GreenId, GreenNode<T>>,
-    pub(crate) arena: AstArena<T>,
-    root_green: Option<GreenId>,
-    root_ast: Option<ASTCell<T>>,
+    mapper: AstMapper,
 }
 
-impl<T, M> IncrementalLowerer<T, M>
-where
-    T: fmt::Debug + Clone + PartialEq + Send + 'static,
-    M: AstMapper<T>,
-{
-    pub fn new(grammar: &'static Grammar, mapper: M) -> Self {
+impl IncrementalLowerer {
+    pub fn new(grammar: &'static Grammar, mapper: impl Into<AstMapper>) -> Self {
         Self {
             grammar,
-            mapper,
-            greens: FxHashMap::default(),
-            arena: AstArena::new(),
-            root_green: None,
-            root_ast: None,
+            mapper: mapper.into(),
         }
     }
 
-    pub fn arena(&self) -> &AstArena<T> {
-        &self.arena
-    }
-
-    pub fn root_ast(&self) -> Option<ASTCell<T>> {
-        self.root_ast
-    }
-
-    pub fn has_parse_node(&self, green: GreenId) -> bool {
-        self.greens.contains_key(&green)
-    }
-
-    fn apply_from_ir2(
+    fn apply_from_ir(
         &mut self,
-        upstream: &RedGreenTreeIR,
-        commands: &[Command],
-        source_text: &str,
-    ) -> Vec<scheme::Command<AstArena<T>>> {
-        let mut ops = Vec::new();
+        upstream: &ParseTreeIR,
+        downstream: &AstArena<AstMapAny>,
+        commands: &[CstCommand],
+    ) -> AstDelta<AstMapAny> {
+        let memo: RefCell<FxHashMap<NodePath, AstMapIntent>> = RefCell::new(FxHashMap::default());
+        let resolving: RefCell<FxHashSet<NodePath>> = RefCell::new(FxHashSet::default());
 
-        self.sync_from_upstream(upstream, &mut ops);
-        let dirty = self.collect_dirty_nodes(upstream, commands);
-
-        // Phase 2: Recompute dirty greens & emit AST deltas
-        let mut visited = FxHashSet::default();
-        let mut next_create_id = 0usize;
-        for &green in &dirty {
-            if self.greens.contains_key(&green) {
-                self.recompute_binding(
-                    green,
-                    source_text,
-                    &mut ops,
-                    &mut visited,
-                    &mut next_create_id,
-                );
-            }
-        }
-
-        // Phase 3: Update root & emit root-change if needed
-        let next_root = self.compute_root();
-        if next_root != self.root_ast {
-            self.root_ast = next_root;
-            ops.push(scheme::Command::SetRoot {
-                id: next_root.map(|c| c.into_raw()),
-            });
-        }
-
-        ops
-    }
-
-    pub fn transform_with_source(
-        &mut self,
-        upstream: &RedGreenTreeIR,
-        txn: scheme::Transaction<RedGreenTreeIR>,
-        source_text: &str,
-    ) -> scheme::Transaction<AstArena<T>> {
-        std::sync::Arc::new(self.apply_from_ir2(upstream, &txn, source_text))
-    }
-
-    fn collect_dirty_nodes(
-        &self,
-        upstream: &RedGreenTreeIR,
-        commands: &[Command],
-    ) -> FxHashSet<GreenId> {
-        let mut dirty = FxHashSet::default();
-
-        for command in commands {
-            match command {
-                scheme::Command::Insert { index, .. }
-                | scheme::Command::Replace { index, .. }
-                | scheme::Command::Delete { index } => {
-                    let ParseTreeQuery::Path(index) = index else {
+        // Discover dirty anchors from the transaction:
+        // - Root Insert (full parse): DFS-scan the entire upstream CST to find all anchors.
+        // - Non-root Insert / Replace: walk up ancestor chain to the nearest mapped rule.
+        //   The incremental reparser only emits a Replace for the changed leaf token;
+        //   the containing rule node (e.g. `primary`) won't appear in the transaction
+        //   but its subtree changed, so we must find it by walking up.
+        let mut dirty_anchors: FxHashSet<NodePath> = FxHashSet::default();
+        for cmd in commands {
+            match cmd {
+                CstCommand::Insert { index, .. } => {
+                    let crate::scheme::layers::ParseTreeQuery::Path(path) = index else {
                         continue;
                     };
-
-                    if index.0.is_empty() {
-                        if let Some(root) = upstream.root {
-                            dirty.insert(root);
+                    if path.0.is_empty() {
+                        // Root insert: this is a full parse — DFS the whole tree.
+                        self.collect_upstream_anchors(
+                            upstream,
+                            &NodePath::root(),
+                            &memo,
+                            &resolving,
+                            &mut dirty_anchors,
+                        );
+                    } else {
+                        // Non-root insert (incremental mid-tree insert).
+                        if let Some(anchor) =
+                            self.resolve_anchor_or_ancestor(upstream, path, &memo, &resolving)
+                        {
+                            dirty_anchors.insert(anchor);
                         }
+                    }
+                }
+                CstCommand::Replace { index, .. } => {
+                    let crate::scheme::layers::ParseTreeQuery::Path(path) = index else {
                         continue;
-                    }
-
-                    for depth in 0..index.0.len() {
-                        let path = NodePath(index.0[..depth].to_vec());
-                        if let Some(green) = upstream.green_at_path(&path) {
-                            dirty.insert(green);
-                        }
-                    }
-
-                    if !matches!(command, scheme::Command::Delete { .. }) {
-                        if let Some(green) = upstream.green_at_path(index) {
-                            dirty.insert(green);
-                        }
+                    };
+                    if let Some(anchor) =
+                        self.resolve_anchor_or_ancestor(upstream, path, &memo, &resolving)
+                    {
+                        dirty_anchors.insert(anchor);
                     }
                 }
-                scheme::Command::SetRoot { .. } => {
-                    if let Some(root) = upstream.root {
-                        dirty.insert(root);
+                CstCommand::SetRoot { .. } => {
+                    if let Some(anchor) =
+                        self.resolve_anchor_path(upstream, &NodePath::root(), &memo, &resolving)
+                    {
+                        dirty_anchors.insert(anchor);
                     }
                 }
-                scheme::Command::Create { .. } => {}
+                CstCommand::Delete { .. } | CstCommand::Create { .. } => {}
             }
         }
 
-        if dirty.is_empty() {
-            if let Some(root) = upstream.root {
-                dirty.insert(root);
-            }
+        let mut builder: AstTxnBuilder<AstMapAny> = AstTxnBuilder::new();
+
+        // Delete AST anchors whose CST source path no longer exists in the tree.
+        // `downstream.storage.nodes` is the ground truth for currently-live anchors.
+        let stale: Vec<NodePath> = downstream
+            .storage
+            .nodes
+            .keys()
+            .filter(|p| upstream.green_at_path(p).is_none())
+            .cloned()
+            .collect();
+        for p in stale {
+            builder.delete(p.clone());
         }
 
-        dirty
+        // Delete stale AST nodes that still exist at a CST path but no longer
+        // map to themselves after recovery reshapes a dirty subtree.
+        //
+        // Example: an `on_error()` node may have emitted `Json::Error` at path
+        // `P.4`, then after more input that same CST slot becomes a skipped
+        // token or part of another structure. The path still exists in the CST,
+        // so the simple `green_at_path == None` cleanup above does not remove
+        // it. We must sweep existing AST nodes under dirty anchors and delete
+        // any path that no longer resolves to itself as a live AST anchor.
+        let stale_in_dirty: Vec<NodePath> = downstream
+            .storage
+            .nodes
+            .keys()
+            .filter(|existing_path| {
+                dirty_anchors
+                    .iter()
+                    .any(|dirty| dirty.is_prefix_of(existing_path))
+            })
+            .filter(|existing_path| upstream.green_at_path(existing_path).is_some())
+            .filter(|existing_path| {
+                self.resolve_anchor_path(upstream, existing_path, &memo, &resolving)
+                    .as_ref()
+                    != Some(*existing_path)
+            })
+            .cloned()
+            .collect();
+        for p in stale_in_dirty {
+            builder.delete(p);
+        }
+
+        // Re-lower dirty anchors deepest-first so child anchors are settled
+        // before parent anchors that reference them via read_cell.
+        let mut dirty: Vec<NodePath> = dirty_anchors.into_iter().collect();
+        dirty.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+
+        for anchor in dirty {
+            self.relower_anchor(
+                upstream,
+                downstream,
+                &anchor,
+                &mut builder,
+                &memo,
+                &resolving,
+            );
+        }
+
+        builder.finish()
     }
 
-    fn sync_from_upstream(
+    fn relower_anchor(
         &mut self,
-        upstream: &RedGreenTreeIR,
-        ops: &mut Vec<scheme::Command<AstArena<T>>>,
+        upstream: &ParseTreeIR,
+        downstream: &AstArena<AstMapAny>,
+        anchor_path: &NodePath,
+        builder: &mut AstTxnBuilder<AstMapAny>,
+        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<NodePath>>,
     ) {
-        let old = std::mem::take(&mut self.greens);
-        let mut next = FxHashMap::default();
-
-        if let Some(root) = upstream.root {
-            self.build_shadow_from_ir2(root, 0, upstream, &old, &mut next);
-        }
-
-        for (green, node) in old {
-            if !next.contains_key(&green) {
-                if let Some(binding) = node.binding {
-                    if self.arena.remove_erased(binding.cast()).is_some() {
-                        ops.push(scheme::Command::Delete {
-                            index: binding.into_raw(),
-                        });
-                    }
-                }
-            }
-        }
-
-        self.greens = next;
-        self.root_green = upstream.root;
-    }
-
-    fn build_shadow_from_ir2(
-        &self,
-        green: GreenId,
-        offset: usize,
-        upstream: &RedGreenTreeIR,
-        old: &FxHashMap<GreenId, GreenNode<T>>,
-        out: &mut FxHashMap<GreenId, GreenNode<T>>,
-    ) {
-        if let Some(existing) = old.get(&green) {
-            if existing.offset == offset {
-                self.copy_shadow_subtree(green, upstream, old, out);
-                return;
-            }
-        }
-
-        if out.contains_key(&green) {
+        let Some(intent) = self.resolve_intent(upstream, anchor_path, memo, resolving) else {
             return;
-        }
-
-        let alloc_node = upstream.alloc.get_node(green);
-        let children = alloc_node.children.clone();
-        let width = alloc_node.width;
-        let tag = alloc_node.tag.clone();
-        drop(alloc_node);
-
-        let token_text = match upstream.value_of_green(green) {
-            ParseNodeValue::Token { text, .. } | ParseNodeValue::Error { text, .. } => Some(text),
-            ParseNodeValue::Node { .. } | ParseNodeValue::Messages { .. } => None,
         };
 
-        let binding = old.get(&green).and_then(|n| n.binding);
+        let AstMapIntent {
+            action,
+            anchor: declared_anchor,
+        } = intent;
+        let anchor = declared_anchor.unwrap_or_else(|| anchor_path.clone());
 
-        out.insert(
-            green,
-            GreenNode {
-                children: children.clone(),
-                offset,
-                width,
-                token_text,
-                tag,
-                binding,
-            },
-        );
-
-        let mut child_offset = offset;
-        for child in children {
-            let child_width = upstream.alloc.get_node(child).width;
-            self.build_shadow_from_ir2(child, child_offset, upstream, old, out);
-            child_offset = child_offset.saturating_add(child_width);
+        match action {
+            AstMapAction::Emit(value) => {
+                // Compare against erased stored value to suppress no-ops.
+                match downstream.get_erased_as_any(&anchor) {
+                    Some(existing) if existing == value => return, // already correct
+                    None => builder.insert_value(anchor, value),   // new anchor
+                    Some(_) => builder.replace_value(anchor, value), // updated anchor
+                }
+            }
+            AstMapAction::Skip | AstMapAction::Forward(_) => {
+                // Important: a CST path may previously have emitted a value
+                // (for example via `on_error`) and later become an unmapped
+                // token or forwarding node after recovery stabilizes. In that
+                // case the AST node at the old anchor must be deleted even
+                // though the CST path itself still exists.
+                if downstream.get_erased_as_any(anchor_path).is_some() {
+                    builder.delete(anchor_path.clone());
+                }
+            }
         }
     }
 
-    fn copy_shadow_subtree(
+    fn resolve_intent(
         &self,
-        green: GreenId,
-        upstream: &RedGreenTreeIR,
-        old: &FxHashMap<GreenId, GreenNode<T>>,
-        out: &mut FxHashMap<GreenId, GreenNode<T>>,
-    ) {
-        let mut stack = vec![green];
-        while let Some(green) = stack.pop() {
-            if out.contains_key(&green) {
-                continue;
+        upstream: &ParseTreeIR,
+        cst_path: &NodePath,
+        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<NodePath>>,
+    ) -> Option<AstMapIntent> {
+        if let Some(cached) = memo.borrow().get(cst_path).cloned() {
+            return Some(cached);
+        }
+
+        let green = upstream.green_at_path(cst_path)?;
+        let offset = upstream.offset_at_path(cst_path)?;
+        let mut node = upstream
+            .viewer(self.grammar)
+            .node(green, offset)
+            .with_path(cst_path.clone());
+
+        // Attach grammar-derived field name from parent context.
+        // `ParseTreeIR` uses `Tag::Rule` for everything (field wrappers are
+        // transparent in the protocol), so the only way to know a child is at a
+        // named field position is to look at the parent production's field_positions.
+        if let Some(child_ix) = cst_path.0.last().copied() {
+            if let Some(parent_path) = cst_path.parent() {
+                if let Some(parent_green) = upstream.green_at_path(&parent_path) {
+                    let parent_node = upstream.alloc.node(parent_green);
+                    if let Tag::Rule {
+                        rule_ix: parent_rule_ix,
+                        ..
+                    } = &parent_node.tag
+                    {
+                        let n_siblings = parent_node.children.len();
+                        'field_lookup: for prod in &self.grammar.table.productions {
+                            if prod.lhs == *parent_rule_ix && prod.rhs.len() == n_siblings {
+                                for &(pos, name) in &prod.field_positions {
+                                    if pos == child_ix {
+                                        node = node.with_grammar_field_name(name);
+                                        break 'field_lookup;
+                                    }
+                                }
+                                break 'field_lookup;
+                            }
+                        }
+                    }
+                }
             }
-            let Some(existing) = old.get(&green).cloned() else {
-                let offset = upstream
-                    .green_at_path(&NodePath(vec![]))
-                    .and_then(|root| (root == green).then_some(0))
-                    .unwrap_or(0);
-                self.build_shadow_from_ir2(green, offset, upstream, old, out);
-                continue;
-            };
-            let children = existing.children.clone();
-            out.insert(green, existing);
-            for child in children.into_iter().rev() {
-                if old.contains_key(&child) {
-                    stack.push(child);
+        }
+        if !resolving.borrow_mut().insert(cst_path.clone()) {
+            return Some(AstMapIntent::skip());
+        }
+
+        let resolve_ast_path =
+            |child: &NodeView| self.resolve_ast_path(upstream, child.path(), memo, resolving);
+        let ctx = AstMapCtx {
+            upstream,
+            resolve_ast_path: &resolve_ast_path,
+        };
+
+        let intent = self.mapper.map(&ctx, &node);
+        resolving.borrow_mut().remove(cst_path);
+        memo.borrow_mut().insert(cst_path.clone(), intent.clone());
+        Some(intent)
+    }
+
+    fn resolve_ast_path(
+        &self,
+        upstream: &ParseTreeIR,
+        cst_path: &NodePath,
+        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<NodePath>>,
+    ) -> Option<NodePath> {
+        let intent = self.resolve_intent(upstream, cst_path, memo, resolving)?;
+        match intent.action {
+            AstMapAction::Skip => None,
+            AstMapAction::Forward(target) => {
+                self.resolve_ast_path(upstream, &target, memo, resolving)
+            }
+            AstMapAction::Emit(_) => Some(intent.anchor.unwrap_or_else(|| cst_path.clone())),
+        }
+    }
+
+    fn collect_upstream_anchors(
+        &self,
+        upstream: &ParseTreeIR,
+        root_path: &NodePath,
+        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<NodePath>>,
+        dirty_anchors: &mut FxHashSet<NodePath>,
+    ) {
+        // Iterative DFS to avoid stack overflow on deep trees.
+        let mut stack: Vec<NodePath> = vec![root_path.clone()];
+        while let Some(path) = stack.pop() {
+            if let Some(anchor) = self.resolve_anchor_path(upstream, &path, memo, resolving) {
+                dirty_anchors.insert(anchor);
+                // Still recurse: children may be independent mapped anchors
+                // (e.g. `primary` and `mul` are both inside `add`'s subtree).
+            }
+            if let Some(green) = upstream.green_at_path(&path) {
+                let node = upstream.alloc.node(green);
+                let n_children = node.children.len();
+                drop(node);
+                for ix in 0..n_children {
+                    let mut child_path = path.0.clone();
+                    child_path.push(ix);
+                    stack.push(NodePath(child_path));
                 }
             }
         }
     }
 
-    fn recompute_binding(
-        &mut self,
-        green: GreenId,
-        source_text: &str,
-        ops: &mut AstDelta<T>,
-        visited: &mut FxHashSet<GreenId>,
-        next_create_id: &mut usize,
-    ) {
-        let mut stack = vec![(green, false)];
-
-        while let Some((green, expanded)) = stack.pop() {
-            if expanded {
-                let child_asts: Vec<_> = self.greens[&green]
-                    .children
-                    .iter()
-                    .map(|&child| self.greens[&child].binding)
-                    .collect();
-
-                let query = GreenQuery {
-                    grammar: self.grammar,
-                    greens: &self.greens,
-                    source_text,
-                    green,
-                };
-                let mapped = self.mapper.map(&query);
-
-                let old_binding = self.greens[&green].binding;
-                let forward_child_ast = match &mapped.kind {
-                    MapOutputKind::ForwardChild(idx) => child_asts.get(*idx).copied(),
-                    _ => None,
-                };
-                drop(query);
-
-                let new_binding = match mapped.kind {
-                    MapOutputKind::Node(erased) => {
-                        let typed = erased.downcast_ref::<T>().cloned();
-                        let id = self.arena.insert_erased(erased).cast::<T>();
-                        if let Some(value) = typed {
-                            let raw = id.into_raw();
-                            let staging_id = *next_create_id;
-                            *next_create_id += 1;
-                            ops.push(scheme::Command::Create {
-                                id: staging_id,
-                                value,
-                            });
-                            ops.push(scheme::Command::Insert {
-                                index: raw,
-                                id: staging_id,
-                            });
-                        }
-                        Some(id)
-                    }
-                    MapOutputKind::Alias(id) => Some(id.cast()),
-                    MapOutputKind::ForwardChild(_) => forward_child_ast.flatten(),
-                    MapOutputKind::Skip => None,
-                };
-
-                if let Some(old_id) = old_binding {
-                    if new_binding != Some(old_id) {
-                        if self.arena.remove_erased(old_id.cast()).is_some() {
-                            ops.push(scheme::Command::Delete {
-                                index: old_id.into_raw(),
-                            });
-                        }
-                    }
-                }
-
-                self.greens.get_mut(&green).unwrap().binding = new_binding;
-                continue;
+    fn resolve_anchor_or_ancestor(
+        &self,
+        upstream: &ParseTreeIR,
+        cst_path: &NodePath,
+        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<NodePath>>,
+    ) -> Option<NodePath> {
+        // Try the path itself first (covers full-parse case where every node appears).
+        if let Some(anchor) = self.resolve_anchor_path(upstream, cst_path, memo, resolving) {
+            return Some(anchor);
+        }
+        // Walk up the ancestor chain (covers incremental case where only the leaf appears).
+        let mut cur = cst_path.parent()?;
+        loop {
+            if let Some(anchor) = self.resolve_anchor_path(upstream, &cur, memo, resolving) {
+                return Some(anchor);
             }
-
-            if !visited.insert(green) {
-                continue;
-            }
-
-            stack.push((green, true));
-            let children = self.greens[&green].children.clone();
-            for child in children.into_iter().rev() {
-                if !visited.contains(&child) {
-                    stack.push((child, false));
-                }
-            }
+            cur = cur.parent()?;
         }
     }
 
-    fn compute_root(&self) -> Option<ASTCell<T>> {
-        self.root_green.and_then(|g| {
-            self.greens
-                .get(&g)
-                .and_then(|n| n.binding)
-                .filter(|id| id.arena_ty == Some(type_name::<T>()))
-        })
+    fn resolve_anchor_path(
+        &self,
+        upstream: &ParseTreeIR,
+        cst_path: &NodePath,
+        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<NodePath>>,
+    ) -> Option<NodePath> {
+        let intent = self.resolve_intent(upstream, cst_path, memo, resolving)?;
+        match intent.action {
+            AstMapAction::Emit(_) => Some(intent.anchor.unwrap_or_else(|| cst_path.clone())),
+            AstMapAction::Forward(target) => {
+                self.resolve_anchor_path(upstream, &target, memo, resolving)
+            }
+            AstMapAction::Skip => None,
+        }
     }
 }
 
-impl<T, M> scheme::Pass<RedGreenTreeIR, AstArena<T>> for IncrementalLowerer<T, M>
-where
-    T: fmt::Debug + Clone + PartialEq + Send + 'static,
-    M: AstMapper<T> + Send + 'static,
-{
+impl scheme::Pass<ParseTreeIR, AstArena<AstMapAny>> for IncrementalLowerer {
     type Error = std::convert::Infallible;
 
     fn transform(
         &mut self,
-        upstream: &RedGreenTreeIR,
-        txn: scheme::Transaction<RedGreenTreeIR>,
-    ) -> Result<scheme::Transaction<AstArena<T>>, Self::Error> {
-        Ok(self.transform_with_source(upstream, txn, ""))
+        upstream: &ParseTreeIR,
+        downstream: &AstArena<AstMapAny>,
+        txn: scheme::Transaction<ParseTreeIR>,
+    ) -> Result<scheme::Transaction<AstArena<AstMapAny>>, Self::Error> {
+        Ok(Arc::new(self.apply_from_ir(upstream, downstream, &txn)))
     }
 }

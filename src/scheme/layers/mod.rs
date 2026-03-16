@@ -12,9 +12,9 @@ pub mod ast;
 pub mod cst;
 pub mod source;
 
-pub use ast::{ASTCell, AstArena, AstArenaError, AstDelta};
+pub(crate) use ast::AstTxnBuilder;
+pub use ast::{AstArena, AstArenaError, AstCell, AstDelta, AstMapAny, AstVec};
 pub use cst::{
-    Command, NodePath, ParseNodeValue, ParseTreeError, ParseTreeIR, ParseTreeQuery, ParserCommand,
-    RedGreenTreeIR,
+    NodePath, ParseNodeValue, ParseTreeError, ParseTreeIR, ParseTreeQuery, ParseTreeValue,
 };
 pub use source::SourceText;

@@ -1,10 +1,11 @@
+use rustc_hash::FxHashMap;
+
 use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
-    runtime::Payload,
     scheme::{
         self,
-        layers::{ParseNodeValue, RedGreenTreeIR, SourceText},
+        layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText},
     },
     utils::Span,
 };
@@ -47,28 +48,25 @@ impl ParserPass {
     }
 }
 
-impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
+impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
     type Error = std::convert::Infallible;
 
     fn transform(
         &mut self,
         upstream: &SourceText,
+        downstream: &ParseTreeIR,
         txn: scheme::Transaction<SourceText>,
-    ) -> Result<scheme::Transaction<RedGreenTreeIR>, Self::Error> {
-        let new_text = &upstream.text;
+    ) -> Result<scheme::Transaction<ParseTreeIR>, Self::Error> {
+        let new_text_owned = upstream.text();
+        let new_text = new_text_owned.as_str();
 
         let edit = extract_edit(&txn);
 
-        if let Some((span, new_len)) = edit {
-            // A span that starts at 0 and covers the entire current text is a
-            // "replace-all" (e.g. the CLI submitting a full buffer, or the very
-            // first character typed into an empty document).  No incremental
-            // candidate can help here — always use the full-reparse path so the
-            // CST layer receives a correct root-setting Insert command.
-            let old_len = self.parser.text().len();
-            let is_replace_all = span.start == 0 && span.end >= old_len;
-
-            if !is_replace_all {
+        // Only attempt incremental re-parse when a CST already exists.
+        // `downstream.root.is_some()` is the ground truth: if no CST root has
+        // been set yet the reparser has nothing to reuse, and we must full-parse.
+        if downstream.root.is_some() {
+            if let Some((span, new_len)) = edit {
                 let result =
                     self.reparser
                         .handle_edit(&mut self.parser, span, new_len, new_text, None);
@@ -95,32 +93,37 @@ impl scheme::Pass<SourceText, RedGreenTreeIR> for ParserPass {
 }
 
 fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
-    // Collect staged string lengths indexed by Create id.
-    let mut staged_len: Vec<usize> = Vec::new();
+    // Collect staged string lengths for Create commands.
+    let mut staged_len: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut edit_count = 0usize;
+    let mut result = None;
 
     for cmd in txn {
         match cmd {
             scheme::Command::Create { id, value } => {
-                if *id >= staged_len.len() {
-                    staged_len.resize(*id + 1, 0);
-                }
-                staged_len[*id] = value.len();
+                staged_len.insert(*id, value.len());
             }
             scheme::Command::Delete { index: span } => {
-                return Some((*span, 0));
+                edit_count += 1;
+                result = Some((*span, 0));
             }
             scheme::Command::Insert { index: span, id } => {
-                let new_len = staged_len.get(*id).copied().unwrap_or(0);
-                return Some((*span, new_len));
+                let new_len = staged_len.get(id).copied().unwrap_or(0);
+                edit_count += 1;
+                result = Some((*span, new_len));
             }
             scheme::Command::Replace { index: span, id } => {
-                let new_len = staged_len.get(*id).copied().unwrap_or(0);
-                return Some((*span, new_len));
+                let new_len = staged_len.get(id).copied().unwrap_or(0);
+                edit_count += 1;
+                result = Some((*span, new_len));
             }
             scheme::Command::SetRoot { .. } => {}
         }
     }
-    None
+
+    // Only use incremental reparse for exactly one edit; multi-edit batches
+    // fall through to full reparse to avoid incorrect partial-edit hints.
+    if edit_count == 1 { result } else { None }
 }
 
 /// Prepend a `ParseNodeValue::Messages` Create command (id=0) carrying the
@@ -129,15 +132,15 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
 /// dropped by `finalize_root`).  Tree-node IDs start at 1, so id=0 is safe.
 fn prepend_messages_command(
     messages: &crate::parsec::msg::ParserMessages,
-    rest: Vec<scheme::Command<RedGreenTreeIR>>,
-) -> Vec<scheme::Command<RedGreenTreeIR>> {
+    rest: Vec<scheme::Command<ParseTreeIR>>,
+) -> Vec<scheme::Command<ParseTreeIR>> {
     if messages.is_empty() {
         return rest;
     }
     let mut cmds = Vec::with_capacity(rest.len() + 1);
     cmds.push(scheme::Command::Create {
         id: 0,
-        value: Payload::new(ParseNodeValue::Messages {
+        value: ParseTreeValue::Node(ParseNodeValue::Messages {
             messages: messages.clone(),
         }),
     });

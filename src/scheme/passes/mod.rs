@@ -5,6 +5,6 @@ pub mod parsing;
 pub mod reparser;
 pub(crate) mod strategy;
 
-pub use lowering::{AstMapper, FallbackMode, GreenQuery, IncrementalLowerer, MapOutput, RuleMap};
+pub use lowering::{AstMapAction, AstMapCtx, AstMapIntent, AstMapper, AstNode, IncrementalLowerer};
 pub use parsing::ParserPass;
 pub use reparser::{Reparser, ReparserConfig};

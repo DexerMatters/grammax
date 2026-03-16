@@ -1,5 +1,6 @@
 use std::{
     fmt::Debug,
+    hash::Hash,
     ops::{self},
     sync::Arc,
 };
@@ -57,28 +58,37 @@ pub trait Matcher: Debug {
 /// A convenient type alias for a reference-counted matcher, allowing for shared ownership and dynamic dispatch.
 pub type MatcherRef = Arc<dyn Matcher + Send + Sync + 'static>;
 
+impl Hash for dyn Matcher + Send + Sync {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.display().hash(state);
+    }
+}
+
 /// A matcher that matches the end of the input string.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct EndOfInput;
 
-/// A matcher that matches the start of the input string.
-#[derive(Debug, Clone, Copy)]
-pub struct StartOfInput;
-
 /// A matcher that represents an alternative between two matchers, meaning that either can match.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct Alternative<T, U>(pub T, pub U);
 
 /// A matcher that represents a sequence of two matchers, meaning that both must match in order.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct Sequence<T, U>(pub T, pub U);
 
 /// A matcher that represents a repetition of another matcher according to a specified range.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct Repeat<T, R: ops::RangeBounds<usize>>(pub T, pub R);
 
+#[derive(Debug, Clone, Copy, Hash)]
+pub struct CustomChar {
+    pub predicate: fn(char) -> bool,
+    pub pick: fn() -> &'static str,
+    pub description: &'static str,
+}
+
 /// A named matcher that associates a human-readable name with another matcher, which can be useful for error messages and debugging.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct NamedMatcher<M: Matcher> {
     pub name: &'static str,
     pub matcher: M,
@@ -92,23 +102,47 @@ impl<M: Matcher> NamedMatcher<M> {
 }
 
 /// A predefined matcher that matches a sequence of ASCII digits, representing a number.
-pub const NUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
-    NamedMatcher::new("number", Repeat(|c: char| c.is_ascii_digit(), 1..));
+pub const NUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "number",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_ascii_digit(),
+            pick: || "0123456789",
+            description: "digit",
+        },
+        1..,
+    ),
+);
 
 /// A predefined matcher that matches a sequence of ASCII alphabetic characters, representing an identifier.
-pub const ALPHAS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
-    NamedMatcher::new("identifier", Repeat(|c: char| c.is_ascii_alphabetic(), 1..));
+pub const ALPHAS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "identifier",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_ascii_alphabetic(),
+            pick: || "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            description: "alphabetic character",
+        },
+        1..,
+    ),
+);
 
 /// A predefined matcher that matches a sequence of ASCII alphanumeric characters or underscores, representing an identifier that can include digits.
-pub const ALPHANUMS: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
-    NamedMatcher::new(
-        "alphanum",
-        Repeat(|c: char| c.is_ascii_alphanumeric() || c == '_', 1..),
-    );
+pub const ALPHANUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "alphanum",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_ascii_alphanumeric() || c == '_',
+            pick: || "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_",
+            description: "alphanumeric character or underscore",
+        },
+        1..,
+    ),
+);
 
 /// A matcher for identifiers accepted by most programming languages.
 /// Starts with a letter or underscore, followed by letters, digits, or underscores.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct IdentMatcher;
 
 impl Matcher for IdentMatcher {
@@ -162,7 +196,7 @@ pub const IDENT: NamedMatcher<IdentMatcher> = NamedMatcher::new("ident", IdentMa
 /// Matches a sequence where each character is either:
 /// - A regular character (not ", \, newline)
 /// - An escape sequence starting with \ followed by any character
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Hash)]
 pub struct StringMatcher;
 
 impl Matcher for StringMatcher {
@@ -209,15 +243,31 @@ impl Matcher for StringMatcher {
 pub const STRING: NamedMatcher<StringMatcher> = NamedMatcher::new("string", StringMatcher);
 
 /// A predefined matcher that matches a sequence of whitespace characters, which can be used to skip irrelevant spaces in the input.
-pub const WHITESPACES: NamedMatcher<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>> =
-    NamedMatcher::new("whitespaces", Repeat(|c: char| c.is_whitespace(), 1..));
+pub const WHITESPACES: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "whitespaces",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_whitespace(),
+            pick: || " \t\r\n",
+            description: "whitespace",
+        },
+        1..,
+    ),
+);
 
 /// A helper function that creates a matcher which matches the given matcher preceded by optional leading whitespace. This is useful for token matchers that should ignore leading spaces.
 pub const fn token<M: Matcher>(
     matcher: M,
-) -> Sequence<Repeat<fn(char) -> bool, ops::RangeFrom<usize>>, M> {
+) -> Sequence<Repeat<CustomChar, ops::RangeFrom<usize>>, M> {
     Sequence(
-        Repeat(|c: char| c.is_whitespace() || c == '\n' || c == '\r', 0..),
+        Repeat(
+            CustomChar {
+                predicate: |c| c.is_whitespace() || c == '\n' || c == '\r',
+                pick: || " \t\r\n",
+                description: "whitespace or newline",
+            },
+            0..,
+        ),
         matcher,
     )
 }
@@ -242,11 +292,11 @@ impl Matcher for () {
     }
 }
 
-impl Matcher for fn(char) -> bool {
+impl Matcher for CustomChar {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
         if let Some(next_char) = input[*pos..].chars().next() {
-            if self(next_char) {
+            if (self.predicate)(next_char) {
                 *pos += next_char.len_utf8();
                 return Some(*pos - start);
             }
@@ -255,7 +305,7 @@ impl Matcher for fn(char) -> bool {
     }
 
     fn display(&self) -> String {
-        String::from("char_predicate")
+        String::from(self.description)
     }
 
     fn is_nullable(&self) -> bool {
@@ -327,24 +377,6 @@ impl Matcher for EndOfInput {
 
     fn display(&self) -> String {
         String::from("EOF")
-    }
-
-    fn is_nullable(&self) -> bool {
-        false
-    }
-
-    fn is_consuming(&self) -> bool {
-        false
-    }
-}
-
-impl Matcher for StartOfInput {
-    fn matches<'a>(&self, _input: &'a str, pos: &mut usize) -> Option<usize> {
-        if *pos == 0 { Some(0) } else { None }
-    }
-
-    fn display(&self) -> String {
-        String::from("SOF")
     }
 
     fn is_nullable(&self) -> bool {
@@ -498,5 +530,72 @@ impl<M: Matcher> Matcher for NamedMatcher<M> {
 
     fn preview(&self) -> Option<&str> {
         self.matcher.preview()
+    }
+}
+
+/// A matcher for dynamically created owned string literals.
+/// Used internally for deserializing cached matchers.
+#[derive(Debug, Hash)]
+pub struct OwnedLiteral(pub String);
+
+impl Matcher for OwnedLiteral {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        if input[*pos..].starts_with(&self.0) {
+            *pos += self.0.len();
+            Some(*pos - start)
+        } else {
+            None
+        }
+    }
+
+    fn display(&self) -> String {
+        format!("\"{}\"", self.0)
+    }
+
+    fn is_nullable(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_consuming(&self) -> bool {
+        !self.0.is_empty()
+    }
+
+    fn preview(&self) -> Option<&str> {
+        Some(&self.0)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TokenizedMatcher {
+    pub inner: MatcherRef,
+}
+
+impl Matcher for TokenizedMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        let _ = token(()).0.matches(input, pos).or_else(|| Some(0));
+        if self.inner.matches(input, pos).is_some() {
+            Some(*pos - start)
+        } else {
+            *pos = start;
+            None
+        }
+    }
+
+    fn display(&self) -> String {
+        format!("char_predicate* {}", self.inner.display())
+    }
+
+    fn is_nullable(&self) -> bool {
+        self.inner.is_nullable()
+    }
+
+    fn is_consuming(&self) -> bool {
+        self.inner.is_consuming()
+    }
+
+    fn preview(&self) -> Option<&str> {
+        self.inner.preview()
     }
 }

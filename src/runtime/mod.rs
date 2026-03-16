@@ -1,21 +1,21 @@
 //! Runtime terraced facade.
 //!
 //! - [`ComposedCompiler`]: composable compiler runtime built from IR/pass stages.
+//! - [`GlobalEventDispatcher`]: unified event/request loop (GED).
 
 pub mod compiler;
-pub mod payload;
+pub mod dispatcher;
 pub mod protocol;
 pub mod service;
 
-pub use crate::scheme::layers::cst::Command;
 pub use crate::scheme::passes::{ParserPass, Reparser, ReparserConfig};
 pub use crate::scheme::{LayerName, PassId};
-pub use compiler::{CompilerBuilder, ComposedCompiler, ExpectLayer, ExpectPass, LayerObserver};
-pub use payload::{Payload, SerdeAny};
-pub use protocol::{
-    RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimePath, RuntimeRequest,
-    RuntimeResult, RuntimeSelector, RuntimeSignal, RuntimeSignalKind,
+pub use compiler::{
+    Another, BuildTree, CompilerBuilder, ComposedCompiler, ContainsPath, ContainsTree, Down, End,
+    Fork, Here, LayerObserver, Observe, ObservePath, ObservedLayer, SeededTree, Then, TypedTree,
 };
+pub use protocol::{RevisionId, RuntimeError, RuntimePath};
+pub(crate) use protocol::{RuntimeEnvelope, RuntimeRequest, RuntimeResult, RuntimeSignal};
 pub use service::RuntimeService;
 
 #[cfg(test)]

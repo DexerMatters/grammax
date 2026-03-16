@@ -90,12 +90,16 @@ impl RuleTable {
                 // Group alternatives by first symbol
                 let mut prefix_groups: FxHashMap<String, Vec<Vec<NormalizedNode>>> =
                     FxHashMap::default();
+                let mut prefix_order = Vec::new();
 
                 for alt in alts {
                     match alt {
                         NormalizedNode::Sequence(mut parts) if !parts.is_empty() => {
                             let first = parts.remove(0);
                             let key = Self::node_key(&first);
+                            if !prefix_groups.contains_key(&key) {
+                                prefix_order.push(key.clone());
+                            }
                             prefix_groups.entry(key).or_default().push({
                                 let mut v = vec![first];
                                 v.extend(parts);
@@ -104,6 +108,9 @@ impl RuleTable {
                         }
                         other => {
                             let key = Self::node_key(&other);
+                            if !prefix_groups.contains_key(&key) {
+                                prefix_order.push(key.clone());
+                            }
                             prefix_groups.entry(key).or_default().push(vec![other]);
                         }
                     }
@@ -111,7 +118,8 @@ impl RuleTable {
 
                 // Rebuild alternatives with factored prefixes
                 let mut new_alts = Vec::new();
-                for (_, group) in prefix_groups {
+                for key in prefix_order {
+                    let group = prefix_groups.remove(&key).unwrap();
                     if group.len() == 1 {
                         new_alts.push(NormalizedNode::Sequence(group[0].clone()));
                     } else {

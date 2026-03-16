@@ -13,8 +13,9 @@ use crate::parsec::recovery::{
     OpenScopeToken, RecoveryCache, RecoveryConfig, RepairOp, ScopeStop, recover, scope_recover,
 };
 use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
-use crate::parsec::view::View;
-use crate::runtime;
+use crate::parsec::view::{NodeView, Viewer};
+use crate::scheme::Command;
+use crate::scheme::layers::ParseTreeIR;
 use crate::utils::{LruCache, Span};
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
@@ -41,18 +42,13 @@ impl Default for ParserConfig {
     }
 }
 
-#[derive(Default)]
-pub struct ParserListener {
-    // Callbacks
-}
-
 pub struct Result<'a> {
     alloc: TreeAllocRef,
     grammar: &'static Grammar,
     source: &'a str,
     pub root: RedNode,
     pub messages: ParserMessages,
-    pub semantic_commands: Vec<runtime::Command>,
+    pub semantic_commands: Vec<Command<ParseTreeIR>>,
 }
 
 impl<'a> Result<'a> {
@@ -68,8 +64,19 @@ impl<'a> Result<'a> {
         format_ast(&self.grammar, &self.root, &self.alloc, self.source)
     }
 
-    pub fn view(self) -> View<'a> {
-        View::new(self.grammar, self.alloc, self.source, self.root.green, 0)
+    pub fn view(&self) -> NodeView {
+        NodeView::new(
+            self.grammar,
+            self.alloc.clone(),
+            self.source,
+            std::sync::Arc::new(rustc_hash::FxHashMap::default()),
+            self.root.green,
+            0,
+        )
+    }
+
+    pub fn viewer(&self) -> Viewer {
+        Viewer::new(self.grammar, self.alloc.clone(), self.source)
     }
 
     pub fn is_ok(&self) -> bool {
@@ -113,7 +120,6 @@ pub struct Parser {
     pub newly_computed_tokens: Vec<Span>,
 
     config: ParserConfig,
-    listener: Option<ParserListener>,
 
     text: String,
     pos: usize,
@@ -139,7 +145,6 @@ impl Parser {
             newly_computed_nodes: vec![],
             newly_computed_tokens: vec![],
             config: ParserConfig::default(),
-            listener: None,
             text: String::new(),
             pos: 0,
             inc_insert_pos: None,
@@ -155,11 +160,6 @@ impl Parser {
 
     pub fn with_config(mut self, config: ParserConfig) -> Self {
         self.config = config;
-        self
-    }
-
-    pub fn with_listener(mut self, listener: ParserListener) -> Self {
-        self.listener = Some(listener);
         self
     }
 
@@ -319,6 +319,21 @@ impl Parser {
                     }
                 }
             } else {
+                let lookahead_term = self
+                    .peek_terminal(None)
+                    .map(|(term_ix, _)| term_ix)
+                    .unwrap_or(UNKNOWN_TOKEN);
+
+                if self.try_insert_missing_from_bridge_precedence(
+                    &self.grammar.analysis,
+                    lookahead_term,
+                    &open_scope_stack,
+                    &mut state_stack,
+                    &mut node_stack,
+                ) {
+                    continue;
+                }
+
                 // Scope recovery (Nilsson-Nyman 2009 §4): before falling back to
                 // CPCT+, try to skip to the nearest matching close delimiter.
                 //
@@ -474,6 +489,8 @@ impl Parser {
                     self.string_opened,
                     &self.config.recovery,
                     Some(&mut self.recovery_cache),
+                    &self.grammar.bridge_specs,
+                    &open_scope_stack,
                 );
 
                 if repairs.is_empty() {
@@ -919,6 +936,49 @@ impl Parser {
 
     fn lex(&mut self, expected: Option<&[usize]>) -> (usize, usize, GreenId) {
         self.lex_with_end(expected, self.text.len())
+    }
+
+    fn peek_terminal(&self, expected: Option<&[usize]>) -> Option<(usize, usize)> {
+        let bounded_end = self.text.len();
+        let rest = &self.text[self.pos..bounded_end];
+        let at_boundary = self.pos >= bounded_end;
+        let mut best_match: Option<(usize, usize)> = None;
+
+        let mut consider = |idx: usize, matcher: &crate::parsec::words::MatcherRef| {
+            if self.is_bracketed_terminal(idx) && !self.string_opened {
+                return;
+            }
+            let mut probe = self.pos;
+            if matcher.matches(&self.text, &mut probe).is_some() {
+                if probe < self.pos || probe > bounded_end {
+                    return;
+                }
+                let len = probe - self.pos;
+                if len == 0 && !(at_boundary || rest.starts_with('"')) {
+                    return;
+                }
+                if best_match.iter().all(|&(_, best_len)| len > best_len) {
+                    best_match = Some((idx, len));
+                }
+            }
+        };
+
+        if let Some(expected) = expected {
+            for &idx in expected {
+                if idx == EOF_TOKEN {
+                    continue;
+                }
+                if let Some(matcher) = self.grammar.table.terminals.get(idx) {
+                    consider(idx, matcher);
+                }
+            }
+        } else {
+            for (idx, matcher) in self.grammar.table.terminals.iter().enumerate() {
+                consider(idx, matcher);
+            }
+        }
+
+        best_match
     }
 
     fn lex_with_end(&mut self, expected: Option<&[usize]>, end: usize) -> (usize, usize, GreenId) {
@@ -1394,19 +1454,50 @@ impl Parser {
             });
         }
 
-        // If there is exactly one bound (grammar) node on the stack, return it
-        // directly.  The remaining unbound entries are error/recovery nodes that
-        // were pushed outside the normal LR reduce chain (e.g. from scope
-        // recovery or CPCT+ Delete ops).  Their text spans are already covered
-        // by parser messages so they need not appear as an Incomplete wrapper.
+        // If there is exactly one bound (grammar) node on the stack, return it.
+        // Any unbound entries are error/recovery nodes pushed outside the normal
+        // LR reduce chain (e.g. from scope recovery, CPCT+ Delete ops, or
+        // panic-mode skip).  If those orphaned nodes have non-zero width they
+        // occupy real source characters that precede the bound node, so we must
+        // include them in the returned tree; otherwise the display's running
+        // offset would start at 0 while the actual content starts further in,
+        // producing garbled token labels (e.g. showing "s" instead of "3").
+        // Zero-width orphans are just dropped – they are phantom force_accept
+        // artefacts that carry no source text.
         let bound_count = node_stack.iter().filter(|e| e.binds_state).count();
         if bound_count == 1 {
-            // Find and extract the single bound node, preserving order of unbound ones.
+            // Find and extract the single bound node.
             let bound_pos = node_stack.iter().rposition(|e| e.binds_state).unwrap();
             let root_entry = node_stack.remove(bound_pos);
-            // The remaining unbound nodes are discarded (their content is in messages).
-            node_stack.clear();
-            return root_entry.node;
+
+            // Collect non-zero-width orphaned nodes (they cover real source text).
+            let orphans: Vec<GreenId> = node_stack
+                .drain(..)
+                .filter_map(|e| {
+                    let n = self.alloc.get_node(e.node);
+                    if n.width > 0 { Some(e.node) } else { None }
+                })
+                .collect();
+
+            if orphans.is_empty() {
+                // No real-text orphans – fast path, return the bound node directly.
+                return root_entry.node;
+            }
+
+            // One or more real-text error nodes precede the bound root.  Prepend
+            // them into the root rule's children so offset tracking stays correct
+            // while the root node itself (e.g. `start`) remains the tree root.
+            let (root_tag, root_children) = {
+                let root_node = self.alloc.get_node(root_entry.node);
+                (root_node.tag.clone(), root_node.children.clone())
+            };
+            let mut new_children = orphans;
+            new_children.extend(root_children);
+            let width: usize = new_children
+                .iter()
+                .map(|id| self.alloc.get_node(*id).width)
+                .sum();
+            return self.alloc.alloc(root_tag, new_children, width);
         }
 
         // Filter out zero-width grammar (non-error) nodes — these are phantom
@@ -1712,6 +1803,125 @@ impl Parser {
             node_stack,
             analysis,
         )
+    }
+
+    fn try_insert_missing_from_bridge_precedence(
+        &mut self,
+        analysis: &GrammarStateAnalysis,
+        lookahead_term: usize,
+        open_scope_stack: &[OpenScopeToken],
+        state_stack: &mut Vec<usize>,
+        node_stack: &mut Vec<StackEntry>,
+    ) -> bool {
+        if lookahead_term == EOF_TOKEN || lookahead_term == UNKNOWN_TOKEN {
+            return false;
+        }
+
+        let current_state_idx = *state_stack.last().unwrap();
+        let expected = self.expected_ids_for_analysis(analysis, current_state_idx, true);
+        if expected.is_empty() {
+            return false;
+        }
+
+        let expected_set = expected.iter().copied().collect::<HashSet<_>>();
+        let mut prioritized = Vec::new();
+
+        for open_scope in open_scope_stack.iter().rev() {
+            let Some(spec) = self
+                .grammar
+                .bridge_specs
+                .iter()
+                .find(|spec| spec.open == open_scope.term_idx)
+            else {
+                continue;
+            };
+
+            if !spec.included.contains(&lookahead_term)
+                && !spec
+                    .precedence
+                    .iter()
+                    .any(|rule| rule.before.contains(&lookahead_term))
+            {
+                continue;
+            }
+
+            prioritized.extend(
+                spec.precedence
+                    .iter()
+                    .filter(|rule| rule.before.contains(&lookahead_term))
+                    .map(|rule| rule.terminal)
+                    .filter(|term_ix| expected_set.contains(term_ix)),
+            );
+
+            if !prioritized.is_empty() {
+                break;
+            }
+        }
+
+        if prioritized.is_empty() {
+            return false;
+        }
+
+        prioritized.dedup();
+
+        for candidate in prioritized {
+            let mut sim_state_stack = state_stack.clone();
+            let mut sim_node_stack = node_stack.clone();
+            let missing = self.alloc.alloc(
+                Tag::new_error(ParsecError::MissingToken {
+                    expected: vec![candidate],
+                }),
+                vec![],
+                0,
+            );
+            if !self.apply_terminal_with_analysis(
+                candidate,
+                0,
+                missing,
+                false,
+                &mut sim_state_stack,
+                &mut sim_node_stack,
+                analysis,
+            ) {
+                continue;
+            }
+
+            let boundary = self.alloc.alloc_token(Tag::new_token(lookahead_term), 0);
+            if !self.apply_terminal_with_analysis(
+                lookahead_term,
+                0,
+                boundary,
+                false,
+                &mut sim_state_stack,
+                &mut sim_node_stack,
+                analysis,
+            ) {
+                continue;
+            }
+
+            self.messages.push(ParserMessage::new_missing(
+                Span::new(self.pos, self.pos),
+                vec![candidate],
+            ));
+            let missing = self.alloc.alloc(
+                Tag::new_error(ParsecError::MissingToken {
+                    expected: vec![candidate],
+                }),
+                vec![],
+                0,
+            );
+            return self.apply_terminal_with_analysis(
+                candidate,
+                0,
+                missing,
+                false,
+                state_stack,
+                node_stack,
+                analysis,
+            );
+        }
+
+        false
     }
 
     fn push_unexpected_trimmed(&mut self, start: usize, end: usize, expected: Vec<usize>) {

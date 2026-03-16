@@ -326,3 +326,96 @@ impl LineIndex {
         LineCol { line, col }
     }
 }
+
+use std::any::Any;
+
+// ── ForceSync wrapper ─────────────────────────────────────────────────────────
+//
+// Used only by `Payload::new_any` for values that are not Send/Sync (e.g.
+// `TreeAllocRef = Rc<RefCell<...>>`).  The caller guarantees that the payload
+// is only accessed on the thread that created it.
+
+struct ForceSync<T>(T);
+// SAFETY: Payload::new_any callers (e.g. the IR query path) ensure the payload
+// is only materialised and consumed on the single IR worker thread.
+unsafe impl<T> Send for ForceSync<T> {}
+unsafe impl<T> Sync for ForceSync<T> {}
+
+// ── JSON helpers ──────────────────────────────────────────────────────────────
+
+fn json_for<T: serde::Serialize + 'static>(any: &dyn Any) -> serde_json::Value {
+    match any.downcast_ref::<T>() {
+        Some(v) => serde_json::to_value(v).unwrap_or(serde_json::Value::Null),
+        None => serde_json::Value::Null,
+    }
+}
+
+struct Inner {
+    data: Box<dyn Any + Send + Sync>,
+    to_json: Option<fn(&dyn Any) -> serde_json::Value>,
+    type_name: &'static str,
+}
+
+pub(crate) struct Payload(Box<Inner>);
+
+impl Payload {
+    pub fn new<T: Send + Sync + 'static>(value: T) -> Self {
+        Self(Box::new(Inner {
+            data: Box::new(value),
+            to_json: None,
+            type_name: std::any::type_name::<T>(),
+        }))
+    }
+
+    pub fn new_serializable<T: serde::Serialize + Send + Sync + 'static>(value: T) -> Self {
+        Self(Box::new(Inner {
+            data: Box::new(value),
+            to_json: Some(json_for::<T>),
+            type_name: std::any::type_name::<T>(),
+        }))
+    }
+    pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
+        // Direct path (stored via `new`)
+        if let Some(v) = (*self.0.data).downcast_ref::<T>() {
+            return Some(v);
+        }
+        // ForceSync path (stored via `new_any`)
+        (*self.0.data).downcast_ref::<ForceSync<T>>().map(|w| &w.0)
+    }
+
+    pub fn downcast<T: 'static>(self) -> Option<T> {
+        let Inner { data, .. } = *self.0;
+        // Coerce Box<dyn Any + Send + Sync> → Box<dyn Any> to access downcast().
+        let data: Box<dyn Any> = data;
+        match data.downcast::<T>() {
+            Ok(boxed) => Some(*boxed),
+            Err(data) => data.downcast::<ForceSync<T>>().ok().map(|b| b.0),
+        }
+    }
+
+    pub fn to_json(&self) -> serde_json::Value {
+        self.0
+            .to_json
+            .map(|to_json| to_json(self.0.data.as_ref()))
+            .unwrap_or(serde_json::Value::Null)
+    }
+}
+
+impl serde::Serialize for Payload {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.to_json().serialize(serializer)
+    }
+}
+
+impl std::fmt::Debug for Payload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.to_json.is_some() {
+            write!(f, "Payload({:?})", self.to_json())
+        } else {
+            write!(f, "Payload(<opaque:{}>)", self.0.type_name)
+        }
+    }
+}
+
+// Kept for compatibility; not currently used for dynamic dispatch.
+pub trait SerdeAny: serde::Serialize + Send + Sync {}

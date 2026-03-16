@@ -14,7 +14,7 @@ use crate::grammar::analysis::GrammarStateAnalysis;
 use crate::grammar::bridge;
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::parsec::words::{self, EndOfInput, Matcher, MatcherRef, StartOfInput, token};
+use crate::parsec::words::{self, EndOfInput, MatcherRef, OwnedLiteral, TokenizedMatcher, token};
 
 pub(crate) mod serde_fxhashmap {
     use std::hash::Hash;
@@ -44,7 +44,7 @@ pub(crate) mod serde_fxhashmap {
     }
 }
 
-const CACHE_FORMAT_VERSION: u32 = 7;
+const CACHE_FORMAT_VERSION: u32 = 8;
 
 static CACHE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
 
@@ -56,7 +56,6 @@ enum CachedTerminal {
     Char(char),
     Named(String),
     Eof,
-    Sof,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,71 +109,6 @@ struct GrammarCacheFile {
     /// Terminals with matching delimiters on both ends (e.g., strings, comments).
     /// Stored as terminal indices that have the same delimiter opening and closing.
     bracketed_terminals: Vec<usize>,
-}
-
-#[derive(Debug)]
-struct OwnedLiteral(String);
-
-#[derive(Debug, Clone)]
-struct TokenizedMatcher {
-    inner: MatcherRef,
-}
-
-impl Matcher for OwnedLiteral {
-    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
-        let start = *pos;
-        if input[*pos..].starts_with(&self.0) {
-            *pos += self.0.len();
-            Some(*pos - start)
-        } else {
-            None
-        }
-    }
-
-    fn display(&self) -> String {
-        format!("\"{}\"", self.0)
-    }
-
-    fn is_nullable(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    fn is_consuming(&self) -> bool {
-        !self.0.is_empty()
-    }
-
-    fn preview(&self) -> Option<&str> {
-        Some(&self.0)
-    }
-}
-
-impl Matcher for TokenizedMatcher {
-    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
-        let start = *pos;
-        let _ = words::token(()).0.matches(input, pos).or_else(|| Some(0));
-        if self.inner.matches(input, pos).is_some() {
-            Some(*pos - start)
-        } else {
-            *pos = start;
-            None
-        }
-    }
-
-    fn display(&self) -> String {
-        format!("char_predicate* {}", self.inner.display())
-    }
-
-    fn is_nullable(&self) -> bool {
-        self.inner.is_nullable()
-    }
-
-    fn is_consuming(&self) -> bool {
-        self.inner.is_consuming()
-    }
-
-    fn preview(&self) -> Option<&str> {
-        self.inner.preview()
-    }
 }
 
 pub(crate) fn load(cache_key: u64) -> Option<Grammar> {
@@ -404,6 +338,12 @@ fn decode_node(node: CachedNode, terminals: &[MatcherRef]) -> Result<NormalizedN
 fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
     let display = matcher.display();
 
+    // Handle "whitespace or newline* ..." patterns (from token() function)
+    if let Some(rest) = display.strip_prefix("whitespace or newline* ") {
+        let inner = cached_terminal_from_display(rest.trim())?;
+        return Some(CachedTerminal::Token(Box::new(inner)));
+    }
+
     if let Some(inner_display) = display.strip_prefix("char_predicate* ") {
         let inner = cached_terminal_from_display(inner_display.trim())?;
         return Some(CachedTerminal::Token(Box::new(inner)));
@@ -427,8 +367,10 @@ fn cached_terminal_from_display(display: &str) -> Option<CachedTerminal> {
     if display == "EOF" {
         return Some(CachedTerminal::Eof);
     }
-    if display == "SOF" {
-        return Some(CachedTerminal::Sof);
+
+    if display == "whitespace or newline" {
+        // Special handling for the token() function's whitespace pattern
+        return Some(CachedTerminal::Named("whitespace_or_newline".to_string()));
     }
 
     if let Some(ch) = parse_char_display(display) {
@@ -452,9 +394,12 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
     match spec {
         CachedTerminal::Literal(s) => Ok(Arc::new(OwnedLiteral(s.clone()))),
         CachedTerminal::TokenLiteral(s) => Ok(Arc::new(token(OwnedLiteral(s.clone())))),
-        CachedTerminal::Token(inner) => Ok(Arc::new(TokenizedMatcher {
-            inner: cached_to_terminal(inner)?,
-        })),
+        CachedTerminal::Token(inner) => {
+            let inner_matcher = cached_to_terminal(inner)?;
+            Ok(Arc::new(TokenizedMatcher {
+                inner: inner_matcher,
+            }))
+        }
         CachedTerminal::Char(c) => Ok(Arc::new(*c)),
         CachedTerminal::Named(name) => match name.as_str() {
             "number" => Ok(Arc::new(words::NUMS)),
@@ -464,10 +409,14 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
             "ident" => Ok(Arc::new(words::IDENT)),
             "json_string" => Ok(Arc::new(words::STRING)), // Backward compatibility
             "whitespaces" => Ok(Arc::new(words::WHITESPACES)),
+            "whitespace_or_newline" => {
+                // This is a special pattern used by token() - return WHITESPACES as best approximation
+                // The actual matching is handled by TokenizedMatcher when this is wrapped as Token
+                Ok(Arc::new(words::WHITESPACES))
+            }
             _ => Err(format!("unsupported named matcher in cache: {}", name)),
         },
         CachedTerminal::Eof => Ok(Arc::new(EndOfInput)),
-        CachedTerminal::Sof => Ok(Arc::new(StartOfInput)),
     }
 }
 
@@ -573,7 +522,6 @@ impl PartialEq for CachedTerminal {
             (Char(a), Char(b)) => a == b,
             (Named(a), Named(b)) => a == b,
             (Eof, Eof) => true,
-            (Sof, Sof) => true,
             _ => false,
         }
     }
@@ -606,7 +554,6 @@ impl Hash for CachedTerminal {
                 s.hash(state);
             }
             Eof => 5u8.hash(state),
-            Sof => 6u8.hash(state),
         }
     }
 }
@@ -621,7 +568,6 @@ impl fmt::Display for CachedTerminal {
             Char(c) => write!(f, "'{}'", c),
             Named(n) => write!(f, "{}", n),
             Eof => write!(f, "EOF"),
-            Sof => write!(f, "SOF"),
         }
     }
 }

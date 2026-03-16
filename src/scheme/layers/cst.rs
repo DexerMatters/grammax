@@ -1,18 +1,20 @@
-use rustc_hash::FxHashMap;
-use serde::Serialize;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::{Serialize, Serializer};
 use std::fmt;
 
 use crate::{
     parsec::{
         msg::{ErrorMessage, ParserMessage, ParserMessages},
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
+        view::Viewer,
     },
-    runtime::Payload,
     scheme::{self, IR},
     utils::Span,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, serde::Deserialize)]
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Default, Serialize, serde::Deserialize,
+)]
 pub struct NodePath(pub Vec<usize>);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
@@ -32,6 +34,25 @@ impl Default for ParseTreeQuery {
 impl NodePath {
     pub fn root() -> Self {
         Self(Vec::new())
+    }
+
+    /// Return the `index`-th direct child of this path.
+    pub fn child(&self, index: usize) -> Self {
+        let mut path = self.0.clone();
+        path.push(index);
+        Self(path)
+    }
+
+    pub fn is_prefix_of(&self, other: &Self) -> bool {
+        self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(a, b)| a == b)
+    }
+
+    pub fn is_direct_child_of(&self, parent: &Self) -> bool {
+        self.0.len() == parent.0.len() + 1 && parent.is_prefix_of(self)
+    }
+
+    pub fn overlaps_subtree(&self, other: &Self) -> bool {
+        self.is_prefix_of(other) || other.is_prefix_of(self)
     }
 
     pub fn parent(&self) -> Option<Self> {
@@ -74,6 +95,42 @@ pub enum ParseTreeError {
     InvalidPath(NodePath),
 }
 
+#[derive(Clone)]
+pub enum ParseTreeValue {
+    Node(ParseNodeValue),
+    GreenId(usize),
+    Messages(ParserMessages),
+    Allocator(TreeAllocRef),
+}
+
+impl fmt::Debug for ParseTreeValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Node(n) => write!(f, "Node({n:?})"),
+            Self::GreenId(id) => write!(f, "GreenId({id})"),
+            Self::Messages(m) => write!(f, "Messages({m:?})"),
+            Self::Allocator(_) => write!(f, "Allocator(<opaque>)"),
+        }
+    }
+}
+
+impl Serialize for ParseTreeValue {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Node(n) => n.serialize(s),
+            Self::GreenId(id) => id.serialize(s),
+            Self::Messages(m) => m.serialize(s),
+            // TreeAllocRef is Rc-based and not serialisable; emit null at the
+            // HTTP boundary (it is only used internally by the CLI/tests).
+            Self::Allocator(_) => s.serialize_none(),
+        }
+    }
+}
+
+// SAFETY: see `SendableAlloc` above.
+unsafe impl Send for ParseTreeValue {}
+unsafe impl Sync for ParseTreeValue {}
+
 impl ParseNodeValue {
     pub fn field(&self) -> &str {
         match self {
@@ -99,15 +156,14 @@ pub struct ParseTreeIR {
     /// Current root green node id inside `alloc`.
     pub root: Option<usize>,
     /// Transaction-local staging table cleared before each transaction.
-    pub staging: Vec<Option<ParseNodeValue>>,
-    created: Vec<Option<usize>>,
+    pub staging: FxHashMap<usize, ParseNodeValue>,
+    created: FxHashMap<usize, usize>,
     fields: FxHashMap<usize, String>,
     token_text: FxHashMap<usize, String>,
-    /// Parser-level messages forwarded directly from the pass (e.g. panic-mode
-    /// recovery errors that are not encoded as error nodes in the green tree).
-    /// Cleared at the start of each transaction and repopulated if a
-    /// `ParseNodeValue::Messages` Create command is present.
     pub forwarded_messages: ParserMessages,
+    /// Pre-computed message list; refreshed at the end of every transaction
+    /// so repeated `query(Message)` calls are O(1) instead of O(tree size).
+    messages_cache: ParserMessages,
 }
 
 // SAFETY: ParseTreeIR is always owned by a single worker thread when used in
@@ -136,20 +192,50 @@ impl ParseTreeIR {
         Self {
             alloc: TreeAllocRef::create(),
             root: None,
-            staging: Vec::new(),
-            created: Vec::new(),
+            staging: FxHashMap::default(),
+            created: FxHashMap::default(),
             fields: FxHashMap::default(),
             token_text: FxHashMap::default(),
             forwarded_messages: Vec::new(),
+            messages_cache: Vec::new(),
         }
     }
 
     pub fn staged(&self, id: usize) -> Option<&ParseNodeValue> {
-        self.staging.get(id)?.as_ref()
+        self.staging.get(&id)
     }
 
     fn width_of(&self, green: usize) -> usize {
-        self.alloc.get_node(green).width
+        self.alloc.width_of(green)
+    }
+
+    pub fn viewer(&self, grammar: &'static crate::grammar::Grammar) -> Viewer {
+        Viewer::new(grammar, self.alloc.clone(), String::new())
+            .with_token_texts(self.token_text.clone())
+    }
+
+    pub fn token_text_of(&self, green: usize) -> Option<&str> {
+        self.token_text.get(&green).map(String::as_str)
+    }
+
+    pub fn offset_at_path(&self, path: &NodePath) -> Option<usize> {
+        let mut current = self.root?;
+        let mut offset = 0;
+        for &ix in &path.0 {
+            let node = self.alloc.node(current);
+            if ix > node.children.len() {
+                return None;
+            }
+            offset += node
+                .children
+                .iter()
+                .take(ix)
+                .map(|&child| self.alloc.width_of(child))
+                .sum::<usize>();
+            let next = *node.children.get(ix)?;
+            current = next;
+        }
+        Some(offset)
     }
 
     fn alloc_from_value(&mut self, value: &ParseNodeValue) -> Option<usize> {
@@ -179,7 +265,7 @@ impl ParseTreeIR {
             } => {
                 let mut child_greens = Vec::with_capacity(children.len());
                 for child in children {
-                    child_greens.push(self.created.get(*child)?.as_ref().copied()?);
+                    child_greens.push(self.created.get(child).copied()?);
                 }
                 let width = child_greens.iter().map(|id| self.width_of(*id)).sum();
                 let id = self
@@ -202,7 +288,7 @@ impl ParseTreeIR {
         };
 
         if parent_path.is_empty() {
-            let node = self.alloc.get_node(current);
+            let node = self.alloc.node(current);
             let mut children = node.children.clone();
             let tag = node.tag.clone();
             let old = current;
@@ -224,7 +310,7 @@ impl ParseTreeIR {
 
         let mut spine: Vec<(usize, usize)> = Vec::new();
         for &ix in parent_path {
-            let node = self.alloc.get_node(current);
+            let node = self.alloc.node(current);
             if ix >= node.children.len() {
                 return;
             }
@@ -234,7 +320,7 @@ impl ParseTreeIR {
             current = next;
         }
 
-        let node = self.alloc.get_node(current);
+        let node = self.alloc.node(current);
         let mut children = node.children.clone();
         let tag = node.tag.clone();
         let old_leaf = current;
@@ -252,7 +338,7 @@ impl ParseTreeIR {
         }
 
         for (ancestor, child_ix) in spine.into_iter().rev() {
-            let node = self.alloc.get_node(ancestor);
+            let node = self.alloc.node(ancestor);
             let mut children = node.children.clone();
             let tag = node.tag.clone();
             drop(node);
@@ -298,7 +384,7 @@ impl ParseTreeIR {
     pub fn green_at_path(&self, path: &NodePath) -> Option<usize> {
         let mut current = self.root?;
         for &ix in &path.0 {
-            let node = self.alloc.get_node(current);
+            let node = self.alloc.node(current);
             if ix >= node.children.len() {
                 return None;
             }
@@ -308,7 +394,7 @@ impl ParseTreeIR {
     }
 
     pub fn value_of_green(&self, green: usize) -> ParseNodeValue {
-        let node = self.alloc.get_node(green);
+        let node = self.alloc.node(green);
         let field = self.fields.get(&green).cloned().unwrap_or_default();
         match &node.tag {
             Tag::Token { rule_ix } => ParseNodeValue::Token {
@@ -334,39 +420,64 @@ impl ParseTreeIR {
         }
     }
 
-    fn collect_messages_from_green(&self, green: usize, offset: usize, out: &mut ParserMessages) {
-        let node = self.alloc.get_node(green);
-        let tag = node.tag.clone();
-        let width = node.width;
-        let children = node.children.clone();
-        drop(node);
-
-        if let Tag::Error(err) = tag {
-            let message = match err {
-                ParsecError::UnexpectedToken { expected } => {
-                    ErrorMessage::UnexpectedToken { expected }
-                }
-                ParsecError::MissingToken { expected } => ErrorMessage::MissingToken { expected },
-                ParsecError::Incomplete | ParsecError::Placeholder | ParsecError::LRError => {
-                    ErrorMessage::Custom(0)
-                }
+    fn collect_messages_from_green(
+        &self,
+        root: usize,
+        root_offset: usize,
+        out: &mut ParserMessages,
+    ) {
+        // Iterative DFS to avoid stack overflow on deep/right-skewed trees.
+        let mut stack: Vec<(usize, usize)> = vec![(root, root_offset)];
+        while let Some((green, offset)) = stack.pop() {
+            let node = self.alloc.node(green);
+            let tag = node.tag.clone();
+            let width = node.width;
+            // Compute child offsets before dropping the node borrow.
+            let children_with_offsets: Vec<(usize, usize)> = {
+                let mut child_offset = offset;
+                node.children
+                    .iter()
+                    .map(|&child| {
+                        let w = self.alloc.width_of(child);
+                        let spec = (child, child_offset);
+                        child_offset = child_offset.saturating_add(w);
+                        spec
+                    })
+                    .collect()
             };
+            drop(node);
 
-            out.push(ParserMessage {
-                span: Span::new(offset, offset + width),
-                message,
-            });
-        }
+            if let Tag::Error(err) = tag {
+                let message = match err {
+                    ParsecError::UnexpectedToken { expected } => {
+                        ErrorMessage::UnexpectedToken { expected }
+                    }
+                    ParsecError::MissingToken { expected } => {
+                        ErrorMessage::MissingToken { expected }
+                    }
+                    ParsecError::Incomplete | ParsecError::Placeholder | ParsecError::LRError => {
+                        ErrorMessage::Custom(0)
+                    }
+                };
+                out.push(ParserMessage {
+                    span: Span::new(offset, offset + width),
+                    message,
+                });
+            }
 
-        let mut child_offset = offset;
-        for child in children {
-            let child_width = self.alloc.get_node(child).width;
-            self.collect_messages_from_green(child, child_offset, out);
-            child_offset = child_offset.saturating_add(child_width);
+            // Push in reverse so children are popped in forward order.
+            for pair in children_with_offsets.into_iter().rev() {
+                stack.push(pair);
+            }
         }
     }
 
     pub fn parser_messages(&self) -> ParserMessages {
+        // Pre-computed in `apply_transaction`; O(1) to return.
+        self.messages_cache.clone()
+    }
+
+    fn compute_parser_messages(&self) -> ParserMessages {
         let mut messages = self.forwarded_messages.clone();
         // Also collect error nodes encoded directly in the green tree (e.g.
         // MissingToken nodes from incremental recovery).  Merge with forwarded
@@ -378,24 +489,41 @@ impl ParseTreeIR {
         messages.dedup_by(|a, b| a.span == b.span && a.message == b.message);
         messages
     }
+
+    fn live_green_ids(&self) -> FxHashSet<usize> {
+        let mut live = FxHashSet::default();
+        let Some(root) = self.root else {
+            return live;
+        };
+        let mut stack = vec![root];
+        while let Some(green) = stack.pop() {
+            if live.insert(green) {
+                let node = self.alloc.node(green);
+                for &child in &node.children {
+                    stack.push(child);
+                }
+            }
+        }
+        live
+    }
 }
 
 impl IR for ParseTreeIR {
     type Ix = ParseTreeQuery;
-    type Value = Payload;
+    type Value = ParseTreeValue;
     type Error = ParseTreeError;
 
-    fn query(&self, index: ParseTreeQuery) -> Result<Payload, Self::Error> {
+    fn query(&self, index: ParseTreeQuery) -> Result<ParseTreeValue, Self::Error> {
         match index {
-            ParseTreeQuery::Message => Ok(Payload::new(self.parser_messages())),
-            ParseTreeQuery::Allocator => Ok(Payload::new_any(self.alloc.clone())),
+            ParseTreeQuery::Message => Ok(ParseTreeValue::Messages(self.parser_messages())),
+            ParseTreeQuery::Allocator => Ok(ParseTreeValue::Allocator(self.alloc.clone())),
             ParseTreeQuery::Path(path) => {
                 let green = match self.green_at_path(&path) {
                     Some(green) => green,
                     None if self.root.is_none() => return Err(ParseTreeError::MissingRoot),
                     None => return Err(ParseTreeError::InvalidPath(path)),
                 };
-                Ok(Payload::new(green))
+                Ok(ParseTreeValue::GreenId(green))
             }
         }
     }
@@ -423,8 +551,10 @@ impl IR for ParseTreeIR {
         for command in transaction.iter() {
             match command {
                 scheme::Command::Create { id, value } => {
-                    let Some(value) = value.downcast_ref::<ParseNodeValue>() else {
-                        continue;
+                    // Extract the inner ParseNodeValue; skip non-node values.
+                    let value = match value {
+                        ParseTreeValue::Node(n) => n,
+                        _ => continue,
                     };
 
                     // Messages variant carries forwarded parser-level errors.
@@ -433,21 +563,17 @@ impl IR for ParseTreeIR {
                         continue;
                     }
 
-                    if *id >= self.staging.len() {
-                        self.staging.resize(*id + 1, None);
-                    }
-                    self.staging[*id] = Some(value.clone());
+                    self.staging.insert(*id, value.clone());
 
-                    if *id >= self.created.len() {
-                        self.created.resize(*id + 1, None);
+                    if let Some(green) = self.alloc_from_value(value) {
+                        self.created.insert(*id, green);
                     }
-                    self.created[*id] = self.alloc_from_value(value);
                 }
                 scheme::Command::Insert { index, id } => {
                     let ParseTreeQuery::Path(index) = index else {
                         continue;
                     };
-                    let Some(green) = self.created.get(*id).and_then(|v| *v) else {
+                    let Some(&green) = self.created.get(id) else {
                         continue;
                     };
 
@@ -489,7 +615,7 @@ impl IR for ParseTreeIR {
                     let ParseTreeQuery::Path(index) = index else {
                         continue;
                     };
-                    let Some(green) = self.created.get(*id).and_then(|v| *v) else {
+                    let Some(&green) = self.created.get(id) else {
                         continue;
                     };
 
@@ -510,11 +636,20 @@ impl IR for ParseTreeIR {
                 }
                 scheme::Command::SetRoot { id } => {
                     flush_pending(self, &mut pending_parent, &mut pending_edits);
-                    self.root = (*id).and_then(|ix| self.created.get(ix).and_then(|v| *v));
+                    self.root = (*id).and_then(|ix| self.created.get(&ix).copied());
                 }
             }
         }
         flush_pending(self, &mut pending_parent, &mut pending_edits);
+
+        // Evict stale metadata for green nodes no longer in the tree (fix 5).
+        let live = self.live_green_ids();
+        self.fields.retain(|id, _| live.contains(id));
+        self.token_text.retain(|id, _| live.contains(id));
+
+        // Pre-compute message cache so query(Message) is O(1) until next txn.
+        self.messages_cache = self.compute_parser_messages();
+
         Ok(())
     }
 }
@@ -525,14 +660,3 @@ enum PendingChildEdit {
     Delete { at: usize },
     Replace { at: usize, green: usize },
 }
-
-// ── Command type alias ────────────────────────────────────────────────────────
-
-/// A concrete parse-tree command — `scheme::Command` specialised for the parse-tree IR.
-pub type Command = scheme::Command<ParseTreeIR>;
-
-/// Alias for Layer 2 in the terraced model terminology.
-pub type RedGreenTreeIR = ParseTreeIR;
-
-/// Alias emphasizing that Layer 2 transactions are parser commands.
-pub type ParserCommand = Command;

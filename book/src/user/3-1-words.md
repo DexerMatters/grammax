@@ -54,7 +54,7 @@ assert_eq!(pos, 8); // The input position has advanced to the end of the string
 
 ## Custom matchers
 
-> [!Warning]
+> [!WARNING]
 > Due to the design of grammar caching, it is currently not recommended to define custom matchers in Grammax. This is because custom matchers contain function pointers, which cannot be easily invalidated by the caching mechanism. 
 
 There are two ways to define custom matchers in Grammax:

@@ -4,7 +4,7 @@
 
 ## Features
 
-> [!Warning]
+> [!WARNING]
 > In progress...
 
 ## Principles
@@ -32,7 +32,7 @@ After reading the user guide, you will be able to design your own grammar, build
 - [The design and implementation](./design/0-terraces.md) shares the design and implementation details of Grammax, focusing on "how it works". It unmasks the design of the "terraced field" structure and makes better understanding of the achievement of the incremental design and command-based pipeline. After reading this section, you will have a deeper understanding of the design and implementation of Grammax, which can help you to use it more effectively and even contribute to its development.
 
 ## Contribution
-> [!Warning]
+> [!WARNING]
 > In progress...
 
 ## License

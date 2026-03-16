@@ -4,7 +4,7 @@ Grammax is both a command-line tool and a library which you can add to your proj
 
 ## Pre-compiled binaries
 
-> [!Warning]
+> [!WARNING]
 > In progress...
 
 ## Build from source

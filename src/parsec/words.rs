@@ -1,9 +1,10 @@
 use std::{
     fmt::Debug,
-    hash::Hash,
     ops::{self},
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
+
+use regex::Regex;
 
 /// A trait representing a matcher that lexically matches a portion of the input string.
 pub trait Matcher: Debug {
@@ -58,37 +59,64 @@ pub trait Matcher: Debug {
 /// A convenient type alias for a reference-counted matcher, allowing for shared ownership and dynamic dispatch.
 pub type MatcherRef = Arc<dyn Matcher + Send + Sync + 'static>;
 
-impl Hash for dyn Matcher + Send + Sync {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.display().hash(state);
-    }
-}
-
 /// A matcher that matches the end of the input string.
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct EndOfInput;
 
 /// A matcher that represents an alternative between two matchers, meaning that either can match.
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct Alternative<T, U>(pub T, pub U);
 
 /// A matcher that represents a sequence of two matchers, meaning that both must match in order.
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct Sequence<T, U>(pub T, pub U);
 
 /// A matcher that represents a repetition of another matcher according to a specified range.
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct Repeat<T, R: ops::RangeBounds<usize>>(pub T, pub R);
 
-#[derive(Debug, Clone, Copy, Hash)]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
 pub struct CustomChar {
     pub predicate: fn(char) -> bool,
     pub pick: fn() -> &'static str,
     pub description: &'static str,
 }
 
+#[derive(Debug, Clone)]
+pub struct RegexMatcher {
+    pub pattern: Regex,
+    pub is_nullable: OnceLock<bool>,
+    pub is_consuming: OnceLock<bool>,
+}
+
+impl Matcher for RegexMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        if let Some(mat) = self.pattern.find(&input[*pos..]) {
+            if mat.start() == 0 {
+                *pos += mat.end();
+                return Some(*pos - start);
+            }
+        }
+        None
+    }
+
+    fn display(&self) -> String {
+        format!("regex({})", self.pattern)
+    }
+
+    fn is_nullable(&self) -> bool {
+        *self.is_nullable.get_or_init(|| self.pattern.is_match(""))
+    }
+
+    fn is_consuming(&self) -> bool {
+        *self.is_consuming.get_or_init(|| !self.pattern.is_match(""))
+    }
+}
+
 /// A named matcher that associates a human-readable name with another matcher, which can be useful for error messages and debugging.
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct NamedMatcher<M: Matcher> {
     pub name: &'static str,
     pub matcher: M,
@@ -142,7 +170,7 @@ pub const ALPHANUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = N
 
 /// A matcher for identifiers accepted by most programming languages.
 /// Starts with a letter or underscore, followed by letters, digits, or underscores.
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct IdentMatcher;
 
 impl Matcher for IdentMatcher {
@@ -196,7 +224,7 @@ pub const IDENT: NamedMatcher<IdentMatcher> = NamedMatcher::new("ident", IdentMa
 /// Matches a sequence where each character is either:
 /// - A regular character (not ", \, newline)
 /// - An escape sequence starting with \ followed by any character
-#[derive(Debug, Clone, Copy, Hash)]
+#[derive(Debug, Clone, Copy)]
 pub struct StringMatcher;
 
 impl Matcher for StringMatcher {
@@ -535,7 +563,7 @@ impl<M: Matcher> Matcher for NamedMatcher<M> {
 
 /// A matcher for dynamically created owned string literals.
 /// Used internally for deserializing cached matchers.
-#[derive(Debug, Hash)]
+#[derive(Debug)]
 pub struct OwnedLiteral(pub String);
 
 impl Matcher for OwnedLiteral {

@@ -8,7 +8,7 @@ use crate::utils::Span;
 use rustc_hash::FxHashMap;
 
 #[doc(hidden)]
-#[derive(Clone, Debug, Hash)]
+#[derive(Clone, Debug)]
 pub enum GrammarNode {
     Terminal(MatcherRef, Span),
     Alternative(Vec<GrammarNode>, Span),

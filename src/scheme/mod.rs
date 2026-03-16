@@ -292,7 +292,6 @@ pub enum Command<Repr: IR> {
     Insert { index: Repr::Ix, id: usize },
     Delete { index: Repr::Ix },
     Replace { index: Repr::Ix, id: usize },
-    SetRoot { id: Option<usize> },
 }
 
 impl<Repr: IR> Command<Repr> {
@@ -321,7 +320,6 @@ impl<Repr: IR> Command<Repr> {
                 index: index.clone(),
                 id: *id,
             },
-            Command::SetRoot { id } => Command::SetRoot { id: *id },
         }
     }
 }

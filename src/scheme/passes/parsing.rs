@@ -117,7 +117,6 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
                 edit_count += 1;
                 result = Some((*span, new_len));
             }
-            scheme::Command::SetRoot { .. } => {}
         }
     }
 

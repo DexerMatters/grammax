@@ -634,10 +634,6 @@ impl IR for ParseTreeIR {
                     }
                     pending_edits.push(PendingChildEdit::Replace { at, green });
                 }
-                scheme::Command::SetRoot { id } => {
-                    flush_pending(self, &mut pending_parent, &mut pending_edits);
-                    self.root = (*id).and_then(|ix| self.created.get(&ix).copied());
-                }
             }
         }
         flush_pending(self, &mut pending_parent, &mut pending_edits);

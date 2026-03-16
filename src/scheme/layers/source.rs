@@ -247,7 +247,6 @@ impl IR for SourceText {
                     let fragment = self.ensure_staged(*id)?.to_owned();
                     self.gap.replace_range(span.start, span.end, &fragment);
                 }
-                Command::SetRoot { .. } => {} // text has no root concept
             }
         }
         Ok(())

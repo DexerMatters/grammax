@@ -827,9 +827,6 @@ impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena
                 scheme::Command::Delete { index } => {
                     self.remove_erased(index.clone());
                 }
-                scheme::Command::SetRoot { id: _ } => {
-                    // SetRoot with staging: reserved for future root tracking
-                }
             }
         }
         self.refresh_root();

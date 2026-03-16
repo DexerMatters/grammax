@@ -1256,7 +1256,6 @@ fn validate_source_txn_len(
                     .ok_or_else(|| runtime_invalid(format!("unknown staging id: {id}")))?;
                 len = len - (span.end - span.start) + frag_len;
             }
-            scheme::Command::SetRoot { .. } => {}
         }
     }
 

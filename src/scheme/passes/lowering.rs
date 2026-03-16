@@ -333,13 +333,6 @@ impl IncrementalLowerer {
                         dirty_anchors.insert(anchor);
                     }
                 }
-                CstCommand::SetRoot { .. } => {
-                    if let Some(anchor) =
-                        self.resolve_anchor_path(upstream, &NodePath::root(), &memo, &resolving)
-                    {
-                        dirty_anchors.insert(anchor);
-                    }
-                }
                 CstCommand::Delete { .. } | CstCommand::Create { .. } => {}
             }
         }

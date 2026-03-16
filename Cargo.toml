@@ -20,7 +20,6 @@ ctrlc = "3.5.2"
 webbrowser = { version = "1.2.0", optional = true }
 crossterm = "0.29.0"
 tempfile = "3.26.0"
-webbrowser = { version = "1.2.0", optional = true }
 
 [dependencies.tower-lsp]
 version = "*"

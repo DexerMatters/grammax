@@ -14,7 +14,9 @@ use crate::grammar::analysis::GrammarStateAnalysis;
 use crate::grammar::bridge;
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::parsec::words::{self, EndOfInput, MatcherRef, OwnedLiteral, TokenizedMatcher, token};
+use crate::parsec::words::{
+    self, EndOfInput, MatcherRef, OwnedLiteral, RegexMatcher, TokenizedMatcher, token,
+};
 
 pub(crate) mod serde_fxhashmap {
     use std::hash::Hash;
@@ -55,6 +57,7 @@ enum CachedTerminal {
     Token(Box<CachedTerminal>),
     Char(char),
     Named(String),
+    Regex(String),
     Eof,
 }
 
@@ -338,6 +341,14 @@ fn decode_node(node: CachedNode, terminals: &[MatcherRef]) -> Result<NormalizedN
 fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
     let display = matcher.display();
 
+    // Handle regex patterns
+    if let Some(pattern) = display
+        .strip_prefix("regex(")
+        .and_then(|s| s.strip_suffix(")"))
+    {
+        return Some(CachedTerminal::Regex(pattern.to_string()));
+    }
+
     // Handle "whitespace or newline* ..." patterns (from token() function)
     if let Some(rest) = display.strip_prefix("whitespace or newline* ") {
         let inner = cached_terminal_from_display(rest.trim())?;
@@ -401,6 +412,15 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
             }))
         }
         CachedTerminal::Char(c) => Ok(Arc::new(*c)),
+        CachedTerminal::Regex(pattern) => {
+            let compiled = regex::Regex::new(pattern)
+                .map_err(|e| format!("failed to compile regex pattern: {}", e))?;
+            Ok(Arc::new(RegexMatcher {
+                pattern: compiled,
+                is_nullable: OnceLock::new(),
+                is_consuming: OnceLock::new(),
+            }))
+        }
         CachedTerminal::Named(name) => match name.as_str() {
             "number" => Ok(Arc::new(words::NUMS)),
             "identifier" => Ok(Arc::new(words::ALPHAS)),
@@ -553,6 +573,10 @@ impl Hash for CachedTerminal {
                 4u8.hash(state);
                 s.hash(state);
             }
+            Regex(s) => {
+                6u8.hash(state);
+                s.hash(state);
+            }
             Eof => 5u8.hash(state),
         }
     }
@@ -568,6 +592,7 @@ impl fmt::Display for CachedTerminal {
             Char(c) => write!(f, "'{}'", c),
             Named(n) => write!(f, "{}", n),
             Eof => write!(f, "EOF"),
+            Regex(s) => write!(f, "regex({})", s),
         }
     }
 }

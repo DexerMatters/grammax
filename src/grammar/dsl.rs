@@ -12,7 +12,7 @@ use crate::{
     parsec::{
         self,
         view::{ViewAction, Viewer},
-        words::{self, EndOfInput, IDENT, Matcher, NUMS, NamedMatcher, RegexMatcher, STRING},
+        words::{self, EndOfInput, IDENT, Matcher, NUMBER, NamedMatcher, RegexMatcher, STRING},
     },
     utils::Span,
 };
@@ -31,13 +31,13 @@ thread_local! {
         alternative -> r!(expr).drop(1) + tt("|") + r!(expr)
         sequence -> r!(expr).drop(2) + t(" ") + r!(expr).drop(1)
         fields -> field("field_name", tt(IDENT)) + tt(":") + r!(expr).drop(3)
-        drop -> r!(expr).drop(4) + t("/") + tt(NUMS)
+        drop -> r!(expr).drop(4) + t("/") + tt(NUMBER)
         many -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("*")
         some -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("+")
         reference -> tt(IDENT)
         terminal -> (tt("(") + r!(expr) + tt(")")) | opt(t("!")) + r!(primary)
         primary -> r!(token) | r!(literal) | r!(regexp)
-        token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMS") | tt("ALPHABETS") | tt("EOF")
+        token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMBER") | tt("ALPHABETS") | tt("EOF")
         literal -> tt('"') + t(STRING) + t('"')
         regexp -> tt('/') + t(REGEXP_MATCHER.with(|x| x.clone())) + t('/')
     };
@@ -289,9 +289,9 @@ fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNo
     match token_name {
         "IDENT" => mk(raw, IDENT, span),
         "STRING" => mk(raw, STRING, span),
-        "NUMBER" => mk(raw, NUMS, span),
-        "ALPHANUMS" => mk(raw, words::ALPHANUMS, span),
-        "ALPHABETS" => mk(raw, words::ALPHAS, span),
+        "NUMBER" => mk(raw, NUMBER, span),
+        "ALPHANUMBER" => mk(raw, words::ALPHANUMBER, span),
+        "ALPHABETS" => mk(raw, words::ALPHABETS, span),
         "EOF" => mk(raw, EndOfInput, span),
         t => panic!("Unsupported token type: {}", t),
     }

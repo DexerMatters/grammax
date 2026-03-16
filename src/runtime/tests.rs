@@ -25,7 +25,7 @@ fn test_json() {
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
         string  -> tt("\"") + t(STRING) + t("\"")
-        number  -> t(NUMS)
+        number  -> t(NUMBER)
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
@@ -49,7 +49,7 @@ fn test_tap_prints_cst_commands() {
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
         string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
+        number  -> tt(NUMBER)
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );

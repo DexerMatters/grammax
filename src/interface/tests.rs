@@ -86,7 +86,7 @@ fn test_tap_prints_cst_commands() {
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
         string  -> tt("\"") + t(STRING) + tt("\"")
-        number  -> tt(NUMS)
+        number  -> tt(NUMBER)
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
@@ -169,7 +169,7 @@ fn test_arith_commands() {
         expr -> r!(add) | r!(mul) | r!(primary)
         add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
         mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
-        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
+        primary -> tt(NUMBER) | tt("(") + r!(expr) + tt(")")
     );
 
     let pass = CompilerBuilder::new()

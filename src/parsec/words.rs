@@ -47,12 +47,19 @@ pub trait Matcher: Debug {
     }
 
     /// Repeats this matcher according to the specified range.
-    fn times<R>(self, range: R) -> Repeat<Self, R>
+    fn repeat<R>(self, range: R) -> Repeat<Self, R>
     where
         Self: Sized,
         R: ops::RangeBounds<usize>,
     {
         Repeat(self, range)
+    }
+
+    fn times(self, n: usize) -> Repeat<Self, ops::RangeInclusive<usize>>
+    where
+        Self: Sized,
+    {
+        Repeat(self, n..=n)
     }
 }
 
@@ -140,7 +147,7 @@ impl<M: Matcher> NamedMatcher<M> {
 }
 
 /// A predefined matcher that matches a sequence of ASCII digits, representing a number.
-pub const NUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+pub const NUMBER: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
     "number",
     Repeat(
         CustomChar {
@@ -152,8 +159,38 @@ pub const NUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedM
     ),
 );
 
+pub const OCTAL_NUMBER: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "octal_number",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_ascii_digit() && c < '8',
+            pick: || "01234567",
+            description: "octal digit",
+        },
+        1..,
+    ),
+);
+
+pub const HEX_NUMBER: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "hex_number",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_ascii_hexdigit(),
+            pick: || "0123456789abcdefABCDEF",
+            description: "hexadecimal digit",
+        },
+        1..,
+    ),
+);
+
+pub const IDENT: IdentMatcher = IdentMatcher;
+
+pub const INTEGER: IntegerMatcher = IntegerMatcher;
+
+pub const FLOAT: FloatMatcher = FloatMatcher;
+
 /// A predefined matcher that matches a sequence of ASCII alphabetic characters, representing an identifier.
-pub const ALPHAS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+pub const ALPHABETS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
     "identifier",
     Repeat(
         CustomChar {
@@ -166,7 +203,7 @@ pub const ALPHAS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = Name
 );
 
 /// A predefined matcher that matches a sequence of ASCII alphanumeric characters or underscores, representing an identifier that can include digits.
-pub const ALPHANUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+pub const ALPHANUMBER: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
     "alphanum",
     Repeat(
         CustomChar {
@@ -178,11 +215,138 @@ pub const ALPHANUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = N
     ),
 );
 
+pub const EOF: EndOfInput = EndOfInput;
+
+pub const STRING: NamedMatcher<Repeat<CharMatcherWithEscapes, ops::RangeFrom<usize>>> =
+    NamedMatcher::new("string", Repeat(CharMatcherWithEscapes, 0..));
+
+pub const WHITESPACES: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
+    "whitespaces",
+    Repeat(
+        CustomChar {
+            predicate: |c| c.is_whitespace(),
+            pick: || " \t\r\n",
+            description: "whitespace",
+        },
+        1..,
+    ),
+);
+
+pub const DIGIT: CustomChar = CustomChar {
+    predicate: |c| c.is_ascii_digit(),
+    pick: || "0123456789",
+    description: "digit",
+};
+
+pub const OCTAL_DIGIT: CustomChar = CustomChar {
+    predicate: |c| c.is_ascii_digit() && c < '8',
+    pick: || "01234567",
+    description: "octal digit",
+};
+
+pub const HEX_DIGIT: CustomChar = CustomChar {
+    predicate: |c| c.is_ascii_hexdigit(),
+    pick: || "0123456789abcdefABCDEF",
+    description: "hexadecimal digit",
+};
+
 pub fn regex(pattern: &str) -> RegexMatcher {
     RegexMatcher {
         pattern: Regex::new(pattern).unwrap(),
         is_nullable: OnceLock::new(),
         is_consuming: OnceLock::new(),
+    }
+}
+
+pub const fn named<M: Matcher>(name: &'static str, matcher: M) -> NamedMatcher<M> {
+    NamedMatcher { name, matcher }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct IntegerMatcher;
+
+impl Matcher for IntegerMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        let remaining = &input[*pos..];
+
+        // Try hex (0x or 0X followed by hex digits)
+        if remaining.starts_with("0x") || remaining.starts_with("0X") {
+            *pos += 2;
+            if HEX_NUMBER.matches(input, pos).is_some() {
+                return Some(*pos - start);
+            }
+            *pos = start;
+            return None;
+        }
+
+        // Try octal (0 followed by octal digits 0-7)
+        if remaining.starts_with('0') && remaining.len() > 1 {
+            if let Some(next_char) = remaining[1..].chars().next() {
+                if next_char.is_ascii_digit() && next_char < '8' {
+                    *pos += 1; // consume leading 0
+                    if OCTAL_NUMBER.matches(input, pos).is_some() {
+                        return Some(*pos - start);
+                    }
+                }
+            }
+        }
+
+        // Try decimal
+        if NUMBER.matches(input, pos).is_some() {
+            return Some(*pos - start);
+        }
+
+        *pos = start;
+        None
+    }
+
+    fn display(&self) -> String {
+        String::from("integer")
+    }
+
+    fn is_nullable(&self) -> bool {
+        false
+    }
+
+    fn is_consuming(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct FloatMatcher;
+
+impl Matcher for FloatMatcher {
+    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+        let start = *pos;
+        let mut temp_pos = *pos;
+        let _ = NUMBER.matches(input, &mut temp_pos);
+
+        if temp_pos >= input.len() || input.chars().nth(temp_pos).unwrap_or(' ') != '.' {
+            return None;
+        }
+
+        temp_pos += 1;
+
+        if NUMBER.matches(input, &mut temp_pos).is_none() {
+            return None;
+        }
+
+        *pos = temp_pos;
+        Some(*pos - start)
+    }
+
+    fn display(&self) -> String {
+        String::from("float")
+    }
+
+    fn is_nullable(&self) -> bool {
+        false
+    }
+
+    fn is_consuming(&self) -> bool {
+        true
     }
 }
 
@@ -233,10 +397,6 @@ impl Matcher for IdentMatcher {
         true
     }
 }
-
-/// A predefined matcher that matches identifiers accepted by most programming languages.
-/// Identifiers must start with a letter or underscore, followed by zero or more letters, digits, or underscores.
-pub const IDENT: NamedMatcher<IdentMatcher> = NamedMatcher::new("ident", IdentMatcher);
 
 /// A matcher for string content that handles escape sequences (e.g., \n, \t, \\, \").
 /// Matches a sequence where each character is either:
@@ -295,24 +455,6 @@ impl Matcher for CharMatcherWithEscapes {
         true
     }
 }
-
-/// A predefined matcher that matches string content with support for escape sequences.
-/// Matches characters in a string literal, including escaped sequences like \n, \t, \\, \", etc.
-pub const STRING: NamedMatcher<Repeat<CharMatcherWithEscapes, ops::RangeFrom<usize>>> =
-    NamedMatcher::new("string", Repeat(CharMatcherWithEscapes, 0..));
-
-/// A predefined matcher that matches a sequence of whitespace characters, which can be used to skip irrelevant spaces in the input.
-pub const WHITESPACES: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(
-    "whitespaces",
-    Repeat(
-        CustomChar {
-            predicate: |c| c.is_whitespace(),
-            pick: || " \t\r\n",
-            description: "whitespace",
-        },
-        1..,
-    ),
-);
 
 /// A helper function that creates a matcher which matches the given matcher preceded by optional leading whitespace. This is useful for token matchers that should ignore leading spaces.
 pub const fn token<M: Matcher>(

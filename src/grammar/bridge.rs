@@ -356,7 +356,7 @@ fn collect_precedence_from_sequence(
 #[cfg(test)]
 mod tests {
     use crate::new_grammar;
-    use crate::parsec::words::{NUMS, STRING};
+    use crate::parsec::words::{NUMBER, STRING};
 
     #[test]
     fn test_bridge_specs_json() {
@@ -367,7 +367,7 @@ mod tests {
             pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
             array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
             string  -> tt("\"") + t(STRING) + tt("\"")
-            number  -> tt(NUMS)
+            number  -> tt(NUMBER)
             boolean -> tt("true") | tt("false")
             null    -> tt("null")
         );

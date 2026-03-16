@@ -1615,7 +1615,7 @@ impl Parser {
         //   (a) UnexpectedToken — already handled for all single-terminal productions.
         //   (b) MissingToken — but ONLY when the terminal is a keyword/literal (has a
         //       non-None preview, e.g. "true", "false", "null", "{", …).  Pattern
-        //       terminals like `tt(NUMS)` or `tt(STRING)` have preview = None because
+        //       terminals like `tt(NUMBER)` or `tt(STRING)` have preview = None because
         //       their matched text carries semantic value (the number's digits, the
         //       string content, etc.), so we keep the rule wrapper (e.g. `primary`,
         //       `number`) to give the semantic pass something meaningful to hang

@@ -11,8 +11,8 @@ use grammax::parsec::words::*;
 
 let input = "123456abc %%";
 let mut pos = 0;
-let numbers = NUMS.matches(input, &mut pos);
-let alphabets = ALPHAS.matches(input, &mut pos);
+let numbers = NUMBER.matches(input, &mut pos);
+let alphabets = ALPHABETS.matches(input, &mut pos);
 let bad = "%%".matches(input, &mut pos);
 
 assert_eq!(numbers, Some(6));
@@ -45,7 +45,7 @@ let my_grammar = new_grammar! {
     expr -> r!(add) | r!(mul) | r!(num)
     add -> r!(expr) + t('+') + r!(expr).drop(1)
     mul -> r!(expr).drop(1) + t('*') + r!(expr).drop(2)
-    num -> t(NUMS) | t('(') + r!(expr) + t(')')
+    num -> t(NUMBER) | t('(') + r!(expr) + t(')')
 };
 
 assert!(my_grammar.test("1+2*3"));
@@ -133,7 +133,7 @@ let grammar = new_grammar!(
     pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
     array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
     string  -> tt("\"") + t(STRING) + t("\"")
-    number  -> tt(NUMS)
+    number  -> tt(NUMBER)
     boolean -> tt("true") | tt("false")
     null    -> tt("null")
 );

@@ -1,6 +1,6 @@
 use crate::new_grammar;
 use crate::parsec::parser::Parser;
-use crate::parsec::words::{EndOfInput, NUMS, STRING};
+use crate::parsec::words::{EndOfInput, NUMBER, STRING};
 
 #[test]
 fn test_simple_whitespaces() {
@@ -8,7 +8,7 @@ fn test_simple_whitespaces() {
         start where
         start -> r!(expr) + tt(EndOfInput)
         expr -> r!(list1) | r!(list2)
-        id -> tt(NUMS)
+        id -> tt(NUMBER)
         list1 -> tt("(") + sep(r!(id), tt(",")) + tt(")")
         list2 -> tt("(") + sep(r!(id), t(" ")) + tt(")")
     );
@@ -39,7 +39,7 @@ fn test_simple_arithmetic_precedence() {
         expr -> r!(add) | r!(mul) | r!(primary)
         add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
         mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
-        primary -> tt(NUMS) | tt("(") + r!(expr) + tt(")")
+        primary -> tt(NUMBER) | tt("(") + r!(expr) + tt(")")
     );
 
     let mut parser = Parser::new(grammar);
@@ -76,7 +76,7 @@ fn test_json() {
         pair    -> field("key", r!(string)) + tt(":") + field("value", r!(json))
         array   -> tt("[") + sep(r!(json), tt(",")) + tt("]")
         string  -> tt("\"") + t(STRING) + t("\"")
-        number  -> tt(NUMS)
+        number  -> tt(NUMBER)
         boolean -> tt("true") | tt("false")
         null    -> tt("null")
     );
@@ -107,7 +107,7 @@ fn test_recovery_strategy_is_wired_for_current_text() {
         expr -> r!(add) | r!(mul) | r!(num)
         add -> r!(expr) + t('+') + r!(expr).drop(1)
         mul -> r!(expr).drop(1) + t('*') + r!(expr).drop(2)
-        num -> t(NUMS) | t('(') + r!(expr) + t(')')
+        num -> t(NUMBER) | t('(') + r!(expr) + t(')')
     };
 
     assert!(my_grammar.test("1+2*3"));

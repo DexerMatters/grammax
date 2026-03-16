@@ -441,9 +441,9 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
         }
         CachedTerminal::CharEscapes => Ok(Arc::new(CharMatcherWithEscapes)),
         CachedTerminal::Named(name) => match name.as_str() {
-            "number" => Ok(Arc::new(words::NUMS)),
-            "identifier" => Ok(Arc::new(words::ALPHAS)),
-            "alphanum" => Ok(Arc::new(words::ALPHANUMS)),
+            "number" => Ok(Arc::new(words::NUMBER)),
+            "identifier" => Ok(Arc::new(words::ALPHABETS)),
+            "alphanum" => Ok(Arc::new(words::ALPHANUMBER)),
             "string" => Ok(Arc::new(words::STRING)),
             "ident" => Ok(Arc::new(words::IDENT)),
             "regexp" => Ok(Arc::new(words::NamedMatcher::new(

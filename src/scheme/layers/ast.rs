@@ -275,8 +275,8 @@ impl<T: fmt::Debug + 'static> fmt::Debug for AstVec<T> {
             .arena
             .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
 
-        let mut list = f.debug_list();
         if let Some(ptr) = arena_ptr {
+            let mut list = f.debug_list();
             // SAFETY: arena pointer is valid for the duration of formatting,
             // same guarantee as in AstCell::deref_debug_value.
             let storage = unsafe { ptr.cast::<AstArenaStorage>().as_ref() };
@@ -291,11 +291,11 @@ impl<T: fmt::Debug + 'static> fmt::Debug for AstVec<T> {
                     list.entry(&format_args!("<type mismatch at {:?}>", path));
                 }
             }
+            list.finish()
         } else {
             // No arena available: show the base path instead of empty list
-            return f.debug_struct("AstVec").field("base", &self.base).finish();
+            f.debug_struct("AstVec").field("base", &self.base).finish()
         }
-        list.finish()
     }
 }
 
@@ -761,15 +761,21 @@ impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena
         // Special case: when T == AstMapAny, wrap the stored ErasedAstNode
         // instead of trying to downcast the concrete stored type to AstMapAny.
         if TypeId::of::<T>() == TypeId::of::<AstMapAny>() {
-            let map_any = AstMapAny(node.clone());
-            let boxed: Box<dyn Any> = Box::new(map_any);
-            return boxed
-                .downcast::<T>()
-                .map(|b| *b)
-                .map_err(|_| AstArenaError::TypeMismatch {
-                    path: query_path,
-                    expected: type_name::<T>(),
-                });
+            return AST_CELL_CLONE_ARENA.with(|slot| {
+                let prev = slot.replace(Some(self.storage_ptr()));
+                let map_any = AstMapAny(node.clone());
+                let boxed: Box<dyn Any> = Box::new(map_any);
+                let result =
+                    boxed
+                        .downcast::<T>()
+                        .map(|b| *b)
+                        .map_err(|_| AstArenaError::TypeMismatch {
+                            path: query_path,
+                            expected: type_name::<T>(),
+                        });
+                slot.set(prev);
+                result
+            });
         }
 
         AST_CELL_CLONE_ARENA.with(|slot| {

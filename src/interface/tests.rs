@@ -24,9 +24,9 @@ use std::thread;
 fn test_tap_prints_cst_commands() {
     #[derive(Debug, Clone, PartialEq)]
     enum Json {
-        Object(AstVec<Json>),        // children in arena: Pair nodes
-        Pair(String, AstCell<Json>), // key text, typed value cell
-        Array(AstVec<Json>),         // children in arena: Json nodes
+        Object(AstVec<Json>),
+        Pair(String, AstCell<Json>),
+        Array(AstVec<Json>),
         String(String),
         Number(f64),
         Boolean(bool),
@@ -106,7 +106,7 @@ fn test_tap_prints_cst_commands() {
         while let Some(transaction) = cst_observer.recv() {
             println!("=== CST transaction ===");
             for cmd in transaction.iter() {
-                println!("CST Command  {:?}", cmd);
+                cprintln!("<yellow>CST Command: {:?}</>", cmd);
             }
         }
     });
@@ -114,20 +114,18 @@ fn test_tap_prints_cst_commands() {
     thread::spawn(move || {
         while let Some(transaction) = ast_observer.recv() {
             if let Ok(root) = ast_observer.query(NodePath::root()) {
-                println!("=== Current JSON AST: {:?} ===", root);
+                println!("=== Current JSON AST ===");
+                cprintln!("<cyan>{:#?}</>", root);
             }
             println!("=== AST transaction ===");
             for cmd in transaction.iter() {
-                println!("AST Command  {:?}", cmd);
+                cprintln!("<green>AST Command  {:?}</>", cmd);
             }
         }
     });
 
-    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
-    runtime
-        .insert(0, r#"{"name": "John", "age": 30, "is_student": false}"#)
-        .unwrap();
-    thread::sleep(std::time::Duration::from_millis(10));
+    let runtime = pass.build_runtime::<WebPreviewInterface<_>>(grammar);
+    runtime.run().expect("Failed to run runtime");
 }
 
 #[cfg(feature = "webui")]

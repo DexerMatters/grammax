@@ -359,6 +359,36 @@ impl IncrementalLowerer {
             builder.delete(p.clone());
         }
 
+        // Delete stale AST nodes that still exist at a CST path but no longer
+        // map to themselves after recovery reshapes a dirty subtree.
+        //
+        // Example: an `on_error()` node may have emitted `Json::Error` at path
+        // `P.4`, then after more input that same CST slot becomes a skipped
+        // token or part of another structure. The path still exists in the CST,
+        // so the simple `green_at_path == None` cleanup above does not remove
+        // it. We must sweep existing AST nodes under dirty anchors and delete
+        // any path that no longer resolves to itself as a live AST anchor.
+        let stale_in_dirty: Vec<NodePath> = downstream
+            .storage
+            .nodes
+            .keys()
+            .filter(|existing_path| {
+                dirty_anchors
+                    .iter()
+                    .any(|dirty| dirty.is_prefix_of(existing_path))
+            })
+            .filter(|existing_path| upstream.green_at_path(existing_path).is_some())
+            .filter(|existing_path| {
+                self.resolve_anchor_path(upstream, existing_path, &memo, &resolving)
+                    .as_ref()
+                    != Some(*existing_path)
+            })
+            .cloned()
+            .collect();
+        for p in stale_in_dirty {
+            builder.delete(p);
+        }
+
         // Re-lower dirty anchors deepest-first so child anchors are settled
         // before parent anchors that reference them via read_cell.
         let mut dirty: Vec<NodePath> = dirty_anchors.into_iter().collect();
@@ -397,12 +427,24 @@ impl IncrementalLowerer {
         } = intent;
         let anchor = declared_anchor.unwrap_or_else(|| anchor_path.clone());
 
-        if let AstMapAction::Emit(value) = action {
-            // Compare against erased stored value to suppress no-ops.
-            match downstream.get_erased_as_any(&anchor) {
-                Some(existing) if existing == value => return, // already correct
-                None => builder.insert_value(anchor, value),   // new anchor
-                Some(_) => builder.replace_value(anchor, value), // updated anchor
+        match action {
+            AstMapAction::Emit(value) => {
+                // Compare against erased stored value to suppress no-ops.
+                match downstream.get_erased_as_any(&anchor) {
+                    Some(existing) if existing == value => return, // already correct
+                    None => builder.insert_value(anchor, value),   // new anchor
+                    Some(_) => builder.replace_value(anchor, value), // updated anchor
+                }
+            }
+            AstMapAction::Skip | AstMapAction::Forward(_) => {
+                // Important: a CST path may previously have emitted a value
+                // (for example via `on_error`) and later become an unmapped
+                // token or forwarding node after recovery stabilizes. In that
+                // case the AST node at the old anchor must be deleted even
+                // though the CST path itself still exists.
+                if downstream.get_erased_as_any(anchor_path).is_some() {
+                    builder.delete(anchor_path.clone());
+                }
             }
         }
     }

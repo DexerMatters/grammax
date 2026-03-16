@@ -279,8 +279,6 @@ fn commands_to_web_json(commands: &[Command<ParseTreeIR>]) -> serde_json::Value 
             } => Some(
                 serde_json::json!({ "type": "replace", "index": path_to_json(&path), "id": id }),
             ),
-            Command::SetRoot { id } => Some(serde_json::json!({ "type": "setRoot", "id": id })),
-            // Message / Allocator queries are backend-only — skip them.
             _ => None,
         })
         .collect();

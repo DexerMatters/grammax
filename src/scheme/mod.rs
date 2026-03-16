@@ -80,11 +80,6 @@ pub trait IR {
 pub trait Pass<U: IR, D: IR> {
     type Error;
 
-    /// Transform an upstream transaction into a downstream transaction.
-    ///
-    /// `upstream` is the upstream IR **after** the transaction has been applied.
-    /// `downstream` is the downstream IR **before** the transaction is applied
-    /// (i.e. the current accumulated state of the layer below).
     fn transform(
         &mut self,
         upstream: &U,

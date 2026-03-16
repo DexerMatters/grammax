@@ -90,6 +90,16 @@ pub struct RegexMatcher {
     pub is_consuming: OnceLock<bool>,
 }
 
+impl RegexMatcher {
+    pub fn new(pattern: &str) -> Self {
+        Self {
+            pattern: Regex::new(pattern).unwrap(),
+            is_nullable: OnceLock::new(),
+            is_consuming: OnceLock::new(),
+        }
+    }
+}
+
 impl Matcher for RegexMatcher {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
@@ -168,6 +178,14 @@ pub const ALPHANUMS: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = N
     ),
 );
 
+pub fn regex(pattern: &str) -> RegexMatcher {
+    RegexMatcher {
+        pattern: Regex::new(pattern).unwrap(),
+        is_nullable: OnceLock::new(),
+        is_consuming: OnceLock::new(),
+    }
+}
+
 /// A matcher for identifiers accepted by most programming languages.
 /// Starts with a letter or underscore, followed by letters, digits, or underscores.
 #[derive(Debug, Clone, Copy)]
@@ -225,50 +243,63 @@ pub const IDENT: NamedMatcher<IdentMatcher> = NamedMatcher::new("ident", IdentMa
 /// - A regular character (not ", \, newline)
 /// - An escape sequence starting with \ followed by any character
 #[derive(Debug, Clone, Copy)]
-pub struct StringMatcher;
+pub struct CharMatcherWithEscapes;
 
-impl Matcher for StringMatcher {
+impl Matcher for CharMatcherWithEscapes {
     fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
-        while *pos < input.len() {
-            if let Some(c) = input[*pos..].chars().next() {
-                match c {
-                    '"' | '\n' | '\r' => break,
-                    '\\' => {
-                        // Skip escape character
-                        *pos += '\\'.len_utf8();
-                        // Skip the escaped character
-                        if *pos < input.len() {
-                            if let Some(escaped_char) = input[*pos..].chars().next() {
-                                *pos += escaped_char.len_utf8();
-                            }
+
+        if let Some(first_char) = input[*pos..].chars().next() {
+            if first_char == '\\' {
+                // Escape sequence: backslash followed by a valid escape character
+                *pos += first_char.len_utf8();
+                if let Some(next_char) = input[*pos..].chars().next() {
+                    // Valid escape characters: n, t, r, \, ", ', b, f, v, 0, x, u
+                    match next_char {
+                        'n' | 't' | 'r' | '\\' | '"' | '\'' | 'b' | 'f' | 'v' | '0' | 'x' | 'u' => {
+                            *pos += next_char.len_utf8();
+                            Some(*pos - start)
+                        }
+                        _ => {
+                            // Invalid escape sequence - backtrack
+                            *pos = start;
+                            None
                         }
                     }
-                    _ => {
-                        *pos += c.len_utf8();
-                    }
+                } else {
+                    // Backslash at end of input - backtrack
+                    *pos = start;
+                    None
                 }
+            } else if first_char != '"' && first_char != '\n' && first_char != '\r' {
+                // Regular character (not quote, backslash, or newline)
+                *pos += first_char.len_utf8();
+                Some(*pos - start)
+            } else {
+                None
             }
+        } else {
+            None
         }
-        Some(*pos - start)
     }
 
     fn display(&self) -> String {
-        String::from("string_content")
+        String::from("characters including escapes")
     }
 
     fn is_nullable(&self) -> bool {
-        true
+        false
     }
 
     fn is_consuming(&self) -> bool {
-        false
+        true
     }
 }
 
 /// A predefined matcher that matches string content with support for escape sequences.
 /// Matches characters in a string literal, including escaped sequences like \n, \t, \\, \", etc.
-pub const STRING: NamedMatcher<StringMatcher> = NamedMatcher::new("string", StringMatcher);
+pub const STRING: NamedMatcher<Repeat<CharMatcherWithEscapes, ops::RangeFrom<usize>>> =
+    NamedMatcher::new("string", Repeat(CharMatcherWithEscapes, 0..));
 
 /// A predefined matcher that matches a sequence of whitespace characters, which can be used to skip irrelevant spaces in the input.
 pub const WHITESPACES: NamedMatcher<Repeat<CustomChar, ops::RangeFrom<usize>>> = NamedMatcher::new(

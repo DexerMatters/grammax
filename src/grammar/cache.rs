@@ -15,7 +15,8 @@ use crate::grammar::bridge;
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::grammar::norm::RuleTable;
 use crate::parsec::words::{
-    self, EndOfInput, MatcherRef, OwnedLiteral, RegexMatcher, TokenizedMatcher, token,
+    self, CharMatcherWithEscapes, EndOfInput, MatcherRef, OwnedLiteral, RegexMatcher,
+    TokenizedMatcher, token,
 };
 
 pub(crate) mod serde_fxhashmap {
@@ -58,6 +59,7 @@ enum CachedTerminal {
     Char(char),
     Named(String),
     Regex(String),
+    CharEscapes,
     Eof,
 }
 
@@ -349,6 +351,11 @@ fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
         return Some(CachedTerminal::Regex(pattern.to_string()));
     }
 
+    // Handle CharMatcherWithEscapes
+    if display == "characters including escapes" {
+        return Some(CachedTerminal::CharEscapes);
+    }
+
     // Handle "whitespace or newline* ..." patterns (from token() function)
     if let Some(rest) = display.strip_prefix("whitespace or newline* ") {
         let inner = cached_terminal_from_display(rest.trim())?;
@@ -375,8 +382,19 @@ fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
 }
 
 fn cached_terminal_from_display(display: &str) -> Option<CachedTerminal> {
+    if let Some(pattern) = display
+        .strip_prefix("regex(")
+        .and_then(|s| s.strip_suffix(")"))
+    {
+        return Some(CachedTerminal::Regex(pattern.to_string()));
+    }
+
     if display == "EOF" {
         return Some(CachedTerminal::Eof);
+    }
+
+    if display == "characters including escapes" {
+        return Some(CachedTerminal::CharEscapes);
     }
 
     if display == "whitespace or newline" {
@@ -396,7 +414,7 @@ fn cached_terminal_from_display(display: &str) -> Option<CachedTerminal> {
 
     match display {
         "number" | "identifier" | "alphanum" | "string" | "ident" | "json_string"
-        | "whitespaces" => Some(CachedTerminal::Named(display.to_string())),
+        | "whitespaces" | "regexp" => Some(CachedTerminal::Named(display.to_string())),
         _ => None,
     }
 }
@@ -421,12 +439,17 @@ fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
                 is_consuming: OnceLock::new(),
             }))
         }
+        CachedTerminal::CharEscapes => Ok(Arc::new(CharMatcherWithEscapes)),
         CachedTerminal::Named(name) => match name.as_str() {
             "number" => Ok(Arc::new(words::NUMS)),
             "identifier" => Ok(Arc::new(words::ALPHAS)),
             "alphanum" => Ok(Arc::new(words::ALPHANUMS)),
             "string" => Ok(Arc::new(words::STRING)),
             "ident" => Ok(Arc::new(words::IDENT)),
+            "regexp" => Ok(Arc::new(words::NamedMatcher::new(
+                "regexp",
+                RegexMatcher::new(r#"([^/\\\r\n]|\\.)+"#),
+            ))),
             "json_string" => Ok(Arc::new(words::STRING)), // Backward compatibility
             "whitespaces" => Ok(Arc::new(words::WHITESPACES)),
             "whitespace_or_newline" => {
@@ -569,6 +592,9 @@ impl Hash for CachedTerminal {
                 3u8.hash(state);
                 c.hash(state);
             }
+            CharEscapes => {
+                7u8.hash(state);
+            }
             Named(s) => {
                 4u8.hash(state);
                 s.hash(state);
@@ -589,6 +615,7 @@ impl fmt::Display for CachedTerminal {
             Literal(s) => write!(f, "\"{}\"", s),
             TokenLiteral(s) => write!(f, "token(\"{}\")", s),
             Token(inner) => write!(f, "token({})", inner),
+            CharEscapes => write!(f, "characters including escapes"),
             Char(c) => write!(f, "'{}'", c),
             Named(n) => write!(f, "{}", n),
             Eof => write!(f, "EOF"),

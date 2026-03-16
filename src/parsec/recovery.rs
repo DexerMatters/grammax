@@ -960,10 +960,12 @@ fn lex_at_text(
 }
 
 fn is_quote_terminal(terminals: &[MatcherRef], term_ix: usize) -> bool {
-    terminals
-        .get(term_ix)
-        .and_then(|m| m.preview())
-        .is_some_and(|preview| preview == "\"")
+    terminals.get(term_ix).is_some_and(|matcher| {
+        let display = matcher.display();
+        matcher.preview().is_some_and(|preview| preview == "\"")
+            || display == "'\"'"
+            || display.ends_with(" '\"'")
+    })
 }
 
 // Calculate length of unknown token

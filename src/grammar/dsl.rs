@@ -12,12 +12,16 @@ use crate::{
     parsec::{
         self,
         view::{ViewAction, Viewer},
-        words::{self, EndOfInput, IDENT, Matcher, NUMS, STRING},
+        words::{self, EndOfInput, IDENT, Matcher, NUMS, NamedMatcher, RegexMatcher, STRING},
     },
     utils::Span,
 };
 
 thread_local! {
+    static REGEXP_MATCHER: NamedMatcher<RegexMatcher> = NamedMatcher::new(
+        "regexp",
+        RegexMatcher::new(r#"([^/\\\r\n]|\\.)+"#),
+    );
     #[allow(dead_code)]
     static GRAMMAX_DSL_GRAMMAR_PROTOTYPE: &'static Grammar = new_grammar_no_cache! {
         table where
@@ -32,9 +36,10 @@ thread_local! {
         some -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("+")
         reference -> tt(IDENT)
         terminal -> (tt("(") + r!(expr) + tt(")")) | opt(t("!")) + r!(primary)
-        primary -> r!(token) | r!(literal)
+        primary -> r!(token) | r!(literal) | r!(regexp)
         token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMS") | tt("ALPHABETS") | tt("EOF")
-        literal -> tt('"') + tt(STRING) + tt('"')
+        literal -> tt('"') + t(STRING) + t('"')
+        regexp -> tt('/') + t(REGEXP_MATCHER.with(|x| x.clone())) + t('/')
     };
 }
 
@@ -208,6 +213,14 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
                 ));
             }
 
+            if let Some(regexp) = primary.try_first_with_rule("regexp") {
+                return ViewAction::Exact(grammar_regex_from_text(
+                    &regexp[1].text(),
+                    regexp.span(),
+                    is_raw,
+                ));
+            }
+
             let literal = primary.try_first_with_rule("literal").unwrap();
             ViewAction::Exact(grammar_literal_from_text(
                 &literal[1].text_normalized(),
@@ -221,19 +234,22 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
                 node.span(),
             ))
         })
-        .on_rule::<GrammarNode, _>("token", |_viewer, node| {
+        .on_rule("token", |_viewer, node| {
             ViewAction::Exact(grammar_token_from_text(
                 &node.text_trimmed(),
                 node.span(),
                 false,
             ))
         })
-        .on_rule::<GrammarNode, _>("literal", |_viewer, node| {
+        .on_rule("literal", |_viewer, node| {
             ViewAction::Exact(grammar_literal_from_text(
                 &node[1].text_normalized(),
                 node.span(),
                 false,
             ))
+        })
+        .on_rule("regexp", |_viewer, node| {
+            ViewAction::Exact(grammar_regex_from_text(&node[1].text(), node.span(), false))
         })
 }
 
@@ -292,6 +308,17 @@ fn grammar_literal_from_text(text: &str, span: Span, raw: bool) -> GrammarNode {
     GrammarNode::Terminal(matcher, span)
 }
 
+fn grammar_regex_from_text(pattern: &str, span: Span, raw: bool) -> GrammarNode {
+    let normalized = pattern.replace("\\/", "/");
+    let matcher = words::regex(&normalized);
+    let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
+        Arc::new(matcher)
+    } else {
+        Arc::new(words::token(matcher))
+    };
+    GrammarNode::Terminal(matcher, span)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -308,15 +335,7 @@ mod tests {
         println!("Grammar:\n{}", parser.grammar.table);
 
         let text = r#"
-start    -> json EOF
-json     -> object | array | string | number | boolean | null
-object   -> "{" pair{","}* "}"
-pair     -> key:string ":" value:json
-array    -> "[" json{","}* "]"
-string   -> "\"" STRING "\""
-number   -> NUMBER
-boolean -> "true" | "false"
-null     -> "null"
+start    -> /\/+/
 "#;
 
         let result = parser.parse_text(text);
@@ -330,8 +349,8 @@ null     -> "null"
         match result {
             Ok(translated_grammar) => {
                 println!("Translated Grammar:\n{}", translated_grammar.table);
-                let result = translated_grammar.parse(r#"{"a":12}"#).format_ast();
-                println!("Parsed AST:\n{}", result);
+                let result = translated_grammar.parse(r#"///"#);
+                println!("Parsed AST:\n{}", result.format_ast());
             }
             Err(e) => {
                 println!("Error translating grammar: {:?}", e);

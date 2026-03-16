@@ -1956,8 +1956,12 @@ impl Parser {
             .table
             .terminals
             .get(term_ix)
-            .and_then(|m| m.preview())
-            .is_some_and(|preview| preview == "\"")
+            .is_some_and(|matcher| {
+                let display = matcher.display();
+                matcher.preview().is_some_and(|preview| preview == "\"")
+                    || display == "'\"'"
+                    || display.ends_with(" '\"'")
+            })
     }
 
     fn is_bracketed_terminal(&self, term_ix: usize) -> bool {

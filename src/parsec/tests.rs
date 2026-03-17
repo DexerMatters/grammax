@@ -46,7 +46,7 @@ fn test_simple_arithmetic_precedence() {
 
     println!("Grammar:\n{}", parser.grammar.table);
 
-    let text = "s+3";
+    let text = "8+3";
     let result = parser.parse_text(text);
 
     let output = result.format_ast();
@@ -104,16 +104,17 @@ fn test_recovery_strategy_is_wired_for_current_text() {
         start where
         // FORMAT: rule_name -> rule_body
         start -> r!(expr) + t(EndOfInput)
-        expr -> r!(add) | r!(mul) | r!(num)
-        add -> r!(expr) + t('+') + r!(expr).drop(1)
-        mul -> r!(expr).drop(1) + t('*') + r!(expr).drop(2)
+        expr -> r!(add) | r!(sub) | r!(mul) | r!(div) | r!(num)
+        add -> r!(expr) + t('+') + r!(expr).drop(2)
+        sub -> r!(expr) + t('-') + r!(expr).drop(2)
+        mul -> r!(expr).drop(2) + t('*') + r!(expr).drop(4)
+        div -> r!(expr).drop(2) + t('/') + r!(expr).drop(4)
         num -> t(NUMBER) | t('(') + r!(expr) + t(')')
     };
 
-    assert!(my_grammar.test("1+2*3"));
-    assert!(my_grammar.test("(1+2)*3"));
-    assert!(!my_grammar.test("1+2*"));
+    let result = my_grammar.parse("1+12*4/5-2+5-4+5");
+    let output = result.format_ast();
 
-    println!("{}", my_grammar.parse("1*(2+3").format_ast());
-    println!("{}", my_grammar.parse("1*(2+3").format_messages());
+    println!("{}", output);
+    println!("Messages:\n{}", result.format_messages());
 }

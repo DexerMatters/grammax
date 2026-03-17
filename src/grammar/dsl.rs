@@ -27,15 +27,16 @@ thread_local! {
         table where
         table -> sep(r!(rule), t('\n')) + tt(EndOfInput)
         rule -> field("name", tt(IDENT)) + tt("->") + field("definition", r!(expr))
-        expr -> r!(alternative) | r!(sequence) | r!(fields) | r!(drop) | r!(some) | r!(many) | r!(terminal) | r!(reference)
+        expr -> r!(alternative) | r!(sequence) | r!(fields) | r!(optional) | r!(some) | r!(many) | r!(drop) | r!(terminal) | r!(reference)
         alternative -> r!(expr).drop(1) + tt("|") + r!(expr)
         sequence -> r!(expr).drop(2) + t(" ") + r!(expr).drop(1)
         fields -> field("field_name", tt(IDENT)) + tt(":") + r!(expr).drop(3)
-        drop -> r!(expr).drop(4) + t("/") + tt(NUMBER)
+        drop -> r!(reference) + t("/") + t(NUMBER)
+        optional -> r!(expr).drop(4) + t("?")
         many -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("*")
         some -> r!(expr).drop(6) + opt(t("{") + field("sep", r!(expr)) + tt("}")) + t("+")
         reference -> tt(IDENT)
-        terminal -> (tt("(") + r!(expr) + tt(")")) | opt(t("!")) + r!(primary)
+        terminal -> (tt("(") + r!(expr) + tt(")")) | opt(tt("!")) + r!(primary)
         primary -> r!(token) | r!(literal) | r!(regexp)
         token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMBER") | tt("ALPHABETS") | tt("EOF")
         literal -> tt('"') + t(STRING) + t('"')
@@ -171,12 +172,23 @@ fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
             ))
         })
         .on_rule("drop", |viewer, node| {
-            let expr = node.first_with_rule("expr").view::<GrammarNode>(viewer);
+            let expr = node
+                .first_with_rule("reference")
+                .view::<GrammarNode>(viewer);
             let count = node.last().view::<usize>(viewer);
 
             ViewAction::Exact(GrammarNode::Drop {
                 node: Box::new(expr),
                 count,
+                span: node.span(),
+            })
+        })
+        .on_rule("optional", |viewer, node| {
+            let expr = node.first_with_rule("expr").view::<GrammarNode>(viewer);
+            ViewAction::Exact(GrammarNode::Repetition {
+                node: Box::new(expr),
+                min: 0,
+                max: Some(1),
                 span: node.span(),
             })
         })
@@ -335,21 +347,40 @@ mod tests {
         println!("Grammar:\n{}", parser.grammar.table);
 
         let text = r#"
-start    -> /\/+/
+table -> rule{"\n"}* EOF
+rule -> name:IDENT "->" definition:expr
+expr -> alternative | sequence | fields | optional | some | many | drop | terminal | reference
+alternative -> expr/1 "|" expr
+sequence -> expr/2 !" " expr/1
+fields -> field_name:IDENT ":" expr/3
+drop -> reference !"/" !NUMBER
+optional -> expr/4 !"?"
+many -> expr/6 (!"{" sep:expr "}")? !"*"
+some -> expr/6 (!"{" sep:expr "}")? !"+"
+reference -> IDENT
+terminal -> "(" expr ")" | "!"? primary
+primary -> token | literal | regexp
+token -> "IDENT" | "STRING" | "NUMBER" | "ALPHANUMBER" | "ALPHABETS" | "EOF"
+literal -> "\"" !STRING !"\""
+regexp -> "/" !/([^\/\\\r\n]|\\.)+/ !"/"
 "#;
 
         let result = parser.parse_text(text);
 
         let output = result.format_ast();
 
-        println!("AST {}:\n{}", text, output);
-        println!("Messages:\n{}", result.format_messages());
+        // println!("AST {}:\n{}", text, output);
+        // println!("Messages:\n{}", result.format_messages());
 
         let result = translate_dsl_grammar(result);
         match result {
             Ok(translated_grammar) => {
                 println!("Translated Grammar:\n{}", translated_grammar.table);
-                let result = translated_grammar.parse(r#"///"#);
+                let result = translated_grammar.parse(
+                    r#"
+                a -> NUMBER
+                "#,
+                );
                 println!("Parsed AST:\n{}", result.format_ast());
             }
             Err(e) => {

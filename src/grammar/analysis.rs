@@ -40,8 +40,28 @@ impl Item {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Copy)]
+struct LR1Item {
+    production_ix: usize,
+    dot: usize,
+    lookahead: usize,
+}
+
+impl LR1Item {
+    fn new(production_ix: usize, dot: usize, lookahead: usize) -> Self {
+        Self {
+            production_ix,
+            dot,
+            lookahead,
+        }
+    }
+
+    fn core(self) -> Item {
+        Item::new(self.production_ix, self.dot)
+    }
+}
+
 pub struct AnalysisContext<'a> {
-    table: &'a RuleTable,
     productions: &'a [Production],
     first_sets: FxHashMap<usize, FxHashSet<Option<usize>>>, // rule_idx -> {terminal_idx | None} (None = epsilon)
 }
@@ -51,11 +71,7 @@ impl GrammarStateAnalysis {
         let mut ctx = AnalysisContext::new(table);
         ctx.compute_first_sets();
 
-        // LR(0) states
-        let (states, transitions) = ctx.compute_lr0_states(start_rule);
-
-        // LALR(1) lookaheads
-        let lookaheads = ctx.compute_lookaheads(&states, &transitions);
+        let (states, transitions, lookaheads) = ctx.compute_lalr_states(start_rule);
 
         let mut final_states = Vec::with_capacity(states.len());
 
@@ -119,7 +135,6 @@ impl GrammarStateAnalysis {
 impl<'a> AnalysisContext<'a> {
     fn new(table: &'a RuleTable) -> Self {
         Self {
-            table,
             productions: &table.productions,
             first_sets: FxHashMap::default(),
         }
@@ -184,40 +199,39 @@ impl<'a> AnalysisContext<'a> {
         }
     }
 
-    // LR(0) State construction
-    fn compute_lr0_states(
+    fn compute_lalr_states(
         &self,
         start_rule: usize,
     ) -> (
         Vec<FxHashSet<Item>>,
         FxHashMap<usize, FxHashMap<Symbol, usize>>,
+        FxHashMap<usize, FxHashMap<Item, FxHashSet<usize>>>,
     ) {
-        let mut states: Vec<FxHashSet<Item>> = Vec::new();
-        let mut state_map: FxHashMap<Vec<Item>, usize> = FxHashMap::default();
-        let mut transitions: FxHashMap<usize, FxHashMap<Symbol, usize>> = FxHashMap::default();
+        let mut canonical_states: Vec<FxHashSet<LR1Item>> = Vec::new();
+        let mut canonical_state_map: FxHashMap<Vec<LR1Item>, usize> = FxHashMap::default();
+        let mut canonical_transitions: FxHashMap<usize, FxHashMap<Symbol, usize>> =
+            FxHashMap::default();
 
-        // Initial state: productions for start_rule
         let mut start_items = FxHashSet::default();
         for (i, p) in self.productions.iter().enumerate() {
             if p.lhs == start_rule {
-                start_items.insert(Item::new(i, 0));
+                start_items.insert(LR1Item::new(i, 0, EOF_TOKEN));
             }
         }
 
-        let start_closure = self.closure(&start_items);
-        let sorted_start = self.sort_items(&start_closure);
+        let start_closure = self.closure_lr1(&start_items);
+        let sorted_start = self.sort_lr1_items(&start_closure);
 
-        states.push(start_closure);
-        state_map.insert(sorted_start, 0);
+        canonical_states.push(start_closure);
+        canonical_state_map.insert(sorted_start, 0);
 
         let mut queue = VecDeque::new();
         queue.push_back(0);
 
         while let Some(state_idx) = queue.pop_front() {
-            let state = &states[state_idx];
+            let state = &canonical_states[state_idx];
 
-            // Group items by next symbol
-            let mut next_symbols: FxHashMap<Symbol, FxHashSet<Item>> = FxHashMap::default();
+            let mut next_symbols: FxHashMap<Symbol, FxHashSet<LR1Item>> = FxHashMap::default();
 
             for item in state {
                 let prod = &self.productions[item.production_ix];
@@ -226,35 +240,85 @@ impl<'a> AnalysisContext<'a> {
                     next_symbols
                         .entry(sym.clone())
                         .or_default()
-                        .insert(Item::new(item.production_ix, item.dot + 1));
+                        .insert(LR1Item::new(
+                            item.production_ix,
+                            item.dot + 1,
+                            item.lookahead,
+                        ));
                 }
             }
 
             for (sym, items) in next_symbols {
-                let closure = self.closure(&items);
-                let sorted = self.sort_items(&closure);
+                let closure = self.closure_lr1(&items);
+                let sorted = self.sort_lr1_items(&closure);
 
-                let target_idx = if let Some(&idx) = state_map.get(&sorted) {
+                let target_idx = if let Some(&idx) = canonical_state_map.get(&sorted) {
                     idx
                 } else {
-                    let idx = states.len();
-                    states.push(closure);
-                    state_map.insert(sorted, idx);
+                    let idx = canonical_states.len();
+                    canonical_states.push(closure);
+                    canonical_state_map.insert(sorted, idx);
                     queue.push_back(idx);
                     idx
                 };
 
-                transitions
+                canonical_transitions
                     .entry(state_idx)
                     .or_default()
                     .insert(sym, target_idx);
             }
         }
 
-        (states, transitions)
+        let mut merged_states = Vec::new();
+        let mut merged_lookaheads: FxHashMap<usize, FxHashMap<Item, FxHashSet<usize>>> =
+            FxHashMap::default();
+        let mut merged_transitions: FxHashMap<usize, FxHashMap<Symbol, usize>> =
+            FxHashMap::default();
+        let mut core_to_merged: FxHashMap<Vec<Item>, usize> = FxHashMap::default();
+        let mut canonical_to_merged = vec![0; canonical_states.len()];
+
+        for (canonical_idx, state) in canonical_states.iter().enumerate() {
+            let mut core_set = FxHashSet::default();
+            for item in state {
+                core_set.insert(item.core());
+            }
+
+            let core_key = self.sort_items(&core_set);
+            let merged_idx = if let Some(&idx) = core_to_merged.get(&core_key) {
+                idx
+            } else {
+                let idx = merged_states.len();
+                merged_states.push(core_set);
+                core_to_merged.insert(core_key, idx);
+                idx
+            };
+
+            canonical_to_merged[canonical_idx] = merged_idx;
+
+            let entry = merged_lookaheads.entry(merged_idx).or_default();
+            for item in state {
+                entry.entry(item.core()).or_default().insert(item.lookahead);
+            }
+        }
+
+        for (source_idx, transitions) in canonical_transitions {
+            let merged_source = canonical_to_merged[source_idx];
+            for (symbol, target_idx) in transitions {
+                let merged_target = canonical_to_merged[target_idx];
+                let entry = merged_transitions.entry(merged_source).or_default();
+                if let Some(existing) = entry.insert(symbol.clone(), merged_target) {
+                    debug_assert_eq!(
+                        existing, merged_target,
+                        "LALR merge produced inconsistent goto target for a merged state"
+                    );
+                }
+            }
+        }
+
+        (merged_states, merged_transitions, merged_lookaheads)
     }
 
-    fn closure(&self, items: &FxHashSet<Item>) -> FxHashSet<Item> {
+    fn closure_lr1(&self, items: &FxHashSet<LR1Item>) -> FxHashSet<LR1Item> {
         let mut closure = items.clone();
         let mut changed = true;
 
@@ -266,12 +330,15 @@ impl<'a> AnalysisContext<'a> {
                 let prod = &self.productions[item.production_ix];
                 if item.dot < prod.rhs.len() {
                     if let Symbol::NonTerminal(rule_ix) = &prod.rhs[item.dot] {
-                        // Add productions for this non-terminal
+                        let lookaheads =
+                            self.first_of_suffix(&prod.rhs[item.dot + 1..], item.lookahead);
                         for (i, p) in self.productions.iter().enumerate() {
                             if p.lhs == *rule_ix {
-                                let new_item = Item::new(i, 0);
-                                if closure.insert(new_item) {
-                                    changed = true;
+                                for lookahead in &lookaheads {
+                                    let new_item = LR1Item::new(i, 0, *lookahead);
+                                    if closure.insert(new_item) {
+                                        changed = true;
+                                    }
                                 }
                             }
                         }
@@ -292,125 +359,55 @@ impl<'a> AnalysisContext<'a> {
         v
     }
 
-    // Simplified LALR(1) lookahead computation
-    // For a real robust implementation, we need the full propagation graph.
-    // Here we will implement a simplified version or SLR if optimization allows,
-    // but user requested LALR.
-    //
-    // Strategy:
-    // 1. Determine spontaneous lookaheads
-    // 2. Determine propagated lookaheads
-    // 3. Propagate
-
-    fn compute_lookaheads(
-        &self,
-        states: &[FxHashSet<Item>],
-        _transitions: &FxHashMap<usize, FxHashMap<Symbol, usize>>,
-    ) -> FxHashMap<usize, FxHashMap<Item, FxHashSet<usize>>> {
-        // Placeholder: Currently using SLR(1) for simplicity and speed as a baseline optimization.
-        // Real LALR(1) is significantly more complex to implement in one go.
-        // SLR is often sufficient for practical grammars, and we can upgrade if conflicts arise.
-        // To make it LALR, we'd need to trace (State, Item) pairs.
-        //
-        // UPGRADE: Implementing full LALR(1) propagation.
-
-        let mut lookaheads: FxHashMap<usize, FxHashMap<Item, FxHashSet<usize>>> =
-            FxHashMap::default();
-
-        let start_rule = self
-            .productions
-            .iter()
-            .find(|p| p.lhs == self.table.start_rule) // Assuming table.start_rule is set correctly
-            .map(|p| p.lhs)
-            .unwrap_or(0);
-
-        // Compute Follow sets including EOF for start rule
-        let follow_sets = self.compute_follow_sets(start_rule);
-
-        for (state_idx, state) in states.iter().enumerate() {
-            for item in state {
-                let prod = &self.productions[item.production_ix];
-                if item.dot == prod.rhs.len() {
-                    // Reduction
-                    if let Some(follows) = follow_sets.get(&prod.lhs) {
-                        let entry = lookaheads
-                            .entry(state_idx)
-                            .or_default()
-                            .entry(*item)
-                            .or_default();
-                        entry.extend(follows.iter().cloned());
-                    }
-                }
-            }
-        }
-
-        lookaheads
+    fn sort_lr1_items(&self, items: &FxHashSet<LR1Item>) -> Vec<LR1Item> {
+        let mut v: Vec<_> = items.iter().cloned().collect();
+        v.sort_by(|a, b| {
+            a.production_ix
+                .cmp(&b.production_ix)
+                .then(a.dot.cmp(&b.dot))
+                .then(a.lookahead.cmp(&b.lookahead))
+        });
+        v
     }
 
-    fn compute_follow_sets(&self, start_rule: usize) -> FxHashMap<usize, FxHashSet<usize>> {
-        let mut follows: FxHashMap<usize, FxHashSet<usize>> = FxHashMap::default();
+    fn first_of_suffix(&self, suffix: &[Symbol], fallback_lookahead: usize) -> FxHashSet<usize> {
+        let mut result = FxHashSet::default();
+        let mut nullable_prefix = true;
 
-        // Add EOF to start rule
-        follows.entry(start_rule).or_default().insert(EOF_TOKEN);
-
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for prod in self.productions {
-                let mut tail_first = FxHashSet::default();
-                tail_first.insert(None); // Epsilon
-
-                // Backward scan
-                for sym in prod.rhs.iter().rev() {
-                    match sym {
-                        Symbol::Terminal(idx) => {
-                            tail_first.clear();
-                            tail_first.insert(Some(*idx));
+        for symbol in suffix {
+            match symbol {
+                Symbol::Terminal(idx) => {
+                    result.insert(*idx);
+                    nullable_prefix = false;
+                    break;
+                }
+                Symbol::NonTerminal(rule_idx) => {
+                    let firsts = self.first_sets.get(rule_idx).cloned().unwrap_or_default();
+                    let mut is_nullable = false;
+                    for first in firsts {
+                        match first {
+                            Some(term_idx) => {
+                                result.insert(term_idx);
+                            }
+                            None => {
+                                is_nullable = true;
+                            }
                         }
-                        Symbol::NonTerminal(idx) => {
-                            let lhs_follows = if tail_first.contains(&None) {
-                                follows.get(&prod.lhs).cloned()
-                            } else {
-                                None
-                            };
+                    }
 
-                            let entry = follows.entry(*idx).or_default();
-
-                            // Add non-epsilon from tail_first to Follow(B)
-                            for f in &tail_first {
-                                if let Some(t) = f {
-                                    if entry.insert(*t) {
-                                        changed = true;
-                                    }
-                                }
-                            }
-
-                            // If tail_first had epsilon, we add Follow(A) to Follow(B)
-                            if let Some(f_set) = lhs_follows {
-                                for f in f_set {
-                                    if entry.insert(f) {
-                                        changed = true;
-                                    }
-                                }
-                            }
-
-                            // Update tail_first for next symbol
-                            let sym_first = self.first_sets.get(idx).cloned().unwrap_or_default();
-                            let sym_nullable = sym_first.contains(&None);
-
-                            let mut new_tail = sym_first.clone();
-                            new_tail.remove(&None);
-
-                            if sym_nullable {
-                                new_tail.extend(tail_first.iter().cloned());
-                            }
-                            tail_first = new_tail;
-                        }
+                    if !is_nullable {
+                        nullable_prefix = false;
+                        break;
                     }
                 }
             }
         }
-        follows
+
+        if nullable_prefix {
+            result.insert(fallback_lookahead);
+        }
+
+        result
     }
 
     fn add_action(

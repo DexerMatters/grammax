@@ -4,4 +4,13 @@ authors = ["Dexer Matters"]
 language = "en"
 
 [output.html]
+default-theme = "dark"
+preferred-dark-theme = "navy"
+smart-punctuation = true
+definition-lists = true
+admonitions = true
 mathjax-support = true
+no-section-label = false
+git-repository-url = "https://github.com/DexerMatters/Grammax"
+git-repository-icon = "fab-github"
+sidebar-header-nav = true

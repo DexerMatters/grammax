@@ -38,8 +38,8 @@ fn test_simple_arithmetic_precedence() {
         start where
         start -> r!(expr) + tt(EndOfInput)
         expr -> r!(add) | r!(mul) | r!(primary)
-        add  -> field("lhs:", r!(expr)) + tt("+") + field("rhs:", r!(expr).drop(1))
-        mul  -> field("lhs:", r!(expr).drop(1)) + tt("*") + field("rhs:", r!(expr).drop(2))
+        add  -> r!(expr) + tt("+") + r!(expr).drop(1)
+        mul  -> r!(expr).drop(1) + tt("*") + r!(expr).drop(2)
         primary -> tt(NUMBER) | tt("(") + r!(expr) + tt(")")
     );
 
@@ -47,7 +47,7 @@ fn test_simple_arithmetic_precedence() {
 
     println!("Grammar:\n{}", grammar.table);
 
-    let text = "8+3";
+    let text = "1 + 2 * ";
     let result = parser.parse_text(text);
 
     let output = result.format_ast();

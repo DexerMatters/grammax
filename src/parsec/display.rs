@@ -47,7 +47,7 @@ pub fn format_messages_with_source(
         let (msg_type, is_missing) = match &msg.message {
             ErrorMessage::UnexpectedToken { .. } => ("unexpected", false),
             ErrorMessage::MissingToken { .. } => ("missing", true),
-            ErrorMessage::Custom(_) => ("custom", false),
+            ErrorMessage::InternalError { .. } => ("internal", false),
         };
 
         let key = (msg.span.start, msg.span.end, msg_type);
@@ -58,7 +58,7 @@ pub fn format_messages_with_source(
                 let entry = grouped.entry(key).or_insert((is_missing, Vec::new()));
                 entry.1.extend(expected.iter().copied());
             }
-            ErrorMessage::Custom(_) => {
+            ErrorMessage::InternalError { .. } => {
                 grouped.entry(key).or_insert((is_missing, Vec::new()));
             }
         }

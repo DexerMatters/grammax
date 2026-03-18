@@ -5,7 +5,7 @@ use crate::utils::Span;
 pub enum ErrorMessage {
     UnexpectedToken { expected: Vec<usize> },
     MissingToken { expected: Vec<usize> },
-    Custom(usize),
+    InternalError { message: String },
 }
 
 /// A parser message consists of a span in the input text and an error message, used for error reporting and recovery.

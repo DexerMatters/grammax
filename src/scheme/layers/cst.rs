@@ -456,7 +456,9 @@ impl ParseTreeIR {
                         ErrorMessage::MissingToken { expected }
                     }
                     ParsecError::Incomplete | ParsecError::Placeholder | ParsecError::LRError => {
-                        ErrorMessage::Custom(0)
+                        ErrorMessage::InternalError {
+                            message: format!("{err:?}"),
+                        }
                     }
                 };
                 out.push(ParserMessage {

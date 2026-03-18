@@ -40,7 +40,8 @@ impl ParserPass {
         parser_config: ParserConfig,
         reparser_config: ReparserConfig,
     ) -> Self {
-        let mut parser = Parser::new(grammar).with_config(parser_config);
+        let mut parser = Parser::new(grammar);
+        parser.set_config(parser_config);
         let crate::parsec::Result { root, .. } = parser.parse_text("");
         let alloc = parser.alloc.clone();
         let reparser = Reparser::new(root, alloc).with_config(reparser_config);

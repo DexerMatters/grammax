@@ -167,13 +167,12 @@ impl Parser {
         }
     }
 
-    pub fn with_config(mut self, config: ParserConfig) -> Self {
+    pub fn set_config(&mut self, config: ParserConfig) {
         self.reuse_enabled = !config.disable_reuse;
         if !self.reuse_enabled {
             self.reuse_cache.clear();
         }
         self.config = config;
-        self
     }
 
     pub fn text(&self) -> &str {
@@ -582,7 +581,7 @@ impl Parser {
     }
 
     // Helper for Reparser
-    pub fn parse_rule(
+    pub(crate) fn parse_rule(
         &mut self,
         rule_ix: usize,
         pos: usize,

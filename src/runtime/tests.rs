@@ -3,10 +3,7 @@ use std::time::Duration;
 use crate::{
     interface::BasicInterface,
     new_grammar,
-    runtime::{
-        BuildTree, CompilerBuilder, Down, End, Here, Observe, ObservedLayer, Then,
-        compiler::insert_at,
-    },
+    runtime::{BuildTree, CompilerBuilder, Down, End, Here, Observe, ObservedLayer, Then},
     scheme::{
         layers::{AstArena, ParseTreeIR, SourceText},
         passes::{IncrementalLowerer, ParserPass},
@@ -57,12 +54,8 @@ fn test_tap_prints_cst_commands() {
         CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
     let cst_obs: ObservedLayer<CstTree, Down<Here>> = cst_tree.observe::<Down<Here>>();
 
-    let mut compiler = cst_tree.build();
-
-    // Submit a small JSON document.
-    compiler
-        .submit_source(insert_at(0, r#"{"key": 42}"#))
-        .expect("submit");
+    let compiler = cst_tree.build_runtime::<BasicInterface<_>>(grammar);
+    compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
 
     // The observer receives one update per submitted transaction.
     let (revision, txn) = cst_obs

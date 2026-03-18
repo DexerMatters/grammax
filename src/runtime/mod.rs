@@ -11,8 +11,8 @@ pub mod service;
 pub use crate::scheme::passes::ParserPass;
 pub use crate::scheme::{LayerName, PassId};
 pub use compiler::{
-    Another, BuildTree, CompilerBuilder, ComposedCompiler, ContainsPath, ContainsTree, Down, End,
-    Fork, Here, LayerObserver, Observe, ObservePath, ObservedLayer, SeededTree, Then, TypedTree,
+    Another, BuildTree, CompilerBuilder, ContainsPath, ContainsTree, Down, End, Fork, Here,
+    LayerObserver, Observe, ObservePath, ObservedLayer, SeededTree, Then, TypedTree,
 };
 pub use protocol::{RevisionId, RuntimeError, RuntimePath};
 pub(crate) use protocol::{RuntimeEnvelope, RuntimeRequest, RuntimeResult, RuntimeSignal};

@@ -403,7 +403,6 @@ impl<U: IR> LayerObserver<U> {
 #[derive(Clone)]
 struct BuilderCore {
     submit_top: SubmitTopFn,
-    top_layer_path: RuntimePath,
     queries: SharedQueries,
     layer_paths: SharedLayerPaths,
     settled: std::cell::RefCell<(RuntimePath, RuntimePath)>,
@@ -420,7 +419,6 @@ impl BuilderCore {
     ) -> Self {
         Self {
             submit_top,
-            top_layer_path: top_layer_path.clone(),
             queries: Arc::new(Mutex::new(HashMap::new())),
             layer_paths: Arc::new(Mutex::new(vec![top_layer_path.clone()])),
             settled: std::cell::RefCell::new((top_layer_path, top_pass_path)),
@@ -784,14 +782,6 @@ where
 }
 
 pub trait BuildTree: TypedTree + Sized {
-    fn build(self) -> ComposedCompiler<Self>
-    where
-        Self: TypedTree<Current = SourceText> + 'static,
-        SourceText: Send + 'static,
-        <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + fmt::Debug + 'static;
-
     fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Self, I>
     where
         I: Interface<Self>,
@@ -806,17 +796,6 @@ impl<Tree> BuildTree for Tree
 where
     Tree: TypedTree + InstallTree,
 {
-    fn build(self) -> ComposedCompiler<Self>
-    where
-        Self: TypedTree<Current = SourceText> + 'static,
-        SourceText: Send + 'static,
-        <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + fmt::Debug + 'static,
-    {
-        ComposedCompiler::from_tree(self)
-    }
-
     fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Self, I>
     where
         I: Interface<Self>,
@@ -955,13 +934,11 @@ where
     (next_output_rx, downstream_query)
 }
 
-pub struct ComposedCompiler<Tree: TypedTree> {
+pub(crate) struct ComposedCompiler<Tree: TypedTree> {
     submit_top: SubmitTopFn,
     queries: SharedQueries,
-    layer_paths: SharedLayerPaths,
     settled_layer_path: RuntimePath,
     settled_pass_path: RuntimePath,
-    source_layer_path: RuntimePath,
     next_revision: AtomicU64,
     source_len: usize,
     shutdown_hooks: SharedShutdownHooks,
@@ -1000,25 +977,6 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         query(index)
     }
 
-    pub fn source_text(&self) -> Option<String> {
-        let span = Span::new(0, self.source_len);
-        let index = serde_json::to_value(span).ok()?;
-        let payload = self
-            .query(
-                self.source_layer_path.clone(),
-                utils::Payload::new_serializable(index),
-            )
-            .ok()?;
-        payload.downcast::<String>()
-    }
-
-    pub fn layer_paths(&self) -> Vec<RuntimePath> {
-        self.layer_paths
-            .lock()
-            .map(|layers| layers.clone())
-            .unwrap_or_default()
-    }
-
     pub fn settled_layer_path(&self) -> Option<&RuntimePath> {
         Some(&self.settled_layer_path)
     }
@@ -1040,17 +998,6 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
 
     fn into_inner(self) -> RawComposedCompiler<Tree> {
         self
-    }
-
-    fn from_tree(spec: Tree) -> Self
-    where
-        Tree: InstallTree + TypedTree<Current = SourceText> + 'static,
-        SourceText: Send + 'static,
-        <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + fmt::Debug + 'static,
-    {
-        Self::from_tree_with_events(spec, None)
     }
 
     fn from_tree_with_events(
@@ -1103,10 +1050,8 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         ComposedCompiler {
             submit_top: core.submit_top,
             queries: core.queries,
-            layer_paths: core.layer_paths,
             settled_layer_path,
             settled_pass_path,
-            source_layer_path: core.top_layer_path,
             next_revision: AtomicU64::new(1),
             source_len: 0,
             shutdown_hooks: core.shutdown_hooks,
@@ -1272,25 +1217,4 @@ fn runtime_invalid(message: impl Into<String>) -> RuntimeError {
     RuntimeError::InvalidRequest {
         message: message.into(),
     }
-}
-
-pub fn insert_at(offset: usize, text: impl Into<String>) -> SourceTxn {
-    let text = text.into();
-    let span = Span::new(offset, offset);
-    std::sync::Arc::new(vec![
-        scheme::Command::Create { id: 0, value: text },
-        scheme::Command::Insert { index: span, id: 0 },
-    ])
-}
-
-pub fn delete_span(span: Span) -> SourceTxn {
-    std::sync::Arc::new(vec![scheme::Command::Delete { index: span }])
-}
-
-pub fn replace_span(span: Span, text: impl Into<String>) -> SourceTxn {
-    let text = text.into();
-    std::sync::Arc::new(vec![
-        scheme::Command::Create { id: 0, value: text },
-        scheme::Command::Replace { index: span, id: 0 },
-    ])
 }

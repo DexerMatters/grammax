@@ -1,5 +1,6 @@
 pub(crate) mod analysis;
 pub(crate) mod bridge;
+pub(crate) mod bundle;
 pub(crate) mod cache;
 pub mod display;
 pub mod dsl;
@@ -68,6 +69,7 @@ pub enum GrammarError {
     NoStartRule(Span),
     DropCountExceedsNodeLength(Span),
     DropOnNonReference(Span),
+    UncacheableMatcher(String),
     IoError(io::Error),
 }
 
@@ -82,6 +84,7 @@ pub struct Grammar {
     pub(crate) bridge_specs: Vec<bridge::BridgeSpec>,
     pub(crate) recovery_delimiters: Vec<usize>,
     pub(crate) bracketed_terminals: Vec<usize>,
+    pub(crate) bracketed_delimiters: Vec<usize>,
 }
 
 impl Grammar {
@@ -121,6 +124,7 @@ impl Grammar {
         start_rule: &'static str,
     ) -> Result<&'static Self, GrammarError> {
         let table = norm::RuleTable::normalize(node, start_rule)?;
+        cache::ensure_cacheable_terminals(&table.terminals)?;
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
             table.start_rule,
@@ -129,6 +133,7 @@ impl Grammar {
         let bridge_specs = bridge::derive_bridge_specs(&table);
         let recovery_delimiters = bridge::derive_recovery_delimiters(&table);
         let bracketed_terminals = bridge::derive_bracketed_terminals(&table);
+        let bracketed_delimiters = bridge::derive_bracketed_delimiters(&table);
 
         let grammar = Self {
             table,
@@ -137,6 +142,7 @@ impl Grammar {
             bridge_specs,
             recovery_delimiters,
             bracketed_terminals,
+            bracketed_delimiters,
         };
 
         Ok(Box::leak(Box::new(grammar)))
@@ -151,6 +157,7 @@ impl Grammar {
         })?;
 
         let table = norm::RuleTable::normalize_with_registry(node, start_rule, Some(registry))?;
+        cache::ensure_cacheable_terminals(&table.terminals)?;
         let analysis = Arc::new(analysis::GrammarStateAnalysis::from_table(
             &table,
             table.start_rule,
@@ -159,6 +166,7 @@ impl Grammar {
         let bridge_specs = bridge::derive_bridge_specs(&table);
         let recovery_delimiters = bridge::derive_recovery_delimiters(&table);
         let bracketed_terminals = bridge::derive_bracketed_terminals(&table);
+        let bracketed_delimiters = bridge::derive_bracketed_delimiters(&table);
 
         let grammar = Self {
             table,
@@ -167,6 +175,7 @@ impl Grammar {
             bridge_specs,
             recovery_delimiters,
             bracketed_terminals,
+            bracketed_delimiters,
         };
 
         Ok(Box::leak(Box::new(grammar)))
@@ -313,8 +322,20 @@ impl Grammar {
 
     /// Save this grammar to a grammax binary file.
     pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.save_to_target(path, &[])
+    }
+
+    /// Save this grammar to a grammax binary bundle with optional target metadata.
+    ///
+    /// Target values are currently metadata-only and do not add plugin binaries.
+    pub fn save_to_target(&self, path: impl AsRef<Path>, targets: &[&str]) -> io::Result<()> {
         let path = path.as_ref();
-        let bytes = cache::serialize_grammar_file(self)?;
+        let targets: Vec<String> = targets.iter().map(|target| (*target).to_string()).collect();
+        let bytes = if targets.is_empty() {
+            cache::serialize_grammar_file(self)?
+        } else {
+            cache::serialize_grammar_file_for_targets(self, &targets)?
+        };
         fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
         fs::write(path, bytes)
     }

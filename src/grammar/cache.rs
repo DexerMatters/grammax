@@ -1,7 +1,5 @@
 use std::env;
-use std::fmt;
 use std::fs;
-use std::hash::Hash;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -10,14 +8,13 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::grammar::Grammar;
+use crate::grammar::GrammarError;
 use crate::grammar::analysis::GrammarStateAnalysis;
 use crate::grammar::bridge;
+use crate::grammar::bundle;
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::parsec::words::{
-    self, CharMatcherWithEscapes, EndOfInput, MatcherRef, OwnedLiteral, RegexMatcher,
-    TokenizedMatcher, token,
-};
+use crate::parsec::words::MatcherRef;
 
 pub(crate) mod serde_fxhashmap {
     use std::hash::Hash;
@@ -47,21 +44,9 @@ pub(crate) mod serde_fxhashmap {
     }
 }
 
-const CACHE_FORMAT_VERSION: u32 = 8;
+const CACHE_FORMAT_VERSION: u32 = 9;
 
 static CACHE_DIR_OVERRIDE: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-enum CachedTerminal {
-    Literal(String),
-    TokenLiteral(String),
-    Token(Box<CachedTerminal>),
-    Char(char),
-    Named(String),
-    Regex(String),
-    CharEscapes,
-    Eof,
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum CachedNode {
@@ -90,7 +75,7 @@ struct CachedProduction {
 struct CachedRuleTable {
     rules: Vec<CachedRuleInfo>,
     productions: Vec<CachedProduction>,
-    terminals: Vec<CachedTerminal>,
+    terminals: Vec<MatcherRef>,
     #[serde(with = "crate::grammar::cache::serde_fxhashmap")]
     terminal_map: FxHashMap<String, usize>,
     start_rule: usize,
@@ -107,19 +92,34 @@ struct GrammarCacheFile {
     analysis: GrammarStateAnalysis,
     #[serde(with = "crate::grammar::cache::serde_fxhashmap")]
     rule_analyses: FxHashMap<usize, GrammarStateAnalysis>,
-    /// Bridge specs derived from productions (Nilsson-Nyman 2009 §3).
+    /// Bridge specs derived from productions (Nilsson-Nyman 2009 section 3).
     bridge_specs: Vec<bridge::BridgeSpec>,
     /// Delimiter terminals used as stop points by scope recovery.
     recovery_delimiters: Vec<usize>,
-    /// Terminals with matching delimiters on both ends (e.g., strings, comments).
-    /// Stored as terminal indices that have the same delimiter opening and closing.
+    /// Terminals with matching delimiters on both ends (e.g. strings, comments).
     bracketed_terminals: Vec<usize>,
+    /// Delimiter terminals that open/close bracketed content scopes.
+    bracketed_delimiters: Vec<usize>,
+}
+
+pub(crate) fn ensure_cacheable_terminals(terminals: &[MatcherRef]) -> Result<(), GrammarError> {
+    for matcher in terminals {
+        if let Err(err) = bincode::serialize(matcher) {
+            return Err(GrammarError::UncacheableMatcher(format!(
+                "{}: {}",
+                matcher.display(),
+                err
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn load(cache_key: u64) -> Option<Grammar> {
     let path = cache_file_path(cache_key);
     let bytes = fs::read(path).ok()?;
-    let cache: GrammarCacheFile = bincode::deserialize(&bytes).ok()?;
+    let decoded = bundle::decode(&bytes).ok()?;
+    let cache = deserialize_cache_payload(&decoded.cache_payload).ok()?;
 
     if cache.format_version != CACHE_FORMAT_VERSION {
         return None;
@@ -150,6 +150,7 @@ pub(crate) fn load(cache_key: u64) -> Option<Grammar> {
         bridge_specs: cache.bridge_specs,
         recovery_delimiters: cache.recovery_delimiters,
         bracketed_terminals: cache.bracketed_terminals,
+        bracketed_delimiters: cache.bracketed_delimiters,
     })
 }
 
@@ -157,6 +158,46 @@ pub(crate) fn store(cache_key: u64, grammar: &Grammar) -> io::Result<()> {
     let dir = cache_dir();
     fs::create_dir_all(&dir)?;
 
+    let payload = serialize_cache_payload(grammar, cache_key)?;
+    let bytes = bundle::encode(&payload, &[])?;
+
+    fs::write(cache_file_path(cache_key), bytes)
+}
+
+pub(crate) fn serialize_grammar_file(grammar: &Grammar) -> Result<Vec<u8>, io::Error> {
+    serialize_grammar_file_for_targets(grammar, &[])
+}
+
+pub(crate) fn serialize_grammar_file_for_targets(
+    grammar: &Grammar,
+    targets: &[String],
+) -> Result<Vec<u8>, io::Error> {
+    let payload = serialize_cache_payload(grammar, 0)?;
+    bundle::encode(&payload, targets)
+}
+
+pub(crate) fn deserialize_grammar_file(bytes: &[u8]) -> Result<Grammar, io::Error> {
+    let decoded = bundle::decode(bytes)?;
+    let _targets = decoded.targets;
+    let cache = deserialize_cache_payload(&decoded.cache_payload)?;
+
+    Ok(Grammar {
+        table: decode_rule_table(cache.table)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?,
+        analysis: Arc::new(cache.analysis),
+        rule_analyses: cache
+            .rule_analyses
+            .into_iter()
+            .map(|(rule_ix, state)| (rule_ix, Arc::new(state)))
+            .collect(),
+        bridge_specs: cache.bridge_specs,
+        recovery_delimiters: cache.recovery_delimiters,
+        bracketed_terminals: cache.bracketed_terminals,
+        bracketed_delimiters: cache.bracketed_delimiters,
+    })
+}
+
+fn serialize_cache_payload(grammar: &Grammar, cache_key: u64) -> io::Result<Vec<u8>> {
     let table = encode_rule_table(&grammar.table)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
 
@@ -176,23 +217,27 @@ pub(crate) fn store(cache_key: u64, grammar: &Grammar) -> io::Result<()> {
         bridge_specs: grammar.bridge_specs.clone(),
         recovery_delimiters: grammar.recovery_delimiters.clone(),
         bracketed_terminals: grammar.bracketed_terminals.clone(),
+        bracketed_delimiters: grammar.bracketed_delimiters.clone(),
     };
 
-    let bytes = bincode::serialize(&cache)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    bincode::serialize(&cache)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
+}
 
-    fs::write(cache_file_path(cache_key), bytes)
+fn deserialize_cache_payload(bytes: &[u8]) -> io::Result<GrammarCacheFile> {
+    bincode::deserialize(bytes)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
 }
 
 fn encode_rule_table(table: &RuleTable) -> Result<CachedRuleTable, String> {
-    let mut matcher_idx: FxHashMap<usize, usize> = FxHashMap::default();
-    let mut terminals = Vec::with_capacity(table.terminals.len());
+    let mut matcher_idx_by_ptr: FxHashMap<usize, usize> = FxHashMap::default();
+    let mut matcher_idx_by_fingerprint: FxHashMap<Vec<u8>, usize> = FxHashMap::default();
 
     for (idx, matcher) in table.terminals.iter().enumerate() {
-        let spec = terminal_to_cached(matcher)
-            .ok_or_else(|| format!("unsupported matcher for cache: {}", matcher.display()))?;
-        terminals.push(spec);
-        matcher_idx.insert(Arc::as_ptr(matcher) as *const () as usize, idx);
+        matcher_idx_by_ptr.insert(Arc::as_ptr(matcher) as *const () as usize, idx);
+
+        let fingerprint = matcher_fingerprint(matcher)?;
+        matcher_idx_by_fingerprint.entry(fingerprint).or_insert(idx);
     }
 
     let rules = table
@@ -202,7 +247,7 @@ fn encode_rule_table(table: &RuleTable) -> Result<CachedRuleTable, String> {
             Ok(CachedRuleInfo {
                 name: rule.name.to_string(),
                 description: rule.description.to_string(),
-                node: encode_node(&rule.node, &matcher_idx, &terminals)?,
+                node: encode_node(&rule.node, &matcher_idx_by_ptr, &matcher_idx_by_fingerprint)?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
@@ -224,18 +269,14 @@ fn encode_rule_table(table: &RuleTable) -> Result<CachedRuleTable, String> {
     Ok(CachedRuleTable {
         rules,
         productions,
-        terminals,
+        terminals: table.terminals.clone(),
         terminal_map: table.terminal_map.clone(),
         start_rule: table.start_rule,
     })
 }
 
 fn decode_rule_table(table: CachedRuleTable) -> Result<RuleTable, String> {
-    let terminals: Vec<MatcherRef> = table
-        .terminals
-        .iter()
-        .map(cached_to_terminal)
-        .collect::<Result<Vec<_>, _>>()?;
+    let terminals = table.terminals;
 
     let rules = table
         .rules
@@ -274,41 +315,46 @@ fn decode_rule_table(table: CachedRuleTable) -> Result<RuleTable, String> {
 
 fn encode_node(
     node: &NormalizedNode,
-    matcher_idx: &FxHashMap<usize, usize>,
-    terminals: &[CachedTerminal],
+    matcher_idx_by_ptr: &FxHashMap<usize, usize>,
+    matcher_idx_by_fingerprint: &FxHashMap<Vec<u8>, usize>,
 ) -> Result<CachedNode, String> {
     match node {
         NormalizedNode::Terminal(matcher) => {
             let key = Arc::as_ptr(matcher) as *const () as usize;
-            if let Some(idx) = matcher_idx.get(&key) {
+            if let Some(idx) = matcher_idx_by_ptr.get(&key) {
                 return Ok(CachedNode::Terminal(*idx));
             }
 
-            let spec = terminal_to_cached(matcher).ok_or_else(|| {
-                format!("unsupported node matcher for cache: {}", matcher.display())
-            })?;
-            let idx = terminals
-                .iter()
-                .position(|s| s == &spec)
-                .ok_or_else(|| "node terminal not found in terminal table".to_string())?;
-            Ok(CachedNode::Terminal(idx))
+            let fingerprint = matcher_fingerprint(matcher)?;
+            if let Some(idx) = matcher_idx_by_fingerprint.get(&fingerprint) {
+                return Ok(CachedNode::Terminal(*idx));
+            }
+
+            Err(format!(
+                "terminal matcher not found in table: {}",
+                matcher.display()
+            ))
         }
         NormalizedNode::Alternative(nodes) => Ok(CachedNode::Alternative(
             nodes
                 .iter()
-                .map(|n| encode_node(n, matcher_idx, terminals))
+                .map(|n| encode_node(n, matcher_idx_by_ptr, matcher_idx_by_fingerprint))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         NormalizedNode::Sequence(nodes) => Ok(CachedNode::Sequence(
             nodes
                 .iter()
-                .map(|n| encode_node(n, matcher_idx, terminals))
+                .map(|n| encode_node(n, matcher_idx_by_ptr, matcher_idx_by_fingerprint))
                 .collect::<Result<Vec<_>, _>>()?,
         )),
         NormalizedNode::Reference(ix) => Ok(CachedNode::Reference(*ix)),
         NormalizedNode::Field(name, inner) => Ok(CachedNode::Field(
             (*name).to_string(),
-            Box::new(encode_node(inner, matcher_idx, terminals)?),
+            Box::new(encode_node(
+                inner,
+                matcher_idx_by_ptr,
+                matcher_idx_by_fingerprint,
+            )?),
         )),
     }
 }
@@ -340,189 +386,18 @@ fn decode_node(node: CachedNode, terminals: &[MatcherRef]) -> Result<NormalizedN
     }
 }
 
-fn terminal_to_cached(matcher: &MatcherRef) -> Option<CachedTerminal> {
-    let display = matcher.display();
-
-    // Handle regex patterns
-    if let Some(pattern) = display
-        .strip_prefix("regex(")
-        .and_then(|s| s.strip_suffix(")"))
-    {
-        return Some(CachedTerminal::Regex(pattern.to_string()));
-    }
-
-    // Handle CharMatcherWithEscapes
-    if display == "characters including escapes" {
-        return Some(CachedTerminal::CharEscapes);
-    }
-
-    // Handle "whitespace or newline* ..." patterns (from token() function)
-    if let Some(rest) = display.strip_prefix("whitespace or newline* ") {
-        let inner = cached_terminal_from_display(rest.trim())?;
-        return Some(CachedTerminal::Token(Box::new(inner)));
-    }
-
-    if let Some(inner_display) = display.strip_prefix("char_predicate* ") {
-        let inner = cached_terminal_from_display(inner_display.trim())?;
-        return Some(CachedTerminal::Token(Box::new(inner)));
-    }
-
-    cached_terminal_from_display(&display).or_else(|| {
-        if let Some(preview) = matcher.preview() {
-            let quoted = format!("\"{}\"", preview);
-            if display == quoted {
-                return Some(CachedTerminal::Literal(preview.to_string()));
-            }
-            if display.contains(&quoted) {
-                return Some(CachedTerminal::TokenLiteral(preview.to_string()));
-            }
-        }
-        None
+fn matcher_fingerprint(matcher: &MatcherRef) -> Result<Vec<u8>, String> {
+    bincode::serialize(matcher).map_err(|err| {
+        format!(
+            "failed to serialize matcher '{}': {}",
+            matcher.display(),
+            err
+        )
     })
-}
-
-fn cached_terminal_from_display(display: &str) -> Option<CachedTerminal> {
-    if let Some(pattern) = display
-        .strip_prefix("regex(")
-        .and_then(|s| s.strip_suffix(")"))
-    {
-        return Some(CachedTerminal::Regex(pattern.to_string()));
-    }
-
-    if display == "EOF" {
-        return Some(CachedTerminal::Eof);
-    }
-
-    if display == "characters including escapes" {
-        return Some(CachedTerminal::CharEscapes);
-    }
-
-    if display == "whitespace or newline" {
-        // Special handling for the token() function's whitespace pattern
-        return Some(CachedTerminal::Named("whitespace_or_newline".to_string()));
-    }
-
-    if let Some(ch) = parse_char_display(display) {
-        return Some(CachedTerminal::Char(ch));
-    }
-
-    if display.starts_with('"') && display.ends_with('"') && display.len() >= 2 {
-        return Some(CachedTerminal::Literal(
-            display[1..display.len() - 1].to_string(),
-        ));
-    }
-
-    match display {
-        "number" | "identifier" | "alphanum" | "string" | "ident" | "json_string"
-        | "whitespaces" | "regexp" => Some(CachedTerminal::Named(display.to_string())),
-        _ => None,
-    }
-}
-
-fn cached_to_terminal(spec: &CachedTerminal) -> Result<MatcherRef, String> {
-    match spec {
-        CachedTerminal::Literal(s) => Ok(Arc::new(OwnedLiteral(s.clone()))),
-        CachedTerminal::TokenLiteral(s) => Ok(Arc::new(token(OwnedLiteral(s.clone())))),
-        CachedTerminal::Token(inner) => {
-            let inner_matcher = cached_to_terminal(inner)?;
-            Ok(Arc::new(TokenizedMatcher {
-                inner: inner_matcher,
-            }))
-        }
-        CachedTerminal::Char(c) => Ok(Arc::new(*c)),
-        CachedTerminal::Regex(pattern) => {
-            let compiled = regex::Regex::new(pattern)
-                .map_err(|e| format!("failed to compile regex pattern: {}", e))?;
-            Ok(Arc::new(RegexMatcher {
-                pattern: compiled,
-                is_nullable: OnceLock::new(),
-                is_consuming: OnceLock::new(),
-            }))
-        }
-        CachedTerminal::CharEscapes => Ok(Arc::new(CharMatcherWithEscapes)),
-        CachedTerminal::Named(name) => match name.as_str() {
-            "number" => Ok(Arc::new(words::NUMBER)),
-            "identifier" => Ok(Arc::new(words::ALPHABETS)),
-            "alphanum" => Ok(Arc::new(words::ALPHANUMBER)),
-            "string" => Ok(Arc::new(words::STRING)),
-            "ident" => Ok(Arc::new(words::IDENT)),
-            "regexp" => Ok(Arc::new(words::NamedMatcher::new(
-                "regexp",
-                RegexMatcher::new(r#"([^/\\\r\n]|\\.)+"#),
-            ))),
-            "json_string" => Ok(Arc::new(words::STRING)), // Backward compatibility
-            "whitespaces" => Ok(Arc::new(words::WHITESPACES)),
-            "whitespace_or_newline" => {
-                // This is a special pattern used by token() - return WHITESPACES as best approximation
-                // The actual matching is handled by TokenizedMatcher when this is wrapped as Token
-                Ok(Arc::new(words::WHITESPACES))
-            }
-            _ => Err(format!("unsupported named matcher in cache: {}", name)),
-        },
-        CachedTerminal::Eof => Ok(Arc::new(EndOfInput)),
-    }
-}
-
-fn parse_char_display(display: &str) -> Option<char> {
-    if display.starts_with('\'') && display.ends_with('\'') {
-        let mut chars = display[1..display.len() - 1].chars();
-        let c = chars.next()?;
-        if chars.next().is_none() {
-            return Some(c);
-        }
-    }
-    None
 }
 
 pub(crate) fn leak_str(value: String) -> &'static str {
     value.leak()
-}
-
-pub(crate) fn serialize_grammar_file(grammar: &Grammar) -> Result<Vec<u8>, io::Error> {
-    let table = encode_rule_table(&grammar.table)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-
-    let file = GrammarCacheFile {
-        format_version: CACHE_FORMAT_VERSION,
-        crate_version: env!("CARGO_PKG_VERSION").to_string(),
-        os: env::consts::OS.to_string(),
-        arch: env::consts::ARCH.to_string(),
-        cache_key: 0,
-        table,
-        analysis: (*grammar.analysis).clone(),
-        rule_analyses: grammar
-            .rule_analyses
-            .iter()
-            .map(|(rule_ix, state)| (*rule_ix, (**state).clone()))
-            .collect(),
-        bridge_specs: grammar.bridge_specs.clone(),
-        recovery_delimiters: grammar.recovery_delimiters.clone(),
-        bracketed_terminals: grammar.bracketed_terminals.clone(),
-    };
-
-    bincode::serialize(&file)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))
-}
-
-pub(crate) fn deserialize_grammar_file(bytes: &[u8]) -> Result<Grammar, io::Error> {
-    let cache: GrammarCacheFile = bincode::deserialize(bytes)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-
-    let table = decode_rule_table(cache.table)
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-
-    Ok(Grammar {
-        table,
-        analysis: Arc::new(cache.analysis),
-        rule_analyses: cache
-            .rule_analyses
-            .into_iter()
-            .map(|(rule_ix, state)| (rule_ix, Arc::new(state)))
-            .collect(),
-        bridge_specs: cache.bridge_specs,
-        recovery_delimiters: cache.recovery_delimiters,
-        bracketed_terminals: cache.bracketed_terminals,
-    })
 }
 
 fn cache_file_path(cache_key: u64) -> PathBuf {
@@ -555,71 +430,233 @@ fn explicit_cache_dir() -> Option<PathBuf> {
     guard.clone()
 }
 
-impl PartialEq for CachedTerminal {
-    fn eq(&self, other: &Self) -> bool {
-        use CachedTerminal::*;
-        match (self, other) {
-            (Literal(a), Literal(b)) => a == b,
-            (TokenLiteral(a), TokenLiteral(b)) => a == b,
-            (Token(a), Token(b)) => a == b,
-            (Char(a), Char(b)) => a == b,
-            (Named(a), Named(b)) => a == b,
-            (Eof, Eof) => true,
-            _ => false,
-        }
-    }
+#[cfg(test)]
+pub(crate) fn set_cache_dir_for_tests(path: Option<PathBuf>) {
+    let lock = CACHE_DIR_OVERRIDE.get_or_init(|| Mutex::new(None));
+    let mut guard = lock.lock().expect("cache override lock poisoned");
+    *guard = path;
 }
 
-impl Eq for CachedTerminal {}
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
 
-impl Hash for CachedTerminal {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        use CachedTerminal::*;
-        match self {
-            Literal(s) => {
-                0u8.hash(state);
-                s.hash(state);
-            }
-            TokenLiteral(s) => {
-                1u8.hash(state);
-                s.hash(state);
-            }
-            Token(inner) => {
-                2u8.hash(state);
-                inner.hash(state);
-            }
-            Char(c) => {
-                3u8.hash(state);
-                c.hash(state);
-            }
-            CharEscapes => {
-                7u8.hash(state);
-            }
-            Named(s) => {
-                4u8.hash(state);
-                s.hash(state);
-            }
-            Regex(s) => {
-                6u8.hash(state);
-                s.hash(state);
-            }
-            Eof => 5u8.hash(state),
+    use serde::ser::Error as _;
+    use serde::{Deserialize, Serialize, Serializer};
+    use tempfile::tempdir;
+
+    use crate::grammar::edsl;
+    use crate::parsec::words::{self, EndOfInput, Matcher};
+    use crate::{new_grammar, new_grammar_no_cache};
+
+    use super::*;
+
+    #[derive(Debug, Deserialize)]
+    struct FailingSerializeMatcher;
+
+    impl Serialize for FailingSerializeMatcher {
+        fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            Err(S::Error::custom("intentional serialization failure"))
         }
     }
-}
 
-impl fmt::Display for CachedTerminal {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        use CachedTerminal::*;
-        match self {
-            Literal(s) => write!(f, "\"{}\"", s),
-            TokenLiteral(s) => write!(f, "token(\"{}\")", s),
-            Token(inner) => write!(f, "token({})", inner),
-            CharEscapes => write!(f, "characters including escapes"),
-            Char(c) => write!(f, "'{}'", c),
-            Named(n) => write!(f, "{}", n),
-            Eof => write!(f, "EOF"),
-            Regex(s) => write!(f, "regex({})", s),
+    #[typetag::serde]
+    impl Matcher for FailingSerializeMatcher {
+        fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+            if input[*pos..].starts_with("x") {
+                *pos += 1;
+                Some(1)
+            } else {
+                None
+            }
         }
+
+        fn display(&self) -> String {
+            "failing_serialization".to_string()
+        }
+
+        fn is_nullable(&self) -> bool {
+            false
+        }
+
+        fn is_consuming(&self) -> bool {
+            true
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    struct CustomWordMatcher {
+        value: String,
+    }
+
+    #[typetag::serde]
+    impl Matcher for CustomWordMatcher {
+        fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+            if input[*pos..].starts_with(&self.value) {
+                *pos += self.value.len();
+                Some(self.value.len())
+            } else {
+                None
+            }
+        }
+
+        fn display(&self) -> String {
+            format!("custom({})", self.value)
+        }
+
+        fn is_nullable(&self) -> bool {
+            self.value.is_empty()
+        }
+
+        fn is_consuming(&self) -> bool {
+            !self.value.is_empty()
+        }
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_for_builtin_matchers_uses_bundle() {
+        let grammar = new_grammar_no_cache! {
+            start where
+            start -> tt(words::NUMBER) + tt(words::IDENT) + tt(words::STRING) + tt(EndOfInput)
+        };
+
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("builtins.gmx.bin");
+
+        grammar.save_to(&path).expect("save bundle");
+        let bytes = fs::read(&path).expect("read saved bundle");
+        assert_eq!(&bytes[0..4], b"GMXB");
+
+        let loaded = Grammar::load_from(&path).expect("load bundle");
+        assert!(loaded.test("123 abc hello"));
+    }
+
+    #[test]
+    fn composed_matchers_roundtrip_preserves_parse_behavior() {
+        fn start() -> edsl::GrammarNode {
+            let composed = words::named(
+                "composed",
+                words::Repeat::new(
+                    words::Sequence::new(
+                        words::token(words::Alternative::new("alpha", "beta")),
+                        words::token(words::NUMBER),
+                    ),
+                    1..=2,
+                ),
+            );
+            edsl::t(composed) + edsl::t(EndOfInput)
+        }
+
+        let grammar = Grammar::new_uncached(start(), "start").expect("build grammar");
+
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("composed.gmx.bin");
+
+        grammar.save_to(&path).expect("save composed bundle");
+        let loaded = Grammar::load_from(&path).expect("load composed bundle");
+
+        assert!(loaded.test("alpha1"));
+        assert!(loaded.test("beta2 alpha3"));
+        assert!(!loaded.test("gamma1"));
+    }
+
+    #[test]
+    fn custom_typetag_matcher_roundtrip_works_without_cache_hardcoding() {
+        let grammar = new_grammar_no_cache! {
+            start where
+            start -> t(words::token(CustomWordMatcher { value: "hello".to_string() })) + t(EndOfInput)
+        };
+
+        let dir = tempdir().expect("temp dir");
+        let path = dir.path().join("custom.gmx.bin");
+
+        grammar.save_to(&path).expect("save custom bundle");
+        let loaded = Grammar::load_from(&path).expect("load custom bundle");
+
+        assert!(loaded.test("hello"));
+        assert!(!loaded.test("world"));
+    }
+
+    #[test]
+    fn non_serializable_matcher_is_rejected() {
+        fn start() -> edsl::GrammarNode {
+            edsl::t(FailingSerializeMatcher) + edsl::t(EndOfInput)
+        }
+
+        let err = match Grammar::new_uncached(start(), "start") {
+            Ok(_) => panic!("expected uncacheable matcher error"),
+            Err(err) => err,
+        };
+        match err {
+            GrammarError::UncacheableMatcher(message) => {
+                assert!(message.contains("failing_serialization"));
+            }
+            _ => panic!("unexpected error: {:?}", err),
+        }
+    }
+
+    #[test]
+    fn cache_store_and_load_use_bundle_format() {
+        let temp = tempdir().expect("temp dir");
+        set_cache_dir_for_tests(Some(temp.path().to_path_buf()));
+
+        let grammar = new_grammar! {
+            start where
+            start -> tt(words::NUMBER) + tt(EndOfInput)
+        };
+
+        let cache_key = 0xDEADBEEF;
+        store(cache_key, grammar).expect("store cache");
+
+        let cache_path = cache_file_path(cache_key);
+        let bytes = fs::read(&cache_path).expect("read cache file");
+        assert_eq!(&bytes[0..4], b"GMXB");
+
+        let loaded = Box::leak(Box::new(load(cache_key).expect("load cache file")));
+        assert!(loaded.test("42"));
+
+        set_cache_dir_for_tests(None);
+    }
+
+    #[test]
+    fn corrupt_bundle_and_legacy_inputs_fail_cleanly() {
+        let grammar = new_grammar_no_cache! {
+            start where
+            start -> tt(words::NUMBER) + tt(EndOfInput)
+        };
+        let mut bytes = serialize_grammar_file(grammar).expect("serialize bundle");
+
+        bytes[0] = b'X';
+        let err = match deserialize_grammar_file(&bytes) {
+            Ok(_) => panic!("invalid magic must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("invalid grammar bundle"));
+
+        let legacy = bincode::serialize(&42u32).expect("serialize legacy payload");
+        let err = match deserialize_grammar_file(&legacy) {
+            Ok(_) => panic!("legacy payload must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("invalid grammar bundle"));
+
+        let mut truncated = serialize_grammar_file(grammar).expect("serialize bundle");
+        truncated.truncate(10);
+        let err = match deserialize_grammar_file(&truncated) {
+            Ok(_) => panic!("truncated bundle must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("invalid grammar bundle"));
+
+        let mut tmp = tempfile::NamedTempFile::new().expect("tmp file");
+        tmp.write_all(&legacy).expect("write legacy");
+        let err = match Grammar::load_from(tmp.path()) {
+            Ok(_) => panic!("legacy load must fail"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("invalid grammar bundle"));
     }
 }

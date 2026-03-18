@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use rust_embed::Embed;
 use rustc_hash::FxHashMap;
 
@@ -12,16 +10,12 @@ use crate::{
     parsec::{
         self,
         view::{ViewAction, Viewer},
-        words::{self, EndOfInput, IDENT, Matcher, NUMBER, NamedMatcher, RegexMatcher, STRING},
+        words::{self, EndOfInput, IDENT, IntoMatcher, NUMBER, RegexMatcher, STRING},
     },
     utils::Span,
 };
 
 thread_local! {
-    static REGEXP_MATCHER: NamedMatcher<RegexMatcher> = NamedMatcher::new(
-        "regexp",
-        RegexMatcher::new(r#"([^/\\\r\n]|\\.)+"#),
-    );
     #[allow(dead_code)]
     static GRAMMAX_DSL_GRAMMAR_PROTOTYPE: &'static Grammar = new_grammar_no_cache! {
         table where
@@ -40,7 +34,7 @@ thread_local! {
         primary -> r!(token) | r!(literal) | r!(regexp)
         token -> tt("IDENT") | tt("STRING") | tt("NUMBER") | tt("ALPHANUMBER") | tt("ALPHABETS") | tt("EOF")
         literal -> tt('"') + t(STRING) + t('"')
-        regexp -> tt('/') + t(REGEXP_MATCHER.with(|x| x.clone())) + t('/')
+        regexp -> tt('/') + t(words::named("regexp", RegexMatcher::new(r#"([^/\\\r\n]|\\.)+"#))) + t('/')
     };
 }
 
@@ -290,11 +284,11 @@ fn repetition_node(
 }
 
 fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNode {
-    fn mk(raw: bool, matcher: impl Matcher + Send + Sync + 'static, span: Span) -> GrammarNode {
-        let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
-            Arc::new(matcher)
+    fn mk(raw: bool, matcher: impl IntoMatcher, span: Span) -> GrammarNode {
+        let matcher = if raw {
+            matcher.into_matcher_ref()
         } else {
-            Arc::new(words::token(matcher))
+            words::token(matcher).into_matcher_ref()
         };
         GrammarNode::Terminal(matcher, span)
     }
@@ -312,10 +306,10 @@ fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNo
 fn grammar_literal_from_text(text: &str, span: Span, raw: bool) -> GrammarNode {
     let text = text.trim();
     let text = Box::leak(text.to_string().into_boxed_str()) as &'static str;
-    let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
-        Arc::new(text)
+    let matcher = if raw {
+        text.into_matcher_ref()
     } else {
-        Arc::new(words::token(text))
+        words::token(text).into_matcher_ref()
     };
     GrammarNode::Terminal(matcher, span)
 }
@@ -323,10 +317,10 @@ fn grammar_literal_from_text(text: &str, span: Span, raw: bool) -> GrammarNode {
 fn grammar_regex_from_text(pattern: &str, span: Span, raw: bool) -> GrammarNode {
     let normalized = pattern.replace("\\/", "/");
     let matcher = words::regex(&normalized);
-    let matcher: Arc<dyn Matcher + Send + Sync> = if raw {
-        Arc::new(matcher)
+    let matcher = if raw {
+        matcher.into_matcher_ref()
     } else {
-        Arc::new(words::token(matcher))
+        words::token(matcher).into_matcher_ref()
     };
     GrammarNode::Terminal(matcher, span)
 }
@@ -367,7 +361,7 @@ regexp -> "/" !/([^\/\\\r\n]|\\.)+/ !"/"
 
         let result = parser.parse_text(text);
 
-        let output = result.format_ast();
+        let _output = result.format_ast();
 
         // println!("AST {}:\n{}", text, output);
         // println!("Messages:\n{}", result.format_messages());

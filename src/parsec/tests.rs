@@ -1,4 +1,5 @@
 use crate::new_grammar;
+use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
 use crate::parsec::words::{EndOfInput, NUMBER, STRING};
 
@@ -117,4 +118,47 @@ fn test_recovery_strategy_is_wired_for_current_text() {
 
     println!("{}", output);
     println!("Messages:\n{}", result.format_messages());
+}
+
+#[test]
+fn test_delimited_content_with_custom_delimiter() {
+    let grammar = new_grammar!(
+        start where
+        start -> r!(single_quoted) + tt(EndOfInput)
+        single_quoted -> tt("'")
+            + t(crate::parsec::words::RegexMatcher::new(r#"[^']*"#))
+            + tt("'")
+    );
+
+    let mut parser = Parser::new(grammar);
+    let result = parser.parse_text("'abc'");
+
+    assert!(
+        result.messages.is_empty(),
+        "expected successful parse, got: {}",
+        result.format_messages()
+    );
+}
+
+#[test]
+fn test_custom_delimiter_recovery_inserts_missing_close() {
+    let grammar = new_grammar!(
+        start where
+        start -> r!(single_quoted) + tt(EndOfInput)
+        single_quoted -> tt("'")
+            + t(crate::parsec::words::RegexMatcher::new(r#"[^']*"#))
+            + tt("'")
+    );
+
+    let mut parser = Parser::new(grammar);
+    let result = parser.parse_text("'abc");
+
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| matches!(m.message, ErrorMessage::MissingToken { .. })),
+        "expected missing-token recovery, got: {}",
+        result.format_messages()
+    );
 }

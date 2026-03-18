@@ -103,6 +103,9 @@ pub fn main() {
             grammar,
             interactive_mode,
         }) => {
+            #[cfg(not(feature = "webui"))]
+            let _ = &interactive_mode;
+
             let grammar = match Grammar::load_from(&grammar) {
                 Ok(g) => g,
                 Err(e) => {

@@ -25,6 +25,16 @@ pub struct BridgeSpec {
     pub precedence: Vec<TerminalPrecedence>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DelimitedTerminalRule {
+    /// Opening delimiter terminal index.
+    pub open: usize,
+    /// Closing delimiter terminal index.
+    pub close: usize,
+    /// Content terminals that are valid only inside this delimiter pair.
+    pub content: Vec<usize>,
+}
+
 pub fn derive_recovery_delimiters(table: &RuleTable) -> Vec<usize> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -54,33 +64,92 @@ pub fn derive_recovery_delimiters(table: &RuleTable) -> Vec<usize> {
     out
 }
 
-/// Detects terminals that have the same delimiter on both ends (e.g., strings delimited by `"`).
-/// These are typically content matchers that are wrapped by literal delimiters.
-pub fn derive_bracketed_terminals(table: &RuleTable) -> Vec<usize> {
-    let mut bracketed = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+/// Derive delimiter rules for "content terminals between delimiters", e.g.
+/// `" ... STRING ... "` or `/* ... CONTENT ... */`.
+pub fn derive_delimited_terminal_rules(table: &RuleTable) -> Vec<DelimitedTerminalRule> {
+    let mut content_by_pair: FxHashMap<(usize, usize), FxHashSet<usize>> = FxHashMap::default();
 
-    // Check for named matchers that are bracketed types (e.g., "string", "ident")
-    // These are commonly wrapped by matching delimiter literals in the grammar
-    for (idx, matcher) in table.terminals.iter().enumerate() {
-        let display = matcher.display();
+    for prod in &table.productions {
+        let rhs = &prod.rhs;
+        for i in 0..rhs.len() {
+            let Symbol::Terminal(open) = rhs[i] else {
+                continue;
+            };
+            let Some(open_preview) = table.terminals[open].preview() else {
+                continue;
+            };
+            if !is_punctuation_literal(open_preview) {
+                continue;
+            }
 
-        // Check if this is a bracketed content matcher
-        if is_bracketed_matcher_type(&display) && seen.insert(idx) {
-            bracketed.push(idx);
+            for j in (i + 2)..rhs.len() {
+                let Symbol::Terminal(close) = rhs[j] else {
+                    continue;
+                };
+                let Some(close_preview) = table.terminals[close].preview() else {
+                    continue;
+                };
+                if !is_punctuation_literal(close_preview) {
+                    continue;
+                }
+
+                let mut content = Vec::new();
+                for sym in &rhs[i + 1..j] {
+                    let Symbol::Terminal(term_idx) = sym else {
+                        continue;
+                    };
+                    if table.terminals[*term_idx].preview().is_none() {
+                        content.push(*term_idx);
+                    }
+                }
+
+                if content.is_empty() {
+                    continue;
+                }
+
+                let entry = content_by_pair.entry((open, close)).or_default();
+                entry.extend(content);
+            }
         }
     }
 
-    bracketed
+    let mut out = content_by_pair
+        .into_iter()
+        .map(|((open, close), content)| {
+            let mut content = content.into_iter().collect::<Vec<_>>();
+            content.sort_unstable();
+            DelimitedTerminalRule {
+                open,
+                close,
+                content,
+            }
+        })
+        .collect::<Vec<_>>();
+    out.sort_by_key(|rule| (rule.open, rule.close));
+    out
 }
 
-/// Determines if a matcher display string represents a bracketed/delimited content type.
-/// Such matchers are typically used for strings, comments, and identifiers within delimiters.
-fn is_bracketed_matcher_type(display: &str) -> bool {
-    matches!(
-        display,
-        "string" | "ident" | "json_string" | "string_content" | "identifier"
-    )
+/// Content terminals that should only be considered while inside an inline
+/// delimiter scope (derived from grammar structure, not matcher names).
+pub fn derive_bracketed_terminals(table: &RuleTable) -> Vec<usize> {
+    let mut out = FxHashSet::default();
+    for rule in derive_delimited_terminal_rules(table) {
+        out.extend(rule.content);
+    }
+    let mut out = out.into_iter().collect::<Vec<_>>();
+    out.sort_unstable();
+    out
+}
+
+pub fn derive_bracketed_delimiters(table: &RuleTable) -> Vec<usize> {
+    let mut out = FxHashSet::default();
+    for rule in derive_delimited_terminal_rules(table) {
+        out.insert(rule.open);
+        out.insert(rule.close);
+    }
+    let mut out = out.into_iter().collect::<Vec<_>>();
+    out.sort_unstable();
+    out
 }
 
 fn is_punctuation_literal(preview: &str) -> bool {

@@ -54,9 +54,6 @@ assert_eq!(pos, 8); // The input position has advanced to the end of the string
 
 ## Custom matchers
 
-> [!WARNING]
-> Due to the design of grammar caching, it is currently not recommended to define custom matchers in Grammax. This is because custom matchers contain function pointers, which cannot be easily invalidated by the caching mechanism. 
-
 There are two ways to define custom matchers in Grammax:
 
 ### The `Matcher` trait
@@ -64,10 +61,12 @@ There are two ways to define custom matchers in Grammax:
 Every matcher mentioned above implements the `Matcher` trait, which defines a common interface for matching input strings. You can implement this trait for your own custom matchers. For example:
 
 ```rust
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SkipToEndMatcher;
 
+#[typetag::serde]
 impl Matcher for SkipToEndMatcher {
-    fn matches<'a>(&self, input: &'a str, pos: &mut usize) -> Option<usize> {
+    fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
         let remaining = &input[*pos..];
         let len = remaining.len();
         *pos += len; // Consume the entire remaining input
@@ -90,15 +89,12 @@ impl Matcher for SkipToEndMatcher {
 
 `matches` is the core method that defines how the matcher works. It takes the input string and a mutable reference to the current position, and returns an `Option<usize>` indicating the length of the matched substring if successful, or `None` if it fails to match. `display` is used for error messages, `is_nullable` indicates whether the matcher can match an empty string, and `is_consuming` indicates whether the matcher advances the input position.
 
-### The `CustomChar` struct
+If you want custom matchers to be persisted through cache and `save_to`, make them serde-serializable and register them with `#[typetag::serde]` as shown above.
 
-`CustomChar` is a convenient wrapper for defining matchers that match a single character based on a custom predicate function. It implements the `Matcher` trait, so you can use it directly in your matcher definitions. For example, you can define a matcher that matches a vowel character like this:
+### The `OneOf` struct
+
+`OneOf` matches a single character from a string set. `OneOf("xxxxx")` means “match one of these characters”. It implements `Matcher`, so you can use it directly in rules. For example:
 
 ```rust
-pub const VOWEL: CustomChar = CustomChar {
-    predicate: |c| "aeiouAEIOU".contains(c),
-    pick: || "aeiouAEIOU",
-    description: "vowel character",
-}
+pub const VOWEL: OneOf = OneOf("aeiouAEIOU");
 ```
-This matcher will match any single character that is a vowel (either lowercase or uppercase). The `predicate` function checks if the character is in the set of vowels, and the `pick` function returns a string of all possible characters that can be matched, which is used for fuzz testing and candidate generation. The `description` field provides a human-readable description of the matcher for error reporting.

@@ -16,7 +16,7 @@ pub struct RecoveryCacheKey {
     stack_hash: u64,
     stack_state: usize,
     pos: usize,
-    string_opened: bool,
+    bracketed_scope_opened: bool,
     scope_hash: u64,
 }
 
@@ -31,9 +31,9 @@ pub enum RepairOp {
 
 #[derive(Debug, Clone)]
 pub struct RecoveryConfig {
-    pub nshifts: usize, // N_shifts from paper: success when we shift this many tokens
-    pub ntry: usize,    // N_try from paper: how far to simulate for ranking
-    pub timeout: Duration, // Timeout from paper (0.5s recommended)
+    pub nshifts: usize,
+    pub ntry: usize,
+    pub timeout: Duration,
 }
 
 impl Default for RecoveryConfig {
@@ -159,7 +159,7 @@ struct Config {
     pos: usize,                       // Position in input
     cost: usize,                      // Cost of repair sequence
     shifts: usize,                    // Number of trailing shifts
-    string_opened: bool,              // Lexer context: inside quote-delimited string
+    bracketed_scope_opened: bool,     // Lexer context: inside delimiter-bounded content
     repairs: Option<Rc<RepairMerge>>, // Repair sequence as graph-structured stack
 }
 
@@ -174,7 +174,7 @@ impl Config {
         if self.pos != other.pos {
             return false;
         }
-        if self.string_opened != other.string_opened {
+        if self.bracketed_scope_opened != other.bracketed_scope_opened {
             return false;
         }
         // Must have compatible repair sequences
@@ -216,7 +216,7 @@ impl Config {
             pos: self.pos,
             cost: self.cost,
             shifts: self.shifts,
-            string_opened: self.string_opened,
+            bracketed_scope_opened: self.bracketed_scope_opened,
             repairs: merged_repairs,
         })
     }
@@ -228,7 +228,7 @@ struct ConfigKey {
     stack_hash: u64,
     stack_state: usize,
     pos: usize,
-    string_opened: bool,
+    bracketed_scope_opened: bool,
 }
 
 // Main CPCT+ recovery function (Section 5 of paper)
@@ -238,10 +238,11 @@ pub fn recover(
     productions: &[Production],
     terminals: &[MatcherRef],
     bracketed_terminals: &[usize],
+    bracketed_delimiters: &[usize],
     text: &str,
     pos: usize,
     stack: &[usize],
-    string_opened: bool,
+    bracketed_scope_opened: bool,
     config: &RecoveryConfig,
     cache: Option<&mut RecoveryCache>,
     bridge_specs: &[BridgeSpec],
@@ -257,7 +258,7 @@ pub fn recover(
         stack_hash,
         stack_state: *stack.last().unwrap(),
         pos,
-        string_opened,
+        bracketed_scope_opened,
         scope_hash,
     };
     if let Some(cache) = cache.as_ref() {
@@ -281,7 +282,7 @@ pub fn recover(
         pos,
         cost: 0,
         shifts: 0,
-        string_opened,
+        bracketed_scope_opened,
         repairs: None,
     };
     buckets[0].push_back(initial_cfg);
@@ -292,7 +293,7 @@ pub fn recover(
     let mut successful: Vec<Config> = Vec::new();
     let mut min_cost: Option<usize> = None;
 
-    let token_stream = TokenStream::new(terminals, bracketed_terminals, text);
+    let token_stream = TokenStream::new(terminals, bracketed_terminals, bracketed_delimiters, text);
     let insert_candidates = build_insert_candidates(analysis, terminals);
 
     // Breadth-first search by cost
@@ -320,7 +321,7 @@ pub fn recover(
                 stack_hash: cfg.stack.hash,
                 stack_state: cfg.stack.state,
                 pos: cfg.pos,
-                string_opened: cfg.string_opened,
+                bracketed_scope_opened: cfg.bracketed_scope_opened,
             };
 
             if let Some(existing_configs) = visited.get_mut(&key) {
@@ -357,7 +358,14 @@ pub fn recover(
             // Generate neighbors using →CR rules (Figure 5)
 
             // CR Shift (up to 1 shift at a time, per CR Shift 3)
-            if let Some(next) = cr_shift(analysis, productions, terminals, &token_stream, &cfg) {
+            if let Some(next) = cr_shift(
+                analysis,
+                productions,
+                terminals,
+                bracketed_delimiters,
+                &token_stream,
+                &cfg,
+            ) {
                 if next.cost < buckets.len() {
                     buckets[next.cost].push_back(next);
                 }
@@ -401,6 +409,7 @@ pub fn recover(
         analysis,
         productions,
         terminals,
+        bracketed_delimiters,
         &token_stream,
         successful,
         config.ntry,
@@ -417,6 +426,7 @@ fn cr_shift(
     analysis: &GrammarStateAnalysis,
     productions: &[Production],
     terminals: &[MatcherRef],
+    bracketed_delimiters: &[usize],
     tokens: &TokenStream,
     cfg: &Config,
 ) -> Option<Config> {
@@ -432,18 +442,19 @@ fn cr_shift(
 
     // Create new repair sequence with a Shift operation
     let new_repairs = RepairMerge::new(RepairOp::Shift, cfg.repairs.clone());
-    let next_string_opened = if is_quote_terminal(terminals, term) {
-        !cfg.string_opened
-    } else {
-        cfg.string_opened
-    };
+    let next_bracketed_scope_opened = advance_bracketed_scope(
+        cfg.bracketed_scope_opened,
+        terminals,
+        bracketed_delimiters,
+        term,
+    );
 
     Some(Config {
         stack: new_stack,
         pos: cfg.pos + len,
         cost: cfg.cost, // Shifts cost 0
         shifts: cfg.shifts + 1,
-        string_opened: next_string_opened,
+        bracketed_scope_opened: next_bracketed_scope_opened,
         repairs: Some(new_repairs),
     })
 }
@@ -485,7 +496,7 @@ fn cr_insert(
                     pos: cfg.pos,       // Insert doesn't advance position
                     cost: cfg.cost + 1, // Inserts cost 1
                     shifts: cfg.shifts,
-                    string_opened: cfg.string_opened,
+                    bracketed_scope_opened: cfg.bracketed_scope_opened,
                     repairs: Some(new_repairs),
                 });
             }
@@ -561,7 +572,7 @@ fn cr_delete(tokens: &TokenStream, cfg: &Config) -> Option<Config> {
         pos: cfg.pos + len, // Delete advances position
         cost: cfg.cost + 1, // Deletes cost 1
         shifts: cfg.shifts,
-        string_opened: cfg.string_opened,
+        bracketed_scope_opened: cfg.bracketed_scope_opened,
         repairs: Some(new_repairs),
     })
 }
@@ -571,6 +582,7 @@ fn rank_and_select(
     analysis: &GrammarStateAnalysis,
     productions: &[Production],
     terminals: &[MatcherRef],
+    bracketed_delimiters: &[usize],
     tokens: &TokenStream,
     successful: Vec<Config>,
     ntry: usize,
@@ -587,8 +599,9 @@ fn rank_and_select(
                 analysis,
                 productions,
                 terminals,
+                bracketed_delimiters,
                 tokens,
-                cfg.string_opened,
+                cfg.bracketed_scope_opened,
                 &cfg.stack,
                 cfg.pos,
                 ntry,
@@ -637,8 +650,9 @@ fn simulate_progress(
     analysis: &GrammarStateAnalysis,
     productions: &[Production],
     terminals: &[MatcherRef],
+    bracketed_delimiters: &[usize],
     tokens: &TokenStream,
-    mut string_opened: bool,
+    mut bracketed_scope_opened: bool,
     stack: &Rc<StackNode>,
     mut pos: usize,
     max_tokens: usize,
@@ -669,9 +683,12 @@ fn simulate_progress(
 
         cur = next;
         pos += len;
-        if is_quote_terminal(terminals, term) {
-            string_opened = !string_opened;
-        }
+        bracketed_scope_opened = advance_bracketed_scope(
+            bracketed_scope_opened,
+            terminals,
+            bracketed_delimiters,
+            term,
+        );
         consumed += 1;
     }
 
@@ -690,11 +707,16 @@ struct TokenStream {
 }
 
 impl TokenStream {
-    fn new(terminals: &[MatcherRef], bracketed_terminals: &[usize], text: &str) -> Self {
+    fn new(
+        terminals: &[MatcherRef],
+        bracketed_terminals: &[usize],
+        bracketed_delimiters: &[usize],
+        text: &str,
+    ) -> Self {
         let mut tokens = Vec::new();
         let mut index_by_start = FxHashMap::default();
         let mut pos = 0usize;
-        let mut string_opened = false;
+        let mut bracketed_scope_opened = false;
 
         while pos < text.len() {
             if text[pos..].trim().is_empty() {
@@ -708,7 +730,14 @@ impl TokenStream {
                 break;
             }
 
-            let (term, len) = lex_at_text(terminals, bracketed_terminals, text, pos, string_opened);
+            let (term, len) = lex_at_text(
+                terminals,
+                bracketed_terminals,
+                bracketed_delimiters,
+                text,
+                pos,
+                bracketed_scope_opened,
+            );
             if term == EOF_TOKEN && len == 0 {
                 break;
             }
@@ -733,9 +762,12 @@ impl TokenStream {
             tokens.push(Token { term, len });
             index_by_start.insert(pos, idx);
             pos += len;
-            if is_quote_terminal(terminals, term) {
-                string_opened = !string_opened;
-            }
+            bracketed_scope_opened = advance_bracketed_scope(
+                bracketed_scope_opened,
+                terminals,
+                bracketed_delimiters,
+                term,
+            );
         }
 
         Self {
@@ -885,9 +917,10 @@ fn reduce_stack(
 fn lex_at_text(
     terminals: &[MatcherRef],
     bracketed_terminals: &[usize],
+    bracketed_delimiters: &[usize],
     text: &str,
     pos: usize,
-    string_opened: bool,
+    bracketed_scope_opened: bool,
 ) -> (usize, usize) {
     let bounded_pos = pos.min(text.len());
     let rest = &text[bounded_pos..];
@@ -898,39 +931,37 @@ fn lex_at_text(
         #[cfg(test)]
         let trace_recover = std::env::var("TRACE_RECOVER_LEX").is_ok();
 
-        if !string_opened && bracketed_terminals.contains(&idx) {
-            continue;
-        }
-        // Inside a string, skip "opening-quote" style terminals (those with a
-        // whitespace-consuming prefix, like `char_predicate* "`).  They are
-        // designed for starting a string value and should not consume the
-        // closing quote inside an already-open string. The exact closing-quote
-        // terminal (without a whitespace prefix) will be selected instead.
-        if string_opened
-            && matcher.preview() == Some("\"")
-            && matcher.display().contains("char_predicate")
-        {
-            #[cfg(test)]
-            if trace_recover {
-                eprintln!(
-                    "[recover_lex] skip-quote idx={} display={} pos={} rest={:?}",
-                    idx,
-                    matcher.display(),
-                    pos,
-                    rest
-                );
-            }
+        if !bracketed_scope_opened && bracketed_terminals.contains(&idx) {
             continue;
         }
         let mut test_pos = 0;
         if let Some(len) = matcher.matches(rest, &mut test_pos) {
             // Recovery tokenization must advance through input, so zero-length
             // matches are only valid at true boundary (EOF/trailing whitespace).
-            if len == 0 && !at_boundary {
+            if len == 0
+                && !(at_boundary
+                    || starts_with_bracketed_delimiter(rest, terminals, bracketed_delimiters))
+            {
                 continue;
             }
-            // Keep longest match
-            if best_match.iter().all(|&(_, best_len)| len > best_len) {
+            let candidate_score =
+                candidate_rank(idx, matcher, bracketed_delimiters, bracketed_scope_opened);
+            let should_replace = match best_match {
+                None => true,
+                Some((_best_idx, best_len)) if len > best_len => true,
+                Some((best_idx, best_len)) if len == best_len => {
+                    let best_rank = candidate_rank(
+                        best_idx,
+                        &terminals[best_idx],
+                        bracketed_delimiters,
+                        bracketed_scope_opened,
+                    );
+                    candidate_score > best_rank
+                }
+                _ => false,
+            };
+
+            if should_replace {
                 #[cfg(test)]
                 if trace_recover {
                     eprintln!(
@@ -954,27 +985,70 @@ fn lex_at_text(
         (EOF_TOKEN, 0)
     } else {
         // Unknown token
-        let len = unknown_token_len(terminals, bracketed_terminals, text, pos, string_opened);
+        let len = unknown_token_len(
+            terminals,
+            bracketed_terminals,
+            bracketed_delimiters,
+            text,
+            pos,
+            bracketed_scope_opened,
+        );
         (UNKNOWN_TOKEN, len)
     }
 }
 
-fn is_quote_terminal(terminals: &[MatcherRef], term_ix: usize) -> bool {
-    terminals.get(term_ix).is_some_and(|matcher| {
-        let display = matcher.display();
-        matcher.preview().is_some_and(|preview| preview == "\"")
-            || display == "'\"'"
-            || display.ends_with(" '\"'")
-    })
+fn is_bracketed_delimiter(bracketed_delimiters: &[usize], term_ix: usize) -> bool {
+    bracketed_delimiters.contains(&term_ix)
+}
+
+fn advance_bracketed_scope(
+    current: bool,
+    _terminals: &[MatcherRef],
+    bracketed_delimiters: &[usize],
+    term_ix: usize,
+) -> bool {
+    if is_bracketed_delimiter(bracketed_delimiters, term_ix) {
+        !current
+    } else {
+        current
+    }
+}
+
+fn starts_with_bracketed_delimiter(
+    rest: &str,
+    terminals: &[MatcherRef],
+    bracketed_delimiters: &[usize],
+) -> bool {
+    bracketed_delimiters
+        .iter()
+        .filter_map(|idx| terminals.get(*idx))
+        .filter_map(|matcher| matcher.preview())
+        .any(|preview| rest.starts_with(preview))
+}
+
+fn candidate_rank(
+    idx: usize,
+    matcher: &MatcherRef,
+    bracketed_delimiters: &[usize],
+    bracketed_scope_opened: bool,
+) -> u8 {
+    let literal = matcher.preview().is_some();
+    let delimiter = is_bracketed_delimiter(bracketed_delimiters, idx);
+    match (bracketed_scope_opened, delimiter, literal) {
+        (true, true, _) => 2,
+        (_, _, true) => 1,
+        _ => 0,
+    }
 }
 
 // Calculate length of unknown token
 fn unknown_token_len(
     terminals: &[MatcherRef],
     bracketed_terminals: &[usize],
+    bracketed_delimiters: &[usize],
     text: &str,
     pos: usize,
-    string_opened: bool,
+    bracketed_scope_opened: bool,
 ) -> usize {
     if pos >= text.len() {
         return 0;
@@ -982,7 +1056,14 @@ fn unknown_token_len(
     let rest = &text[pos..];
     for (offset, _) in rest.char_indices().skip(1) {
         let abs = pos + offset;
-        if any_terminal_matches_at(terminals, bracketed_terminals, text, abs, string_opened) {
+        if any_terminal_matches_at(
+            terminals,
+            bracketed_terminals,
+            bracketed_delimiters,
+            text,
+            abs,
+            bracketed_scope_opened,
+        ) {
             return offset;
         }
     }
@@ -992,21 +1073,24 @@ fn unknown_token_len(
 fn any_terminal_matches_at(
     terminals: &[MatcherRef],
     bracketed_terminals: &[usize],
+    bracketed_delimiters: &[usize],
     text: &str,
     pos: usize,
-    string_opened: bool,
+    bracketed_scope_opened: bool,
 ) -> bool {
     if pos >= text.len() {
         return false;
     }
     let rest = &text[pos..];
     for (idx, matcher) in terminals.iter().enumerate() {
-        if !string_opened && bracketed_terminals.contains(&idx) {
+        if !bracketed_scope_opened && bracketed_terminals.contains(&idx) {
             continue;
         }
         let mut test_pos = 0;
         if matcher.matches(rest, &mut test_pos).is_some() {
-            if test_pos == 0 && !rest.starts_with('"') {
+            if test_pos == 0
+                && !starts_with_bracketed_delimiter(rest, terminals, bracketed_delimiters)
+            {
                 continue;
             }
             return true;

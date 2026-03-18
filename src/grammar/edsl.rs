@@ -1,9 +1,6 @@
-use std::{
-    ops::{self, RangeBounds},
-    sync::Arc,
-};
+use std::ops::{self, RangeBounds};
 
-use crate::parsec::words::{Matcher, MatcherRef, token};
+use crate::parsec::words::{IntoMatcher, MatcherRef, token};
 use crate::utils::Span;
 use rustc_hash::FxHashMap;
 
@@ -58,13 +55,13 @@ pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
 }
 
 /// Defines a terminal matcher in the grammar.
-pub fn t<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Arc::new(matcher), Span::empty())
+pub fn t<M: IntoMatcher>(matcher: M) -> GrammarNode {
+    GrammarNode::Terminal(matcher.into_matcher_ref(), Span::empty())
 }
 
 /// Defines a terminal matcher which skips leading trivia (whitespace/newlines).
-pub fn tt<M: Matcher + Send + Sync + 'static>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(Arc::new(token(matcher)), Span::empty())
+pub fn tt<M: IntoMatcher>(matcher: M) -> GrammarNode {
+    GrammarNode::Terminal(token(matcher).into_matcher_ref(), Span::empty())
 }
 
 /// Defines a sequence of grammar nodes.

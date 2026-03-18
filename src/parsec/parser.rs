@@ -126,7 +126,7 @@ pub struct Parser {
 
     // For incremental/reparsing (stubs)
     inc_insert_pos: Option<usize>,
-    string_opened: bool,
+    bracketed_scope_opened: bool,
     reuse_enabled: bool,
     reuse_cache_failures: bool,
     reuse_cache: LruCache<ParseRuleCacheKey, ParseRuleCacheEntry>,
@@ -148,7 +148,7 @@ impl Parser {
             text: String::new(),
             pos: 0,
             inc_insert_pos: None,
-            string_opened: false,
+            bracketed_scope_opened: false,
             reuse_enabled: true,
             reuse_cache_failures: true,
             reuse_cache: LruCache::new(DEFAULT_REUSE_CAPACITY),
@@ -204,7 +204,7 @@ impl Parser {
         self.messages.clear();
         self.newly_computed_nodes.clear();
         self.newly_computed_tokens.clear();
-        self.string_opened = false;
+        self.bracketed_scope_opened = false;
         self.recovery_cache.clear();
 
         // LR Parsing Loop
@@ -228,9 +228,7 @@ impl Parser {
             if let Some(action) = action {
                 match action {
                     Action::Shift(next_state) => {
-                        if self.is_quote_terminal(term_idx) {
-                            self.string_opened = !self.string_opened;
-                        }
+                        self.update_bracketed_scope(term_idx);
                         if let Tag::Error(_) = self.alloc.get_node(token_node).tag {
                             self.messages.push(ParserMessage::new_unexpected(
                                 Span::new(self.pos, self.pos + token_len),
@@ -483,10 +481,11 @@ impl Parser {
                     &self.grammar.table.productions,
                     &self.grammar.table.terminals,
                     &self.grammar.bracketed_terminals,
+                    &self.grammar.bracketed_delimiters,
                     &self.text,
                     self.pos,
                     &state_stack,
-                    self.string_opened,
+                    self.bracketed_scope_opened,
                     &self.config.recovery,
                     Some(&mut self.recovery_cache),
                     &self.grammar.bridge_specs,
@@ -586,10 +585,10 @@ impl Parser {
         }
 
         let old_pos = self.pos;
-        let old_string_opened = self.string_opened;
+        let old_bracketed_scope_opened = self.bracketed_scope_opened;
 
         self.pos = pos;
-        self.string_opened = false;
+        self.bracketed_scope_opened = false;
 
         let parse_end = pos + expected_width;
         let analysis = self.analysis_for_rule(rule_ix);
@@ -612,16 +611,14 @@ impl Parser {
                     cache_key,
                     pos,
                     old_pos,
-                    old_string_opened,
+                    old_bracketed_scope_opened,
                     expected_width,
                 );
             };
 
             match action {
                 Action::Shift(next_state) => {
-                    if self.is_quote_terminal(term_idx) {
-                        self.string_opened = !self.string_opened;
-                    }
+                    self.update_bracketed_scope(term_idx);
                     if let Tag::Error(_) = self.alloc.get_node(token_node).tag {
                         self.messages.push(ParserMessage::new_unexpected(
                             Span::new(self.pos, self.pos + token_len),
@@ -652,7 +649,7 @@ impl Parser {
                             cache_key,
                             pos,
                             old_pos,
-                            old_string_opened,
+                            old_bracketed_scope_opened,
                             expected_width,
                         );
                     }
@@ -668,7 +665,7 @@ impl Parser {
                 cache_key,
                 pos,
                 old_pos,
-                old_string_opened,
+                old_bracketed_scope_opened,
                 expected_width,
             );
         };
@@ -678,7 +675,7 @@ impl Parser {
                 cache_key,
                 pos,
                 old_pos,
-                old_string_opened,
+                old_bracketed_scope_opened,
                 expected_width,
             );
         }
@@ -687,7 +684,7 @@ impl Parser {
             .push(Span::new(pos, pos + parsed_rule_width));
 
         self.pos = old_pos;
-        self.string_opened = old_string_opened;
+        self.bracketed_scope_opened = old_bracketed_scope_opened;
         if self.messages.is_empty() {
             self.prime_reuse_from_tree(parsed_rule_green, pos);
         } else {
@@ -707,11 +704,11 @@ impl Parser {
         cache_key: ParseRuleCacheKey,
         pos: usize,
         old_pos: usize,
-        old_string_opened: bool,
+        old_bracketed_scope_opened: bool,
         expected_width: usize,
     ) -> Option<GreenId> {
         self.pos = old_pos;
-        self.string_opened = old_string_opened;
+        self.bracketed_scope_opened = old_bracketed_scope_opened;
 
         if self.messages.is_empty() {
             self.messages.push(ParserMessage::new_unexpected(
@@ -945,7 +942,7 @@ impl Parser {
         let mut best_match: Option<(usize, usize)> = None;
 
         let mut consider = |idx: usize, matcher: &crate::parsec::words::MatcherRef| {
-            if self.is_bracketed_terminal(idx) && !self.string_opened {
+            if self.is_bracketed_terminal(idx) && !self.bracketed_scope_opened {
                 return;
             }
             let mut probe = self.pos;
@@ -954,7 +951,7 @@ impl Parser {
                     return;
                 }
                 let len = probe - self.pos;
-                if len == 0 && !(at_boundary || rest.starts_with('"')) {
+                if len == 0 && !(at_boundary || self.starts_with_bracketed_delimiter(rest)) {
                     return;
                 }
                 if best_match.iter().all(|&(_, best_len)| len > best_len) {
@@ -993,7 +990,7 @@ impl Parser {
         let mut best_match: Option<(usize, usize)> = None;
 
         let mut consider = |idx: usize, matcher: &crate::parsec::words::MatcherRef| {
-            if self.is_bracketed_terminal(idx) && !self.string_opened {
+            if self.is_bracketed_terminal(idx) && !self.bracketed_scope_opened {
                 return;
             }
             let mut probe = self.pos;
@@ -1002,9 +999,9 @@ impl Parser {
                     return;
                 }
                 let len = probe - self.pos;
-                // Allow nullable terminals only at a real parse boundary, except json string body
-                // where empty content is valid before a closing quote.
-                if len == 0 && !(at_boundary || rest.starts_with('"')) {
+                // Allow nullable terminals only at a real parse boundary, except when
+                // delimiter-bounded content can legally be empty before its closer.
+                if len == 0 && !(at_boundary || self.starts_with_bracketed_delimiter(rest)) {
                     return;
                 }
                 if best_match.iter().all(|&(_, best_len)| len > best_len) {
@@ -1078,7 +1075,7 @@ impl Parser {
             return false;
         }
         for (idx, matcher) in self.grammar.table.terminals.iter().enumerate() {
-            if self.is_bracketed_terminal(idx) && !self.string_opened {
+            if self.is_bracketed_terminal(idx) && !self.bracketed_scope_opened {
                 continue;
             }
             let mut probe = pos;
@@ -1087,7 +1084,9 @@ impl Parser {
                     continue;
                 }
                 let len = probe - pos;
-                if len == 0 && !(pos >= bounded_end || self.text[pos..bounded_end].starts_with('"'))
+                if len == 0
+                    && !(pos >= bounded_end
+                        || self.starts_with_bracketed_delimiter(&self.text[pos..bounded_end]))
                 {
                     continue;
                 }
@@ -1113,7 +1112,10 @@ impl Parser {
                     // (EOF / trailing whitespace) for truncated-input completion.
                     let at_boundary =
                         self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty();
-                    if self.is_bracketed_terminal(term_ix) && !at_boundary {
+                    if self.is_bracketed_terminal(term_ix)
+                        && !at_boundary
+                        && !self.bracketed_scope_opened
+                    {
                         return false;
                     }
                     // If the terminal actually matches at the current position
@@ -1282,8 +1284,8 @@ impl Parser {
 
             match action {
                 Some(Action::Shift(next_state)) => {
-                    if consume_input && self.is_quote_terminal(term) {
-                        self.string_opened = !self.string_opened;
+                    if consume_input {
+                        self.update_bracketed_scope(term);
                     }
                     if consume_input {
                         self.consume(len);
@@ -1951,21 +1953,27 @@ impl Parser {
         ));
     }
 
-    fn is_quote_terminal(&self, term_ix: usize) -> bool {
-        self.grammar
-            .table
-            .terminals
-            .get(term_ix)
-            .is_some_and(|matcher| {
-                let display = matcher.display();
-                matcher.preview().is_some_and(|preview| preview == "\"")
-                    || display == "'\"'"
-                    || display.ends_with(" '\"'")
-            })
-    }
-
     fn is_bracketed_terminal(&self, term_ix: usize) -> bool {
         self.grammar.bracketed_terminals.contains(&term_ix)
+    }
+
+    fn is_bracketed_delimiter(&self, term_ix: usize) -> bool {
+        self.grammar.bracketed_delimiters.contains(&term_ix)
+    }
+
+    fn update_bracketed_scope(&mut self, term_ix: usize) {
+        if self.is_bracketed_delimiter(term_ix) {
+            self.bracketed_scope_opened = !self.bracketed_scope_opened;
+        }
+    }
+
+    fn starts_with_bracketed_delimiter(&self, rest: &str) -> bool {
+        self.grammar
+            .bracketed_delimiters
+            .iter()
+            .filter_map(|term_ix| self.grammar.table.terminals.get(*term_ix))
+            .filter_map(|matcher| matcher.preview())
+            .any(|preview| rest.starts_with(preview))
     }
 }
 

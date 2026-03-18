@@ -138,7 +138,11 @@ You can also use [the DSL](./3-3-dsl.md) to define a grammar. The DSL is a domai
 When defining a grammar, you can write descriptions for some rules using `in_which`. 
 
 ### Caching
-By default, Grammax generates cache for each grammar when it is initialized. Cache files are stored in the default temporary directory of the operating system, and they are automatically invalidated when the grammar definition changes. However, if you want to disable caching for a grammar, you can use the `Grammar::new_uncached` method or the `new_grammar_no_cache!` macro. This will create a grammar that does not use caching, which may be useful for testing or when you want to ensure that the grammar is always recompiled from the source code.
+By default, Grammax generates cache for each grammar when it is initialized. Cache files are stored in the default temporary directory of the operating system, and they are automatically invalidated when the grammar definition changes.
+
+Cache artifacts are always written as grammar bundles (`GMXB` format), the same format used by `save_to`. Legacy non-bundle binaries are not loaded.
+
+If you want to disable caching for a grammar, you can use the `Grammar::new_uncached` method or the `new_grammar_no_cache!` macro. This will create a grammar that does not use caching, which may be useful for testing or when you want to ensure that the grammar is always recompiled from the source code.
 
 ## Test a grammar
 
@@ -160,12 +164,11 @@ In the [parser](./4-parser.md) chapter, we will further talk about the parsing r
 
 ## Compile and save a grammar
 
-> [!WARNING]
-> This feature may violate custom matchers. See [custom matchers](./3-1-words.md#custom-matchers) for more details.
-
 In Grammax, grammar compilation is the process of transforming a grammar definition into an optimized internal representation that can be efficiently executed by the parser. Attriuted to caching, grammars are not compiled every time they are used. 
 
 You can manually save the compiled grammar to a file using the `save_to` method on the grammar instance. This is useful for packing up the grammar and sharing it with others without exposing the source code. The compiled grammar can be loaded later using the `Grammar::load_from` method, which will return a grammar instance that is ready to use.
+
+`save_to` always writes a grammar bundle (`GMXB`), which contains the serialized compiled grammar in one binary artifact.
 
 ```rust
 my_grammar.save_to("my_grammar.bin").unwrap();

@@ -5,7 +5,6 @@ use color_print::cprintln;
 use crate::{
     interface::BasicInterface,
     new_grammar,
-    parsec::words::*,
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
         layers::{AstArena, AstCell, AstVec, NodePath, ParseTreeIR},

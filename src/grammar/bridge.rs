@@ -425,7 +425,6 @@ fn collect_precedence_from_sequence(
 #[cfg(test)]
 mod tests {
     use crate::new_grammar;
-    use crate::parsec::words::{NUMBER, STRING};
 
     #[test]
     fn test_bridge_specs_json() {

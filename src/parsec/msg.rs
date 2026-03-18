@@ -33,4 +33,4 @@ impl ParserMessage {
     }
 }
 
-pub type ParserMessages = Vec<ParserMessage>;
+pub(crate) type ParserMessages = Vec<ParserMessage>;

@@ -25,12 +25,12 @@ use crate::{
 type Command = crate::scheme::Command<ParseTreeIR>;
 
 #[derive(Debug, Clone)]
-pub(crate) struct EditResult {
+pub struct EditResult {
     pub semantic_commands: Vec<Command>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ReparseError {
+pub enum ReparseError {
     NoIncrementalCandidate {
         span: Span,
         delta: isize,
@@ -118,7 +118,7 @@ impl Reparser {
         (focus, steps, level)
     }
 
-    pub(crate) fn handle_edit(
+    pub fn handle_edit(
         &mut self,
         parser: &mut Parser,
         span: Span,
@@ -147,8 +147,6 @@ impl Reparser {
         let old_messages = parser.messages.clone();
         let previous_source_text = parser.text().to_string();
         parser.messages.clear();
-        parser.newly_computed_nodes.clear();
-        parser.newly_computed_tokens.clear();
         parser.set_text(source_text);
         let (focus_node, mut steps, level) = self.get_context(span);
         let delta = new_len as isize - span.len() as isize;
@@ -421,8 +419,6 @@ impl Reparser {
         let expected_width = source_text.len();
 
         parser.messages.clear();
-        parser.newly_computed_nodes.clear();
-        parser.newly_computed_tokens.clear();
         parser.set_insert_pos(None);
 
         let mut green = parser.parse_rule(start_rule, 0, expected_width);
@@ -436,8 +432,6 @@ impl Reparser {
         if needs_recovery {
             parser.clear_reuse_cache();
             parser.messages.clear();
-            parser.newly_computed_nodes.clear();
-            parser.newly_computed_tokens.clear();
             parser.set_insert_pos(None);
             green = parser.parse_rule(start_rule, 0, expected_width);
         }
@@ -451,8 +445,6 @@ impl Reparser {
 
         let green = if needs_full_recovery {
             parser.messages.clear();
-            parser.newly_computed_nodes.clear();
-            parser.newly_computed_tokens.clear();
             parser.set_insert_pos(None);
             parser.parse_text(source_text).root.green
         } else {
@@ -690,7 +682,7 @@ pub struct Zipper {
 }
 
 impl Zipper {
-    pub(crate) fn replace_green(&self, alloc: &TreeAllocRef, new_green: usize) -> ReplaceResult {
+    pub fn replace_green(&self, alloc: &TreeAllocRef, new_green: usize) -> ReplaceResult {
         if self.steps.is_empty() {
             let updated_root = Rc::new(RedNode {
                 parent: None,
@@ -727,11 +719,11 @@ impl Zipper {
     }
 }
 
-pub(crate) struct ReplaceResult {
+pub struct ReplaceResult {
     root: Rc<RedNode>,
 }
 
-pub fn collect_affected_zippers(
+fn collect_affected_zippers(
     root: Rc<RedNode>,
     span: Span,
     alloc: &TreeAllocRef,

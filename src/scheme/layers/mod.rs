@@ -13,7 +13,7 @@ pub mod cst;
 pub mod source;
 
 pub(crate) use ast::AstTxnBuilder;
-pub use ast::{AstArena, AstArenaError, AstCell, AstDelta, AstMapAny, AstVec};
+pub use ast::{AstArena, AstArenaError, AstCell, AstDelta, AstVec};
 pub use cst::{
     NodePath, ParseNodeValue, ParseTreeError, ParseTreeIR, ParseTreeQuery, ParseTreeValue,
 };

@@ -193,8 +193,6 @@ fn evaluate_candidate(
     }
 
     ctx.parser.messages.clear();
-    ctx.parser.newly_computed_nodes.clear();
-    ctx.parser.newly_computed_tokens.clear();
 
     ctx.parser.set_insert_pos(None);
 

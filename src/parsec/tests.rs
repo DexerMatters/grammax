@@ -1,11 +1,11 @@
-use crate::new_grammar;
+use crate::new_grammar_no_cache;
+use crate::parsec::ParserConfig;
 use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
-use crate::parsec::words::{EndOfInput, NUMBER, STRING};
 
 #[test]
 fn test_simple_whitespaces() {
-    let grammar = new_grammar!(
+    let grammar = new_grammar_no_cache!(
         start where
         start -> r!(expr) + tt(EndOfInput)
         expr -> r!(list1) | r!(list2)
@@ -16,7 +16,7 @@ fn test_simple_whitespaces() {
 
     let mut parser = Parser::new(grammar);
 
-    println!("Grammar:\n{}", parser.grammar.table);
+    println!("Grammar:\n{}", grammar.table);
 
     let text = "(1 22)";
     let result = parser.parse_text(text);
@@ -34,7 +34,7 @@ fn test_simple_whitespaces() {
 
 #[test]
 fn test_simple_arithmetic_precedence() {
-    let grammar = new_grammar!(
+    let grammar = new_grammar_no_cache!(
         start where
         start -> r!(expr) + tt(EndOfInput)
         expr -> r!(add) | r!(mul) | r!(primary)
@@ -45,7 +45,7 @@ fn test_simple_arithmetic_precedence() {
 
     let mut parser = Parser::new(grammar);
 
-    println!("Grammar:\n{}", parser.grammar.table);
+    println!("Grammar:\n{}", grammar.table);
 
     let text = "8+3";
     let result = parser.parse_text(text);
@@ -69,7 +69,7 @@ fn test_simple_arithmetic_precedence() {
 
 #[test]
 fn test_json() {
-    let grammar = new_grammar!(
+    let grammar = new_grammar_no_cache!(
         start where
         start   -> r!(json) + tt(EndOfInput)
         json    -> r!(object) | r!(array) | r!(string) | r!(number) | r!(boolean) | r!(null)
@@ -84,7 +84,7 @@ fn test_json() {
 
     let mut parser = Parser::new(grammar);
 
-    println!("Grammar:\n{}", parser.grammar.table);
+    println!("Grammar:\n{}", grammar.table);
 
     let text = r#"
 {
@@ -100,7 +100,7 @@ fn test_json() {
 
 #[test]
 fn test_recovery_strategy_is_wired_for_current_text() {
-    let my_grammar = new_grammar! {
+    let my_grammar = new_grammar_no_cache! {
         // The rule to start parsing from
         start where
         // FORMAT: rule_name -> rule_body
@@ -122,7 +122,7 @@ fn test_recovery_strategy_is_wired_for_current_text() {
 
 #[test]
 fn test_delimited_content_with_custom_delimiter() {
-    let grammar = new_grammar!(
+    let grammar = new_grammar_no_cache!(
         start where
         start -> r!(single_quoted) + tt(EndOfInput)
         single_quoted -> tt("'")
@@ -142,7 +142,7 @@ fn test_delimited_content_with_custom_delimiter() {
 
 #[test]
 fn test_custom_delimiter_recovery_inserts_missing_close() {
-    let grammar = new_grammar!(
+    let grammar = new_grammar_no_cache!(
         start where
         start -> r!(single_quoted) + tt(EndOfInput)
         single_quoted -> tt("'")
@@ -160,5 +160,91 @@ fn test_custom_delimiter_recovery_inserts_missing_close() {
             .any(|m| matches!(m.message, ErrorMessage::MissingToken { .. })),
         "expected missing-token recovery, got: {}",
         result.format_messages()
+    );
+}
+
+#[test]
+fn test_disable_error_recovery_stops_missing_token_insertion() {
+    let grammar = new_grammar_no_cache!(
+        start where
+        start -> r!(single_quoted) + tt(EndOfInput)
+        single_quoted -> tt("'")
+            + t(crate::parsec::words::RegexMatcher::new(r#"[^']*"#))
+            + tt("'")
+    );
+
+    let mut parser = Parser::new(grammar).with_config(ParserConfig::new().disable_error_recovery());
+    let result = parser.parse_text("'abc");
+
+    assert!(
+        result
+            .messages
+            .iter()
+            .any(|m| matches!(m.message, ErrorMessage::UnexpectedToken { .. })),
+        "expected unexpected-token error, got: {}",
+        result.format_messages()
+    );
+    assert!(
+        result
+            .messages
+            .iter()
+            .all(|m| !matches!(m.message, ErrorMessage::MissingToken { .. })),
+        "recovery is disabled, but got missing-token repair: {}",
+        result.format_messages()
+    );
+}
+
+#[test]
+fn test_disable_incremental_reuse_skips_parse_rule_cache() {
+    let grammar = new_grammar_no_cache!(
+        start where
+        start -> tt(NUMBER) + tt(EndOfInput)
+    );
+
+    let input = "123";
+    let expected_width = input.len();
+    let start_rule = grammar.table.start_rule;
+
+    let mut parser_with_reuse = Parser::new(grammar);
+    parser_with_reuse.set_text(input);
+    assert!(
+        parser_with_reuse
+            .parse_rule(start_rule, 0, expected_width)
+            .is_some()
+    );
+    let reuse_before = parser_with_reuse.reuse_stats();
+    assert!(
+        parser_with_reuse
+            .parse_rule(start_rule, 0, expected_width)
+            .is_some()
+    );
+    let reuse_after = parser_with_reuse.reuse_stats();
+    assert!(
+        reuse_after.hits > reuse_before.hits,
+        "expected parse_rule cache hit when reuse is enabled"
+    );
+
+    let mut parser_without_reuse =
+        Parser::new(grammar).with_config(ParserConfig::new().disable_incremental_reuse());
+    parser_without_reuse.set_text(input);
+    assert!(
+        parser_without_reuse
+            .parse_rule(start_rule, 0, expected_width)
+            .is_some()
+    );
+    let no_reuse_before = parser_without_reuse.reuse_stats();
+    assert!(
+        parser_without_reuse
+            .parse_rule(start_rule, 0, expected_width)
+            .is_some()
+    );
+    let no_reuse_after = parser_without_reuse.reuse_stats();
+    assert_eq!(
+        no_reuse_after.lookups, no_reuse_before.lookups,
+        "reuse-disabled parser should not perform parse_rule cache lookups"
+    );
+    assert_eq!(
+        no_reuse_after.hits, no_reuse_before.hits,
+        "reuse-disabled parser should not produce parse_rule cache hits"
     );
 }

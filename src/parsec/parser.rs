@@ -12,10 +12,10 @@ use crate::parsec::msg::{ParserMessage, ParserMessages};
 use crate::parsec::recovery::{
     OpenScopeToken, RecoveryCache, RecoveryConfig, RepairOp, ScopeStop, recover, scope_recover,
 };
-use crate::parsec::tree::{GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
+use crate::parsec::tree::{
+    GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt, TreeBuilder,
+};
 use crate::parsec::view::{NodeView, Viewer};
-use crate::scheme::Command;
-use crate::scheme::layers::ParseTreeIR;
 use crate::utils::{LruCache, Span};
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
@@ -23,13 +23,31 @@ const DEFAULT_REUSE_CAPACITY: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct ParserConfig {
-    pub simple_ast: bool,
-    pub recovery: RecoveryConfig,
+    pub(crate) simple_ast: bool,
+    pub(crate) disable_reuse: bool,
+    pub(crate) disable_recovery: bool,
+    pub(crate) recovery: RecoveryConfig,
 }
 
 impl ParserConfig {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub fn disable_simple_ast(mut self) -> Self {
+        self.simple_ast = false;
+        self
+    }
+    pub fn with_recovery_config(mut self, recovery_config: RecoveryConfig) -> Self {
+        self.recovery = recovery_config;
+        self
+    }
+    pub fn disable_incremental_reuse(mut self) -> Self {
+        self.disable_reuse = true;
+        self
+    }
+    pub fn disable_error_recovery(mut self) -> Self {
+        self.disable_recovery = true;
+        self
     }
 }
 
@@ -37,18 +55,19 @@ impl Default for ParserConfig {
     fn default() -> Self {
         Self {
             simple_ast: true,
+            disable_reuse: false,
+            disable_recovery: false,
             recovery: RecoveryConfig::default(),
         }
     }
 }
 
 pub struct Result<'a> {
-    alloc: TreeAllocRef,
-    grammar: &'static Grammar,
-    source: &'a str,
-    pub root: RedNode,
+    pub(crate) alloc: TreeAllocRef,
+    pub(crate) grammar: &'static Grammar,
+    pub(crate) root: RedNode,
+    pub source: &'a str,
     pub messages: ParserMessages,
-    pub semantic_commands: Vec<Command<ParseTreeIR>>,
 }
 
 impl<'a> Result<'a> {
@@ -65,14 +84,7 @@ impl<'a> Result<'a> {
     }
 
     pub fn view(&self) -> NodeView {
-        NodeView::new(
-            self.grammar,
-            self.alloc.clone(),
-            self.source,
-            std::sync::Arc::new(rustc_hash::FxHashMap::default()),
-            self.root.green,
-            0,
-        )
+        NodeView::new(self)
     }
 
     pub fn viewer(&self) -> Viewer {
@@ -113,11 +125,10 @@ struct ParseRuleCacheEntry {
 }
 
 pub struct Parser {
-    pub grammar: &'static Grammar,
-    pub alloc: TreeAllocRef,
-    pub messages: ParserMessages,
-    pub newly_computed_nodes: Vec<Span>,
-    pub newly_computed_tokens: Vec<Span>,
+    pub(crate) messages: ParserMessages,
+
+    pub(crate) alloc: TreeAllocRef,
+    pub(crate) grammar: &'static Grammar,
 
     config: ParserConfig,
 
@@ -142,8 +153,6 @@ impl Parser {
             grammar,
             alloc: TreeAllocRef::create(),
             messages: vec![],
-            newly_computed_nodes: vec![],
-            newly_computed_tokens: vec![],
             config: ParserConfig::default(),
             text: String::new(),
             pos: 0,
@@ -159,6 +168,10 @@ impl Parser {
     }
 
     pub fn with_config(mut self, config: ParserConfig) -> Self {
+        self.reuse_enabled = !config.disable_reuse;
+        if !self.reuse_enabled {
+            self.reuse_cache.clear();
+        }
         self.config = config;
         self
     }
@@ -202,8 +215,6 @@ impl Parser {
         self.recovery_specs_cache = None;
         self.pos = 0;
         self.messages.clear();
-        self.newly_computed_nodes.clear();
-        self.newly_computed_tokens.clear();
         self.bracketed_scope_opened = false;
         self.recovery_cache.clear();
 
@@ -317,6 +328,16 @@ impl Parser {
                     }
                 }
             } else {
+                if self.config.disable_recovery {
+                    let expected = self.expected_ids(*state_stack.last().unwrap());
+                    let end = (self.pos + token_len).min(self.text.len());
+                    self.messages.push(ParserMessage::new_unexpected(
+                        Span::new(self.pos, end),
+                        expected,
+                    ));
+                    break;
+                }
+
                 let lookahead_term = self
                     .peek_terminal(None)
                     .map(|(term_ix, _)| term_ix)
@@ -542,7 +563,9 @@ impl Parser {
         // If non-whitespace input remains, synthetic insertion can keep growing
         // zero-width structures without consuming input (especially on
         // left-recursive grammars), yielding pathological MissingToken chains.
-        if self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty() {
+        if !self.config.disable_recovery
+            && (self.pos >= self.text.len() || self.text[self.pos..].trim().is_empty())
+        {
             self.force_accept(&mut state_stack, &mut node_stack);
         }
 
@@ -555,7 +578,6 @@ impl Parser {
             alloc: self.alloc.clone(),
             root: RedNode::root(root_green),
             messages: self.messages.clone(),
-            semantic_commands: Vec::new(),
         }
     }
 
@@ -571,8 +593,6 @@ impl Parser {
         }
 
         self.messages.clear();
-        self.newly_computed_nodes.clear();
-        self.newly_computed_tokens.clear();
         self.recovery_cache.clear();
 
         let cache_key = self.build_parse_rule_cache_key(
@@ -625,8 +645,6 @@ impl Parser {
                             self.expected_ids_for_analysis(&analysis, current_state_idx, true),
                         ));
                     }
-                    self.newly_computed_tokens
-                        .push(Span::new(self.pos, self.pos + token_len));
                     self.consume(token_len);
                     state_stack.push(next_state);
                     node_stack.push(StackEntry {
@@ -679,10 +697,6 @@ impl Parser {
                 expected_width,
             );
         }
-
-        self.newly_computed_nodes
-            .push(Span::new(pos, pos + parsed_rule_width));
-
         self.pos = old_pos;
         self.bracketed_scope_opened = old_bracketed_scope_opened;
         if self.messages.is_empty() {
@@ -722,9 +736,6 @@ impl Parser {
             vec![],
             expected_width,
         );
-        self.newly_computed_nodes
-            .push(Span::new(pos, pos + expected_width));
-
         self.store_parse_rule_cache(
             cache_key,
             self.text[pos..pos + expected_width].to_string(),
@@ -798,8 +809,6 @@ impl Parser {
                 msg
             })
             .collect();
-        self.newly_computed_nodes.clear();
-        self.newly_computed_tokens.clear();
 
         if let Some(green) = cached.green {
             if matches!(self.alloc.get_node(green).tag, Tag::Error(_)) {
@@ -1642,15 +1651,9 @@ impl Parser {
         let new_node = if passthrough_unexpected {
             children[0]
         } else {
-            let builder =
-                crate::parsec::builder::TreeBuilder::new(&self.grammar, &self.alloc, &self.config);
+            let builder = TreeBuilder::new(&self.grammar, &self.alloc, &self.config);
             builder.build_node(lhs, children)
         };
-
-        let node_width = self.alloc.get_node(new_node).width;
-        let node_start = self.pos - node_width;
-        self.newly_computed_nodes
-            .push(Span::new(node_start, self.pos));
 
         node_stack.push(StackEntry {
             node: new_node,

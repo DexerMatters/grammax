@@ -3,7 +3,6 @@ use std::time::Duration;
 use crate::{
     interface::BasicInterface,
     new_grammar,
-    parsec::words::*,
     runtime::{
         BuildTree, CompilerBuilder, Down, End, Here, Observe, ObservedLayer, Then,
         compiler::insert_at,

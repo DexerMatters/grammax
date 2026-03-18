@@ -1,10 +1,7 @@
 use std::fmt::Write;
 
-use rustc_hash::{FxHashMap, FxHashSet};
-
 use crate::grammar::Grammar;
 use crate::grammar::analysis::EOF_TOKEN;
-use crate::grammar::ir::Symbol;
 use crate::parsec::msg::{ErrorMessage, ParserMessage};
 use crate::parsec::tree::{GreenId, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
 use crate::utils::Span;
@@ -30,46 +27,6 @@ pub fn format_ast(grammar: &Grammar, root: &RedNode, alloc: &TreeAllocRef, sourc
         &mut out,
         &mut stack,
     );
-    out
-}
-
-pub fn format_messages(grammar: &Grammar, messages: &[ParserMessage]) -> String {
-    // Note: This function doesn't have access to source text, so we'll just show byte offsets
-    // To get line:col, call format_messages_with_source instead
-    let mut out = String::new();
-
-    for (idx, msg) in messages.iter().enumerate() {
-        if idx > 0 {
-            out.push('\n');
-        }
-
-        match &msg.message {
-            ErrorMessage::UnexpectedToken { expected } => {
-                let expected = format_expected(grammar, expected);
-                let _ = write!(
-                    out,
-                    "{}Unexpected Token{} at [{}, {}]{}",
-                    RED, RESET, msg.span.start, msg.span.end, expected
-                );
-            }
-            ErrorMessage::MissingToken { expected } => {
-                let expected = format_expected(grammar, expected);
-                let _ = write!(
-                    out,
-                    "{}Missing Token{} at [{}, {}]{}",
-                    RED, RESET, msg.span.start, msg.span.end, expected
-                );
-            }
-            ErrorMessage::Custom(code) => {
-                let _ = write!(
-                    out,
-                    "{}Error{} [{}] at [{}, {}]",
-                    RED, RESET, code, msg.span.start, msg.span.end
-                );
-            }
-        }
-    }
-
     out
 }
 
@@ -477,130 +434,6 @@ fn format_expected_friendly(grammar: &Grammar, expected: &[usize]) -> String {
     } else {
         names.join(", ")
     }
-}
-
-fn format_expected(grammar: &Grammar, expected: &[usize]) -> String {
-    if expected.is_empty() {
-        return String::new();
-    }
-
-    let expected_terms: FxHashSet<usize> = expected
-        .iter()
-        .copied()
-        .filter(|id| *id != EOF_TOKEN)
-        .collect();
-    let first_sets = compute_first_sets(grammar);
-    let mut exact_rules = Vec::new();
-    for (rule_ix, firsts) in &first_sets {
-        let terms: Vec<usize> = firsts.iter().copied().flatten().collect();
-        if terms.is_empty() {
-            continue;
-        }
-        let name = grammar.name(*rule_ix);
-        if terms.len() == expected_terms.len()
-            && terms.iter().all(|t| expected_terms.contains(t))
-            && !name.starts_with('@')
-            && !name.starts_with('$')
-        {
-            exact_rules.push(*rule_ix);
-        }
-    }
-
-    let mut names = Vec::new();
-    if !exact_rules.is_empty() {
-        exact_rules.sort_unstable();
-        exact_rules.dedup();
-        for rule_ix in exact_rules {
-            names.push(format!("rule#{}({})", rule_ix, grammar.name(rule_ix)));
-        }
-    } else {
-        for &id in expected {
-            if id == EOF_TOKEN {
-                names.push("<EOF>".to_string());
-            } else if let Some(matcher) = grammar.table.terminals.get(id) {
-                let mut rule_ids: Vec<(usize, &'static str)> = terminal_rule_ids(grammar, id)
-                    .into_iter()
-                    .filter(|(_, name)| !name.starts_with('@') && !name.starts_with('$'))
-                    .collect();
-                rule_ids.sort_unstable_by_key(|(rule_ix, _)| *rule_ix);
-                rule_ids.dedup_by_key(|(rule_ix, _)| *rule_ix);
-                if !rule_ids.is_empty() {
-                    for (rule_ix, name) in rule_ids {
-                        names.push(format!("rule#{}({})", rule_ix, name));
-                    }
-                } else {
-                    names.push(format!("term#{}({})", id, matcher.display()));
-                }
-            } else {
-                names.push(format!("term#{}", id));
-            }
-        }
-    }
-
-    format!("\n  Expected: {}", names.join(" or "))
-}
-
-fn terminal_rule_ids(grammar: &Grammar, terminal_id: usize) -> Vec<(usize, &'static str)> {
-    let mut out = Vec::new();
-    for prod in &grammar.table.productions {
-        let Some(first) = prod.rhs.first() else {
-            continue;
-        };
-        if let Symbol::Terminal(t) = first {
-            if *t == terminal_id {
-                out.push((prod.lhs, grammar.name(prod.lhs)));
-            }
-        }
-    }
-    out
-}
-
-fn compute_first_sets(grammar: &Grammar) -> FxHashMap<usize, FxHashSet<Option<usize>>> {
-    let mut first_sets: FxHashMap<usize, FxHashSet<Option<usize>>> = FxHashMap::default();
-
-    let mut changed = true;
-    while changed {
-        changed = false;
-        for prod in &grammar.table.productions {
-            let lhs = prod.lhs;
-            let mut nullable = true;
-            for sym in &prod.rhs {
-                match sym {
-                    Symbol::Terminal(t) => {
-                        let set = first_sets.entry(lhs).or_default();
-                        if set.insert(Some(*t)) {
-                            changed = true;
-                        }
-                        nullable = false;
-                        break;
-                    }
-                    Symbol::NonTerminal(rule_ix) => {
-                        let sym_first = first_sets.get(rule_ix).cloned().unwrap_or_default();
-                        for f in sym_first.iter().copied() {
-                            if f.is_some() {
-                                let set = first_sets.entry(lhs).or_default();
-                                if set.insert(f) {
-                                    changed = true;
-                                }
-                            }
-                        }
-                        if !sym_first.contains(&None) {
-                            nullable = false;
-                            break;
-                        }
-                    }
-                }
-            }
-            if nullable {
-                let set = first_sets.entry(lhs).or_default();
-                if set.insert(None) {
-                    changed = true;
-                }
-            }
-        }
-    }
-
-    first_sets
 }
 
 fn pretty_string(s: String) -> String {

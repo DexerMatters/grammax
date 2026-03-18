@@ -10,7 +10,7 @@ use crate::{
     parsec::{
         self,
         view::{ViewAction, Viewer},
-        words::{self, EndOfInput, IDENT, IntoMatcher, NUMBER, RegexMatcher, STRING},
+        words::{self, EndOfInput, IDENT, IntoMatcher, NUMBER, STRING},
     },
     utils::Span,
 };
@@ -338,7 +338,7 @@ mod tests {
             .unwrap();
         let mut parser = Parser::new(grammar);
 
-        println!("Grammar:\n{}", parser.grammar.table);
+        println!("Grammar:\n{}", grammar.table);
 
         let text = r#"
 table -> rule{"\n"}* EOF

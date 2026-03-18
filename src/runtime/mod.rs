@@ -8,7 +8,7 @@ pub mod dispatcher;
 pub mod protocol;
 pub mod service;
 
-pub use crate::scheme::passes::{ParserPass, Reparser, ReparserConfig};
+pub use crate::scheme::passes::ParserPass;
 pub use crate::scheme::{LayerName, PassId};
 pub use compiler::{
     Another, BuildTree, CompilerBuilder, ComposedCompiler, ContainsPath, ContainsTree, Down, End,

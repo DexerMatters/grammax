@@ -43,6 +43,8 @@ macro_rules! new_grammar {
 		{
 			#[allow(unused_imports)]
 			use $crate::{grammar::edsl::*, r};
+            #[allow(unused_imports)]
+            use $crate::{parsec::words::*};
 			$(fn $name() -> GrammarNode { $node })*
 			$crate::grammar::Grammar::new($start(), stringify!($start)).expect("failed to create grammar")
 		}
@@ -55,6 +57,8 @@ macro_rules! new_grammar_no_cache {
 		{
 			#[allow(unused_imports)]
 			use $crate::{grammar::edsl::*, r};
+            #[allow(unused_imports)]
+            use $crate::{parsec::words::*};
 			$(fn $name() -> GrammarNode { $node })*
 			$crate::grammar::Grammar::new_uncached($start(), stringify!($start)).expect("failed to create grammar")
 		}
@@ -181,6 +185,76 @@ impl Grammar {
         Ok(Box::leak(Box::new(grammar)))
     }
 
+    pub fn try_name(&self, rule_idx: usize) -> Option<&'static str> {
+        self.table
+            .rules
+            .get(rule_idx)
+            .map(|r| r.name)
+            .filter(|n| !n.is_empty())
+    }
+
+    /// Get the name of a rule by its index. If the rule has no name, return a generated name based on its index.
+    pub fn name(&self, rule_idx: usize) -> &'static str {
+        self.table
+            .rules
+            .get(rule_idx)
+            .map(|r| r.name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| format!("@{}", rule_idx).leak())
+    }
+
+    /// Add metadata to a rule by its name.
+    ///
+    /// When the meta is a string, it will be used as the rule's description, which can be displayed in error messages.
+    pub fn in_which(mut self, rule_name: &'static str, meta: impl RuleMeta) -> Self {
+        if let Some(idx) = self.table.rules.iter().position(|r| r.name == rule_name) {
+            meta.apply(&mut self, idx);
+        } else {
+            panic!("Rule '{}' not found in grammar", rule_name);
+        }
+        self
+    }
+
+    /// Load a grammar from a grammax binary file.
+    pub fn load_from(path: impl AsRef<Path>) -> io::Result<&'static Self> {
+        let bytes = fs::read(path)?;
+        let grammar = cache::deserialize_grammar_file(&bytes)?;
+        Ok(Box::leak(Box::new(grammar)))
+    }
+
+    /// Save this grammar to a grammax binary file.
+    pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
+        self.save_to_target(path, &[])
+    }
+
+    /// Save this grammar to a grammax binary bundle with optional target metadata.
+    ///
+    /// Target values are currently metadata-only and do not add plugin binaries.
+    pub fn save_to_target(&self, path: impl AsRef<Path>, targets: &[&str]) -> io::Result<()> {
+        let path = path.as_ref();
+        let targets: Vec<String> = targets.iter().map(|target| (*target).to_string()).collect();
+        let bytes = if targets.is_empty() {
+            cache::serialize_grammar_file(self)?
+        } else {
+            cache::serialize_grammar_file_for_targets(self, &targets)?
+        };
+        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
+        fs::write(path, bytes)
+    }
+
+    pub fn load_from_binary(bytes: impl AsRef<[u8]>) -> io::Result<&'static Self> {
+        let grammar = cache::deserialize_grammar_file(bytes.as_ref())?;
+        Ok(Box::leak(Box::new(grammar)))
+    }
+
+    pub fn test(&'static self, input: &str) -> bool {
+        Parser::new(self).parse_text(input).is_ok()
+    }
+
+    pub fn parse<'a>(&'static self, input: &'a str) -> parsec::parser::Result<'a> {
+        Parser::new(self).parse_text(input)
+    }
+
     /// Build incremental LR analyses for every non-start rule.
     /// Each rule needs a thin wrapper production so the LR automaton
     /// can treat it as an independent parse entry point.
@@ -289,68 +363,6 @@ impl Grammar {
                 Self::hash_dsl_node(separator, hasher);
             }
         }
-    }
-
-    /// Get the name of a rule by its index. If the rule has no name, return a generated name based on its index.
-    pub fn name(&self, rule_idx: usize) -> &'static str {
-        self.table
-            .rules
-            .get(rule_idx)
-            .map(|r| r.name)
-            .filter(|n| !n.is_empty())
-            .unwrap_or_else(|| format!("@{}", rule_idx).leak())
-    }
-
-    /// Add metadata to a rule by its name.
-    ///
-    /// When the meta is a string, it will be used as the rule's description, which can be displayed in error messages.
-    pub fn in_which(mut self, rule_name: &'static str, meta: impl RuleMeta) -> Self {
-        if let Some(idx) = self.table.rules.iter().position(|r| r.name == rule_name) {
-            meta.apply(&mut self, idx);
-        } else {
-            panic!("Rule '{}' not found in grammar", rule_name);
-        }
-        self
-    }
-
-    /// Load a grammar from a grammax binary file.
-    pub fn load_from(path: impl AsRef<Path>) -> io::Result<&'static Self> {
-        let bytes = fs::read(path)?;
-        let grammar = cache::deserialize_grammar_file(&bytes)?;
-        Ok(Box::leak(Box::new(grammar)))
-    }
-
-    /// Save this grammar to a grammax binary file.
-    pub fn save_to(&self, path: impl AsRef<Path>) -> io::Result<()> {
-        self.save_to_target(path, &[])
-    }
-
-    /// Save this grammar to a grammax binary bundle with optional target metadata.
-    ///
-    /// Target values are currently metadata-only and do not add plugin binaries.
-    pub fn save_to_target(&self, path: impl AsRef<Path>, targets: &[&str]) -> io::Result<()> {
-        let path = path.as_ref();
-        let targets: Vec<String> = targets.iter().map(|target| (*target).to_string()).collect();
-        let bytes = if targets.is_empty() {
-            cache::serialize_grammar_file(self)?
-        } else {
-            cache::serialize_grammar_file_for_targets(self, &targets)?
-        };
-        fs::create_dir_all(path.parent().unwrap_or_else(|| Path::new(".")))?;
-        fs::write(path, bytes)
-    }
-
-    pub fn load_from_binary(bytes: impl AsRef<[u8]>) -> io::Result<&'static Self> {
-        let grammar = cache::deserialize_grammar_file(bytes.as_ref())?;
-        Ok(Box::leak(Box::new(grammar)))
-    }
-
-    pub fn test(&'static self, input: &str) -> bool {
-        Parser::new(self).parse_text(input).is_ok()
-    }
-
-    pub fn parse<'a>(&'static self, input: &'a str) -> parsec::parser::Result<'a> {
-        Parser::new(self).parse_text(input)
     }
 }
 

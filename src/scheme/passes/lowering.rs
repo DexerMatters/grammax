@@ -14,7 +14,8 @@ use crate::{
     scheme::{
         self,
         layers::{
-            AstArena, AstCell, AstDelta, AstMapAny, AstTxnBuilder, AstVec, NodePath, ParseTreeIR,
+            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, NodePath, ParseTreeIR,
+            ast::AstMapAny,
         },
     },
 };

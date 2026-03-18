@@ -10,6 +10,7 @@ use crate::{
     grammar::Grammar,
     parsec::{
         display::format_ast,
+        parser,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
     scheme::layers::NodePath,
@@ -62,7 +63,7 @@ impl Clone for NodeView {
 }
 
 impl NodeView {
-    pub fn new(
+    pub(crate) fn init(
         grammar: &'static Grammar,
         alloc: TreeAllocRef,
         source: impl Into<Arc<str>>,
@@ -81,6 +82,28 @@ impl NodeView {
             children: OnceLock::new(),
             grammar_field_name: None,
         }
+    }
+
+    pub fn new(result: &parser::Result) -> Self {
+        Self::init(
+            result.grammar,
+            result.alloc.clone(),
+            result.source,
+            Arc::new(FxHashMap::default()),
+            result.root.green,
+            0,
+        )
+    }
+
+    pub fn from_specs(
+        grammar: &'static Grammar,
+        alloc: TreeAllocRef,
+        source: impl Into<Arc<str>>,
+        token_texts: Arc<FxHashMap<usize, String>>,
+        green: usize,
+        offset: usize,
+    ) -> Self {
+        Self::init(grammar, alloc, source, token_texts, green, offset)
     }
 
     pub fn with_path(mut self, path: NodePath) -> Self {
@@ -253,7 +276,7 @@ impl NodeView {
                 let width = self.alloc.width_of(child);
                 let mut child_path = self.path.0.clone();
                 child_path.push(ix);
-                let child_view = Self::new(
+                let child_view = Self::init(
                     self.grammar,
                     self.alloc.clone(),
                     self.source.clone(),
@@ -405,7 +428,7 @@ pub struct Viewer {
 }
 
 impl Viewer {
-    pub fn new(
+    pub(crate) fn new(
         grammar: &'static Grammar,
         alloc: TreeAllocRef,
         source: impl Into<Arc<str>>,
@@ -428,7 +451,7 @@ impl Viewer {
     }
 
     pub fn node(&self, green: usize, offset: usize) -> NodeView {
-        NodeView::new(
+        NodeView::init(
             self.grammar,
             self.alloc.clone(),
             self.source.clone(),

@@ -5,6 +5,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
+use crate::grammar::Grammar;
+use crate::parsec::ParserConfig;
+
 /// Error types that can occur during parsing, used for error reporting and recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
@@ -17,7 +20,7 @@ pub enum ParsecError {
 }
 
 /// A type alias for the identifier of a green node in the syntax tree. This is used to reference nodes in the tree allocator.
-pub type GreenId = usize;
+pub(crate) type GreenId = usize;
 
 /// Tags indicating the type of a syntax tree node, such as whether it's a rule, token, field, or an error.
 ///
@@ -28,7 +31,7 @@ pub type GreenId = usize;
 ///                      point when re-parsing a subtree, so drop constraints are respected.
 ///                      Excluded from PartialEq/Hash so tree equivalence is based on structure.
 #[derive(Debug, Clone, Serialize)]
-pub enum Tag {
+pub(crate) enum Tag {
     Rule {
         rule_ix: usize,
         #[serde(skip)]
@@ -103,35 +106,15 @@ impl Tag {
     pub fn new_token(rule_ix: usize) -> Self {
         Tag::Token { rule_ix }
     }
-    pub fn new_field(rule_ix: usize, name: &'static str) -> Self {
-        Tag::Field { rule_ix, name }
-    }
     pub fn new_error(err: ParsecError) -> Self {
         Tag::Error(err)
-    }
-    pub fn is_error(&self) -> bool {
-        matches!(self, Tag::Error(_))
-    }
-    pub fn rule_ix(&self) -> Option<usize> {
-        match self {
-            Tag::Rule { rule_ix, .. } => Some(*rule_ix),
-            Tag::Token { rule_ix } => Some(*rule_ix),
-            Tag::Field { rule_ix, .. } => Some(*rule_ix),
-            Tag::Error(_) => None,
-        }
-    }
-    pub fn unwrap_error(&self) -> &ParsecError {
-        match self {
-            Tag::Error(err) => err,
-            _ => panic!("Expected an error tag, got: {:?}", self),
-        }
     }
 }
 
 /// Red nodes are the nodes in the "red" syntax tree,
 /// which includes parent references and offsets for easier traversal and error reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct RedNode {
+pub(crate) struct RedNode {
     pub parent: Option<Rc<RedNode>>,
     pub offset: usize,
     pub green: GreenId,
@@ -152,7 +135,7 @@ impl RedNode {
 /// Green nodes are the nodes in the "green" syntax tree, which are immutable and can be shared.
 /// They contain the tag, width, and children references, and are interned for memory efficiency.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct GreenNode {
+pub(crate) struct GreenNode {
     pub tag: Tag,
     pub width: usize,
     pub children: Vec<GreenId>,
@@ -168,7 +151,7 @@ pub struct TreeAlloc {
 pub type TreeAllocRef = Rc<UnsafeCell<TreeAlloc>>;
 
 /// A trait that extends the functionality of the tree allocator reference, providing methods for creating and managing green nodes.
-pub trait TreeAllocRefExt {
+pub(crate) trait TreeAllocRefExt {
     /// Creates a new tree allocator reference.
     fn create() -> Self;
     /// Retrieves a cloned green node snapshot by its ID.
@@ -177,12 +160,8 @@ pub trait TreeAllocRefExt {
     fn node(&self, id: GreenId) -> GreenNode;
     /// Reads a green node width without exposing the underlying borrow.
     fn width_of(&self, id: GreenId) -> usize;
-    /// Allocates a new token node with the given tag and width, returning its ID.
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId;
-    /// Allocates a new node with the given tag, children, and width, returning its ID.
     fn alloc(&self, tag: Tag, children: Vec<GreenId>, width: usize) -> GreenId;
-    /// Creates a new placeholder node with the given width, used for error recovery.
-    fn new_placeholder(&self, width: usize) -> GreenId;
 }
 
 impl TreeAllocRefExt for TreeAllocRef {
@@ -253,8 +232,97 @@ impl TreeAllocRefExt for TreeAllocRef {
             idx
         }
     }
+}
 
-    fn new_placeholder(&self, width: usize) -> GreenId {
-        self.alloc(Tag::Error(ParsecError::Incomplete), vec![], width)
+pub(crate) struct TreeBuilder<'a> {
+    grammar: &'a Grammar,
+    alloc: &'a TreeAllocRef,
+    config: &'a ParserConfig,
+}
+
+impl<'a> TreeBuilder<'a> {
+    pub fn new(grammar: &'a Grammar, alloc: &'a TreeAllocRef, config: &'a ParserConfig) -> Self {
+        Self {
+            grammar,
+            alloc,
+            config,
+        }
+    }
+
+    pub fn build_node(&self, rule_ix: usize, children: Vec<GreenId>) -> GreenId {
+        let reparse_rule_ix = rule_ix; // Original rule, possibly with @drop_ suffix.
+        let mut effective_rule_ix = rule_ix; // Display/semantic rule, @drop_ stripped.
+        let name = self.grammar.name(rule_ix);
+
+        if let Some(pos) = name.find("@drop_") {
+            let target_name = &name[..pos];
+            if let Some(ix) = self
+                .grammar
+                .table
+                .rules
+                .iter()
+                .position(|rule| rule.name == target_name)
+            {
+                effective_rule_ix = ix;
+            }
+        }
+
+        let filtered_children: Vec<GreenId> = children
+            .into_iter()
+            .filter(|child_id| !self.is_silent_token(*child_id))
+            .collect();
+
+        if self.config.simple_ast {
+            let mut flat_children = Vec::with_capacity(filtered_children.len());
+            for &child_id in &filtered_children {
+                let child_node = self.alloc.get_node(child_id);
+                let should_flatten = if let Tag::Rule {
+                    rule_ix: child_ix, ..
+                } = child_node.tag
+                {
+                    let child_name = self.grammar.name(child_ix);
+                    child_name.contains('@')
+                } else {
+                    false
+                };
+
+                if should_flatten {
+                    flat_children.extend_from_slice(&child_node.children);
+                } else {
+                    flat_children.push(child_id);
+                }
+            }
+
+            let width: usize = flat_children
+                .iter()
+                .map(|id| self.alloc.get_node(*id).width)
+                .sum();
+            self.alloc.alloc(
+                Tag::Rule {
+                    rule_ix: effective_rule_ix,
+                    reparse_rule_ix,
+                },
+                flat_children,
+                width,
+            )
+        } else {
+            let width: usize = filtered_children
+                .iter()
+                .map(|id| self.alloc.get_node(*id).width)
+                .sum();
+            self.alloc.alloc(
+                Tag::Rule {
+                    rule_ix: effective_rule_ix,
+                    reparse_rule_ix,
+                },
+                filtered_children,
+                width,
+            )
+        }
+    }
+
+    fn is_silent_token(&self, id: GreenId) -> bool {
+        let node = self.alloc.get_node(id);
+        matches!(node.tag, Tag::Token { .. }) && node.children.is_empty() && node.width == 0
     }
 }

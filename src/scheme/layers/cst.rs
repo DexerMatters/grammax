@@ -152,7 +152,7 @@ impl ParseNodeValue {
 #[derive(Clone)]
 pub struct ParseTreeIR {
     /// Allocator database (IR2) from `parsec/tree.rs`.
-    pub alloc: TreeAllocRef,
+    pub(crate) alloc: TreeAllocRef,
     /// Current root green node id inside `alloc`.
     pub root: Option<usize>,
     /// Transaction-local staging table cleared before each transaction.

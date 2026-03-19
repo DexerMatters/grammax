@@ -11,6 +11,8 @@
     - [DSL](./user/3-3-dsl.md)
     - [Advanced](./user/3-4-advanced.md)
 - [Parser](./user/4-parser.md)
+    - [Basic usage](./user/4-1-basic.md)
+    - [Parse tree](./user/4-2-tree.md)
 - [Compiler](./user/5-compiler.md)
 - [Interactive](./user/6-interactive.md)
 

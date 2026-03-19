@@ -2,6 +2,8 @@ use crate::new_grammar_no_cache;
 use crate::parsec::ParserConfig;
 use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
+use crate::parsec::view::ViewAction;
+use crate::scheme::layers::AstCell;
 
 #[test]
 fn test_simple_whitespaces() {
@@ -43,28 +45,53 @@ fn test_simple_arithmetic_precedence() {
         primary -> tt(NUMBER) | tt("(") + r!(expr) + tt(")")
     );
 
-    let mut parser = Parser::new(grammar);
+    #[derive(PartialEq, Eq, Debug)]
+    enum Expr {
+        Number(u32),
+        Add(Box<Expr>, Box<Expr>),
+        Mul(Box<Expr>, Box<Expr>),
+        Error,
+    }
 
-    println!("Grammar:\n{}", grammar.table);
+    let text = "1 + 2 * (3 + 4)";
+    let result = grammar.parse(text);
+    let view = result.view();
+    let viewer = result
+        .viewer()
+        .on_error(|_, _| ViewAction::Exact(Expr::Error))
+        .on_rule("expr", |_, _| ViewAction::<Expr>::Relay)
+        .on_rule("add", |ctx, view| {
+            let lhs = view.first().view(ctx);
+            let rhs = view.last().view(ctx);
+            ViewAction::Exact(Expr::Add(Box::new(lhs), Box::new(rhs)))
+        })
+        .on_rule("mul", |ctx, view| {
+            let lhs = view.first().view(ctx);
+            let rhs = view.last().view(ctx);
+            ViewAction::Exact(Expr::Mul(Box::new(lhs), Box::new(rhs)))
+        })
+        .on_rule("primary", |ctx, view| {
+            if let Some(expr_view) = view.try_nth(1) {
+                return ViewAction::Exact(expr_view.view(ctx));
+            }
+            let number = view.first().text_trimmed().parse::<u32>().unwrap();
+            ViewAction::Exact(Expr::Number(number))
+        });
 
-    let text = "1 + 2 * ";
-    let result = parser.parse_text(text);
-
-    let output = result.format_ast();
-    println!("AST {}:\n{}", text, output);
-    println!("Messages:\n{}", result.format_messages());
-
-    // Verify * is child of + (or rather + is the root operation)
-    // Structure:
-    // Rule(expr)
-    //   Rule(expr) -> 1
-    //   Token(+)
-    //   Rule(expr)
-    //     Rule(expr) -> 2
-    //     Token(*)
-    //     Rule(expr) -> 3
-
-    // (Note: The normalization might introduce intermediate rules, but the display should show structure)
+    let ast: Expr = view.view(&viewer);
+    assert_eq!(
+        ast,
+        Expr::Add(
+            Box::new(Expr::Number(1)),
+            Box::new(Expr::Mul(
+                Box::new(Expr::Number(2)),
+                Box::new(Expr::Add(
+                    Box::new(Expr::Number(3)),
+                    Box::new(Expr::Number(4))
+                ))
+            ))
+        )
+    );
 }
 
 #[test]

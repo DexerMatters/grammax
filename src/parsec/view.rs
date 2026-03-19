@@ -1,5 +1,6 @@
 use std::{
     any::{Any, TypeId},
+    fmt::Display,
     ops::Index,
     sync::{Arc, OnceLock},
 };
@@ -296,6 +297,10 @@ impl NodeView {
         })
     }
 
+    pub fn try_first(&self) -> Option<&NodeView> {
+        self.each().first()
+    }
+
     pub fn try_nth(&self, index: usize) -> Option<&NodeView> {
         self.each().get(index)
     }
@@ -318,6 +323,15 @@ impl NodeView {
         self.try_last().unwrap_or_else(|| {
             panic!(
                 "NodeView: missing last child for node {}",
+                self.name().unwrap_or("?")
+            )
+        })
+    }
+
+    pub fn first(&self) -> &NodeView {
+        self.try_first().unwrap_or_else(|| {
+            panic!(
+                "NodeView: missing first child for node {}",
                 self.name().unwrap_or("?")
             )
         })
@@ -395,13 +409,19 @@ impl NodeView {
     pub fn view<T: 'static>(&self, viewer: &Viewer) -> T {
         viewer.view_at::<T>(self.green, self.offset)
     }
+}
 
-    pub fn display(&self) -> String {
-        format_ast(
-            self.grammar,
-            &RedNode::root(self.green),
-            &self.alloc,
-            &self.source,
+impl Display for NodeView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            format_ast(
+                self.grammar,
+                &RedNode::root(self.green),
+                &self.alloc,
+                &self.source,
+            )
         )
     }
 }

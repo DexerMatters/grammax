@@ -13,6 +13,7 @@
 - [Parser](./user/4-parser.md)
     - [Basic usage](./user/4-1-basic.md)
     - [Parse tree](./user/4-2-tree.md)
+    - [Reparser](./user/4-3-reparser.md)
 - [Compiler](./user/5-compiler.md)
 - [Interactive](./user/6-interactive.md)
 

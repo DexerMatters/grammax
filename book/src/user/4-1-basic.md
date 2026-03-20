@@ -1,4 +1,4 @@
-# Basic
+# Basic usage
 **Parser generator** is a tool that generates a parser from a given grammar specification. The generated parser can then be used to parse input strings according to the rules defined in the grammar.
 
 Grammax can be used as a parser generator for any context-free grammar. The parsing process is inspired from LALR(1) parsing but with a delicate design to support incremental parsing and error recovery.

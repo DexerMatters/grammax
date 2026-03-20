@@ -1,4 +1,4 @@
-# Tree
+# Parse Tree
 
 When you parse some text, the parser produces a **concrete syntax tree (CST)** — a tree structure that represents exactly what it found in your source code, without losing any details. Think of it as a detailed "parse tree" that faithfully captures every token and structure.
 

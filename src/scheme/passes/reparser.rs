@@ -7,6 +7,7 @@ use crate::{
         Parser,
         msg::ParserMessages,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
+        view::{NodeView, Viewer},
     },
     scheme::{
         layers::{ParseTreeIR, cst::NodePath},
@@ -22,12 +23,7 @@ use crate::{
     utils::Span,
 };
 
-type Command = crate::scheme::Command<ParseTreeIR>;
-
-#[derive(Debug, Clone)]
-pub struct EditResult {
-    pub semantic_commands: Vec<Command>,
-}
+pub type Command = crate::scheme::Command<ParseTreeIR>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReparseError {
@@ -36,10 +32,18 @@ pub enum ReparseError {
         delta: isize,
         candidates_collected: usize,
     },
+    OutOfBounds {
+        span: Span,
+        text_len: usize,
+    },
+    InvalidSpan {
+        span: Span,
+    },
 }
 
 pub struct Reparser {
-    pub current: Rc<RedNode>,
+    pub(crate) current: Rc<RedNode>,
+    pub(crate) parser: Parser,
     alloc: TreeAllocRef,
     config: ReparserConfig,
 }
@@ -64,17 +68,82 @@ impl Default for ReparserConfig {
 }
 
 impl Reparser {
-    pub fn new(root: RedNode, alloc: TreeAllocRef) -> Self {
+    pub(crate) fn init(root: RedNode, alloc: TreeAllocRef, parser: Parser) -> Self {
         Self {
             current: Rc::new(root),
             alloc,
             config: ReparserConfig::default(),
+            parser,
         }
     }
 
-    pub fn with_config(mut self, config: ReparserConfig) -> Self {
+    pub(crate) fn set_config(&mut self, config: ReparserConfig) {
         self.config = config;
-        self
+    }
+
+    pub fn from_parser(mut parser: Parser) -> Self {
+        let alloc = parser.alloc.clone();
+        let crate::parsec::Result { root, .. } = parser.parse_text("");
+        Self::init(root, alloc, parser)
+    }
+
+    pub fn current_view(&self) -> NodeView {
+        NodeView::from_specs(
+            self.parser.grammar,
+            self.alloc.clone(),
+            self.parser.text(),
+            self.current.green,
+            self.current.offset,
+        )
+    }
+
+    pub fn current_viewer(&self) -> Viewer {
+        Viewer::new(self.parser.grammar, self.alloc.clone(), self.parser.text())
+    }
+
+    pub fn current_messages(&self) -> &ParserMessages {
+        &self.parser.messages
+    }
+
+    pub fn current_text(&self) -> &str {
+        self.parser.text()
+    }
+
+    pub fn replace(
+        &mut self,
+        start: usize,
+        end: usize,
+        text: &str,
+    ) -> Result<Vec<Command>, ReparseError> {
+        let old_text = self.parser.text();
+        if start > end {
+            return Err(ReparseError::InvalidSpan {
+                span: Span::new(start, end),
+            });
+        }
+        if end > old_text.len() {
+            return Err(ReparseError::OutOfBounds {
+                span: Span::new(start, end),
+                text_len: old_text.len(),
+            });
+        }
+        let mut new_source = String::with_capacity(old_text.len() - (end - start) + text.len());
+        new_source.push_str(&old_text[..start]);
+        new_source.push_str(text);
+        new_source.push_str(&old_text[end..]);
+
+        let span = Span::new(start, end);
+        let new_len = text.len();
+
+        self.handle_edit(span, new_len, &new_source, None)
+    }
+
+    pub fn insert(&mut self, offset: usize, text: &str) -> Result<Vec<Command>, ReparseError> {
+        self.replace(offset, offset, text)
+    }
+
+    pub fn delete(&mut self, start: usize, end: usize) -> Result<Vec<Command>, ReparseError> {
+        self.replace(start, end, "")
     }
 
     fn get_context(&mut self, span: Span) -> (Rc<RedNode>, Vec<ZipperStep>, usize) {
@@ -118,14 +187,13 @@ impl Reparser {
         (focus, steps, level)
     }
 
-    pub fn handle_edit(
+    pub(crate) fn handle_edit(
         &mut self,
-        parser: &mut Parser,
         span: Span,
         new_len: usize,
         source_text: &str,
         mut metrics: Option<&mut EditMetrics>,
-    ) -> Result<EditResult, ReparseError> {
+    ) -> Result<Vec<Command>, ReparseError> {
         let total_start = if metrics.is_some() {
             Some(std::time::Instant::now())
         } else {
@@ -139,20 +207,18 @@ impl Reparser {
                 }
                 m.used_incremental_path = false;
             }
-            return Ok(EditResult {
-                semantic_commands: Vec::new(),
-            });
+            return Ok(Vec::new());
         }
 
-        let old_messages = parser.messages.clone();
-        let previous_source_text = parser.text().to_string();
-        parser.messages.clear();
-        parser.set_text(source_text);
+        let old_messages = self.parser.messages.clone();
+        let previous_source_text = self.parser.text().to_string();
+        self.parser.messages.clear();
+        self.parser.set_text(source_text);
         let (focus_node, mut steps, level) = self.get_context(span);
         let delta = new_len as isize - span.len() as isize;
 
-        let specs = parser.recovery_specs().cloned();
-        let strategy = parser.recovery_strategy().cloned();
+        let specs = self.parser.recovery_specs().cloned();
+        let strategy = self.parser.recovery_strategy().cloned();
 
         let search_span = span;
         let edit_span = if span.len() == 0 {
@@ -175,7 +241,7 @@ impl Reparser {
             &mut steps,
             level,
             &mut zippers,
-            parser,
+            &self.parser,
         );
         dedupe_zippers(&mut zippers);
 
@@ -189,8 +255,12 @@ impl Reparser {
         if zippers.is_empty() {
             // Fallback: If focus node based seRch failed (rare), try from root
             self.ascend_to_root();
-            zippers =
-                collect_affected_zippers(self.current.clone(), search_span, &self.alloc, parser);
+            zippers = collect_affected_zippers(
+                self.current.clone(),
+                search_span,
+                &self.alloc,
+                &self.parser,
+            );
             dedupe_zippers(&mut zippers);
 
             if let Some(m) = &mut metrics {
@@ -199,9 +269,8 @@ impl Reparser {
         }
 
         if zippers.is_empty() {
-            if let Some(root_candidate) = self.try_root_rule_candidate(parser, source_text) {
+            if let Some(root_candidate) = self.try_root_rule_candidate(source_text) {
                 let result = self.apply_candidate(
-                    parser,
                     root_candidate,
                     &old_messages,
                     delta,
@@ -236,10 +305,10 @@ impl Reparser {
             });
         }
 
-        let reuse_before = parser.reuse_stats();
+        let reuse_before = self.parser.reuse_stats();
 
         let mut ctx = StrategyContext {
-            parser,
+            parser: &mut self.parser,
             span,
             delta,
             specs: specs.as_ref(),
@@ -274,14 +343,18 @@ impl Reparser {
         if best.is_none() {
             self.ascend_to_root();
             let root_span = Span::new(0, source_text.len());
-            let root_zippers =
-                collect_affected_zippers(self.current.clone(), root_span, &self.alloc, parser);
+            let root_zippers = collect_affected_zippers(
+                self.current.clone(),
+                root_span,
+                &self.alloc,
+                &self.parser,
+            );
             let mut root_zippers = root_zippers;
             dedupe_zippers(&mut root_zippers);
 
             if !root_zippers.is_empty() {
                 let mut root_ctx = StrategyContext {
-                    parser,
+                    parser: &mut self.parser,
                     span,
                     delta,
                     specs: specs.as_ref(),
@@ -308,7 +381,7 @@ impl Reparser {
         }
 
         if best.is_none() {
-            best = get_cached_root_candidate(&mut root_candidate_cache, self, parser, source_text);
+            best = get_cached_root_candidate(&mut root_candidate_cache, self, source_text);
             if best.is_some() {
                 if let Some(m) = metrics.as_deref_mut() {
                     m.message =
@@ -325,7 +398,7 @@ impl Reparser {
                 !candidate.score.is_error_free() || !candidate.messages.is_empty();
             if candidate_is_errorful {
                 if let Some(root_candidate) =
-                    get_cached_root_candidate(&mut root_candidate_cache, self, parser, source_text)
+                    get_cached_root_candidate(&mut root_candidate_cache, self, source_text)
                 {
                     // Always prefer root when the zipper green was an Incomplete node (parse_rule
                     // gave up entirely), or when root has fewer errors outside the edit span.
@@ -368,7 +441,7 @@ impl Reparser {
             }
         }
 
-        let reuse_after = parser.reuse_stats();
+        let reuse_after = self.parser.reuse_stats();
         if let Some(m) = &mut metrics {
             m.parse_rule_calls = reuse_after.lookups.saturating_sub(reuse_before.lookups);
             m.parse_rule_cache_hits = reuse_after.hits.saturating_sub(reuse_before.hits);
@@ -376,7 +449,6 @@ impl Reparser {
 
         if let Some(candidate) = best {
             let result = self.apply_candidate(
-                parser,
                 candidate,
                 &old_messages,
                 delta,
@@ -406,47 +478,45 @@ impl Reparser {
         })
     }
 
-    fn try_root_rule_candidate(
-        &mut self,
-        parser: &mut Parser,
-        source_text: &str,
-    ) -> Option<StrategyCandidate> {
+    fn try_root_rule_candidate(&mut self, source_text: &str) -> Option<StrategyCandidate> {
         self.ascend_to_root();
 
         let root_node = self.current.clone();
         let old_width = self.alloc.get_node(root_node.green).width;
-        let start_rule = parser.grammar.table.start_rule;
+        let start_rule = self.parser.grammar.table.start_rule;
         let expected_width = source_text.len();
 
-        parser.messages.clear();
-        parser.set_insert_pos(None);
+        self.parser.messages.clear();
+        self.parser.set_insert_pos(None);
 
-        let mut green = parser.parse_rule(start_rule, 0, expected_width);
+        let mut green = self.parser.parse_rule(start_rule, 0, expected_width);
         let needs_recovery = match green {
             Some(g) if self.alloc.get_node(g).width == expected_width => {
-                matches!(self.alloc.get_node(g).tag, Tag::Error(_)) || !parser.messages.is_empty()
+                matches!(self.alloc.get_node(g).tag, Tag::Error(_))
+                    || !self.parser.messages.is_empty()
             }
             _ => true,
         };
 
         if needs_recovery {
-            parser.clear_reuse_cache();
-            parser.messages.clear();
-            parser.set_insert_pos(None);
-            green = parser.parse_rule(start_rule, 0, expected_width);
+            self.parser.clear_reuse_cache();
+            self.parser.messages.clear();
+            self.parser.set_insert_pos(None);
+            green = self.parser.parse_rule(start_rule, 0, expected_width);
         }
 
         let needs_full_recovery = match green {
             Some(g) if self.alloc.get_node(g).width == expected_width => {
-                matches!(self.alloc.get_node(g).tag, Tag::Error(_)) || !parser.messages.is_empty()
+                matches!(self.alloc.get_node(g).tag, Tag::Error(_))
+                    || !self.parser.messages.is_empty()
             }
             _ => true,
         };
 
         let green = if needs_full_recovery {
-            parser.messages.clear();
-            parser.set_insert_pos(None);
-            parser.parse_text(source_text).root.green
+            self.parser.messages.clear();
+            self.parser.set_insert_pos(None);
+            self.parser.parse_text(source_text).root.green
         } else {
             green?
         };
@@ -454,7 +524,7 @@ impl Reparser {
         Some(StrategyCandidate {
             score: CandidateScore::new(0, 0, 0),
             green,
-            messages: Arc::new(parser.messages.clone()),
+            messages: Arc::new(self.parser.messages.clone()),
             zipper: Zipper {
                 node: root_node,
                 rule_ix: start_rule,
@@ -468,14 +538,13 @@ impl Reparser {
 
     fn apply_candidate(
         &mut self,
-        parser: &mut Parser,
         candidate: StrategyCandidate,
         old_messages: &ParserMessages,
         delta: isize,
         old_source_text: &str,
         new_source_text: &str,
         mut metrics: Option<&mut EditMetrics>,
-    ) -> EditResult {
+    ) -> Vec<Command> {
         if let Some(m) = &mut metrics {
             m.used_incremental_path = true;
         }
@@ -523,8 +592,8 @@ impl Reparser {
         }
         new_messages.sort_by_key(|m| m.span.start);
 
-        parser.messages = new_messages;
-        self.normalize_root(parser);
+        self.parser.messages = new_messages;
+        self.normalize_root();
         let semantic_start = if metrics.is_some() {
             Some(std::time::Instant::now())
         } else {
@@ -562,7 +631,7 @@ impl Reparser {
             }
         }
 
-        EditResult { semantic_commands }
+        semantic_commands
     }
 
     fn ascend_to_root(&mut self) {
@@ -571,7 +640,7 @@ impl Reparser {
         }
     }
 
-    fn normalize_root(&mut self, parser: &Parser) {
+    fn normalize_root(&mut self) {
         if self.current.parent.is_some() {
             return;
         }
@@ -584,7 +653,7 @@ impl Reparser {
 
         let children = root.children.clone();
 
-        let start_rule_ix = parser.grammar.table.start_rule;
+        let start_rule_ix = self.parser.grammar.table.start_rule;
 
         if let Tag::Rule { rule_ix, .. } = &root.tag {
             if *rule_ix != start_rule_ix {
@@ -656,23 +725,22 @@ fn dedupe_zippers(zippers: &mut Vec<Zipper>) {
 fn get_cached_root_candidate(
     cache: &mut Option<Option<StrategyCandidate>>,
     reparser: &mut Reparser,
-    parser: &mut Parser,
     source_text: &str,
 ) -> Option<StrategyCandidate> {
     if cache.is_none() {
-        *cache = Some(reparser.try_root_rule_candidate(parser, source_text));
+        *cache = Some(reparser.try_root_rule_candidate(source_text));
     }
     cache.as_ref().and_then(|candidate| candidate.clone())
 }
 
 #[derive(Debug, Clone)]
-pub struct ZipperStep {
+pub(crate) struct ZipperStep {
     pub parent: Rc<RedNode>,
     pub child_idx: usize,
 }
 
 #[derive(Debug, Clone)]
-pub struct Zipper {
+pub(crate) struct Zipper {
     pub node: Rc<RedNode>,
     pub rule_ix: usize,
     pub offset: usize,

@@ -16,7 +16,6 @@ use super::{
 };
 
 pub struct ParserPass {
-    parser: Parser,
     reparser: Reparser,
 }
 
@@ -27,11 +26,9 @@ unsafe impl Send for ParserPass {}
 impl ParserPass {
     /// Create a pass for `grammar` with default parser/reparser settings.
     pub fn new(grammar: &'static Grammar) -> Self {
-        let mut parser = Parser::new(grammar);
-        let crate::parsec::Result { root, .. } = parser.parse_text("");
-        let alloc = parser.alloc.clone();
-        let reparser = Reparser::new(root, alloc);
-        Self { parser, reparser }
+        let parser = Parser::new(grammar);
+        let reparser = Reparser::from_parser(parser);
+        Self { reparser }
     }
 
     /// Create with custom parser and reparser configuration.
@@ -42,10 +39,9 @@ impl ParserPass {
     ) -> Self {
         let mut parser = Parser::new(grammar);
         parser.set_config(parser_config);
-        let crate::parsec::Result { root, .. } = parser.parse_text("");
-        let alloc = parser.alloc.clone();
-        let reparser = Reparser::new(root, alloc).with_config(reparser_config);
-        Self { parser, reparser }
+        let mut reparser = Reparser::from_parser(parser);
+        reparser.set_config(reparser_config);
+        Self { reparser }
     }
 }
 
@@ -68,14 +64,10 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         // been set yet the reparser has nothing to reuse, and we must full-parse.
         if downstream.root.is_some() {
             if let Some((span, new_len)) = edit {
-                let result =
-                    self.reparser
-                        .handle_edit(&mut self.parser, span, new_len, new_text, None);
+                let result = self.reparser.handle_edit(span, new_len, new_text, None);
                 if let Ok(edit_result) = result {
-                    let cmds = prepend_messages_command(
-                        &self.parser.messages,
-                        edit_result.semantic_commands,
-                    );
+                    let cmds =
+                        prepend_messages_command(&self.reparser.parser.messages, edit_result);
                     return Ok(std::sync::Arc::new(cmds));
                 }
                 // Incremental re-parse failed; fall through to full re-parse.
@@ -83,11 +75,16 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         }
 
         // Full re-parse.
-        let crate::parsec::Result { root, .. } = self.parser.parse_text(new_text);
+        let crate::parsec::Result { root, .. } = { self.reparser.parser.parse_text(new_text) };
         self.reparser.current = std::rc::Rc::new(root.clone());
-        let tree_cmds =
-            delta::generate_commands_for_full_tree(&self.parser.alloc, root.green, new_text);
-        let cmds = prepend_messages_command(&self.parser.messages, tree_cmds);
+        let tree_cmds = {
+            delta::generate_commands_for_full_tree(
+                &self.reparser.parser.alloc,
+                root.green,
+                new_text,
+            )
+        };
+        let cmds = prepend_messages_command(&self.reparser.parser.messages, tree_cmds);
 
         Ok(std::sync::Arc::new(cmds))
     }

@@ -151,18 +151,13 @@ impl ParseNodeValue {
 
 #[derive(Clone)]
 pub struct ParseTreeIR {
-    /// Allocator database (IR2) from `parsec/tree.rs`.
     pub(crate) alloc: TreeAllocRef,
-    /// Current root green node id inside `alloc`.
     pub root: Option<usize>,
-    /// Transaction-local staging table cleared before each transaction.
     pub staging: FxHashMap<usize, ParseNodeValue>,
     created: FxHashMap<usize, usize>,
     fields: FxHashMap<usize, String>,
     token_text: FxHashMap<usize, String>,
     pub forwarded_messages: ParserMessages,
-    /// Pre-computed message list; refreshed at the end of every transaction
-    /// so repeated `query(Message)` calls are O(1) instead of O(tree size).
     messages_cache: ParserMessages,
 }
 

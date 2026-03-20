@@ -100,11 +100,17 @@ impl NodeView {
         grammar: &'static Grammar,
         alloc: TreeAllocRef,
         source: impl Into<Arc<str>>,
-        token_texts: Arc<FxHashMap<usize, String>>,
         green: usize,
         offset: usize,
     ) -> Self {
-        Self::init(grammar, alloc, source, token_texts, green, offset)
+        Self::init(
+            grammar,
+            alloc,
+            source,
+            Arc::new(FxHashMap::default()),
+            green,
+            offset,
+        )
     }
 
     pub fn with_path(mut self, path: NodePath) -> Self {

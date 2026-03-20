@@ -80,7 +80,7 @@ pub enum GrammarError {
 /// The grammar structure, which contains the normalized rule table and analyses for parsing and error recovery.
 ///
 /// The grammar instance is always a static reference.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Grammar {
     pub(crate) table: norm::RuleTable,
     pub(crate) analysis: Arc<analysis::GrammarStateAnalysis>,

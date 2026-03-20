@@ -2,15 +2,36 @@ use std::time::Duration;
 
 use crate::{
     interface::BasicInterface,
-    new_grammar,
+    new_grammar, new_grammar_no_cache,
+    parsec::Parser,
     runtime::{BuildTree, CompilerBuilder, Down, End, Here, Observe, ObservedLayer, Then},
     scheme::{
         layers::{AstArena, ParseTreeIR, SourceText},
-        passes::{IncrementalLowerer, ParserPass},
+        passes::{IncrementalLowerer, ParserPass, reparser::Reparser},
     },
 };
 
 type CstTree = Then<SourceText, ParserPass, End<ParseTreeIR>>;
+
+#[test]
+fn test_arith_reparser() {
+    let grammar = new_grammar_no_cache!(
+        start where
+        start -> r!(expr) + tt(EndOfInput)
+        expr -> r!(add) | r!(mul) | r!(primary)
+        add  -> r!(expr) + tt("+") + r!(expr).drop(1)
+        mul  -> r!(expr).drop(1) + tt("*") + r!(expr).drop(2)
+        primary -> tt(NUMBER) | tt("(") + r!(expr) + tt(")")
+    );
+
+    let parser = Parser::new(grammar);
+    let mut reparser = Reparser::from_parser(parser);
+    reparser.insert(0, "1 + 2 * 3").unwrap();
+    println!("{}", reparser.current_view());
+
+    reparser.delete(0, 3).unwrap();
+    println!("{}", reparser.current_view());
+}
 
 #[test]
 fn test_json() {

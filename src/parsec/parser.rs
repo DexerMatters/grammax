@@ -62,6 +62,7 @@ impl Default for ParserConfig {
     }
 }
 
+#[derive(Debug, Clone)]
 pub struct Result<'a> {
     pub(crate) alloc: TreeAllocRef,
     pub(crate) grammar: &'static Grammar,

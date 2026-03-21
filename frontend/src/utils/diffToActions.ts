@@ -1,5 +1,23 @@
 import type { ApplyTextEditAction } from '../Fetch';
 
+function offsetToPosition(text: string, offset: number): { line: number; character: number } {
+  let line = 0;
+  let character = 0;
+
+  for (const ch of text.slice(0, offset)) {
+    if (ch === '\n') {
+      line += 1;
+      character = 0;
+      continue;
+    }
+
+    const codePoint = ch.codePointAt(0);
+    character += codePoint !== undefined && codePoint > 0xffff ? 2 : 1;
+  }
+
+  return { line, character };
+}
+
 /**
  * Convert string diffs to Actions with smart update detection.
  * 
@@ -35,9 +53,9 @@ export function diffToActions(oldText: string, newText: string): ApplyTextEditAc
   return [
     {
       type: 'applyTextEdit',
-      span: {
-        start: prefix,
-        end: oldSuffix,
+      range: {
+        start: offsetToPosition(oldText, prefix),
+        end: offsetToPosition(oldText, oldSuffix),
       },
       text: replacement,
     },

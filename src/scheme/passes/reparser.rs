@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::{ops, rc::Rc, sync::Arc};
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -20,7 +20,7 @@ use crate::{
             },
         },
     },
-    utils::Span,
+    utils::{Position, Range, TextIndex, advance_position_by_bytes},
 };
 
 pub type Command = crate::scheme::Command<ParseTreeIR>;
@@ -28,16 +28,16 @@ pub type Command = crate::scheme::Command<ParseTreeIR>;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReparseError {
     NoIncrementalCandidate {
-        span: Span,
+        span: Range,
         delta: isize,
         candidates_collected: usize,
     },
     OutOfBounds {
-        span: Span,
+        span: Range,
         text_len: usize,
     },
     InvalidSpan {
-        span: Span,
+        span: Range,
     },
 }
 
@@ -88,12 +88,17 @@ impl Reparser {
     }
 
     pub fn current_view(&self) -> NodeView {
+        let byte_offset = self
+            .parser
+            .position_to_byte(self.current.position)
+            .unwrap_or(0);
         NodeView::from_specs(
             self.parser.grammar,
             self.alloc.clone(),
             self.parser.text(),
             self.current.green,
-            self.current.offset,
+            self.current.position,
+            byte_offset,
         )
     }
 
@@ -111,46 +116,58 @@ impl Reparser {
 
     pub fn replace(
         &mut self,
-        start: usize,
-        end: usize,
+        span: impl Into<Range>,
         text: &str,
     ) -> Result<Vec<Command>, ReparseError> {
+        let span = span.into();
         let old_text = self.parser.text();
-        if start > end {
-            return Err(ReparseError::InvalidSpan {
-                span: Span::new(start, end),
-            });
+        if span.start > span.end {
+            return Err(ReparseError::InvalidSpan { span });
         }
-        if end > old_text.len() {
+        let old_index = self.parser.text_index();
+        let clamped = old_index.clamp_range_with_text(span, old_text);
+        if clamped != span {
             return Err(ReparseError::OutOfBounds {
-                span: Span::new(start, end),
+                span,
                 text_len: old_text.len(),
             });
         }
-        let mut new_source = String::with_capacity(old_text.len() - (end - start) + text.len());
-        new_source.push_str(&old_text[..start]);
+        let Some(span_bytes) = old_index.range_to_byte_range_with_text(span, old_text) else {
+            return Err(ReparseError::InvalidSpan { span });
+        };
+        let mut new_source =
+            String::with_capacity(old_text.len() - range_len(&span_bytes) + text.len());
+        new_source.push_str(&old_text[..span_bytes.start]);
         new_source.push_str(text);
-        new_source.push_str(&old_text[end..]);
-
-        let span = Span::new(start, end);
+        new_source.push_str(&old_text[span_bytes.end..]);
         let new_len = text.len();
 
         self.handle_edit(span, new_len, &new_source, None)
     }
 
-    pub fn insert(&mut self, offset: usize, text: &str) -> Result<Vec<Command>, ReparseError> {
-        self.replace(offset, offset, text)
+    pub fn insert(
+        &mut self,
+        position: impl Into<Position>,
+        text: &str,
+    ) -> Result<Vec<Command>, ReparseError> {
+        self.replace(Range::point(position.into()), text)
     }
 
-    pub fn delete(&mut self, start: usize, end: usize) -> Result<Vec<Command>, ReparseError> {
-        self.replace(start, end, "")
+    pub fn delete(&mut self, span: impl Into<Range>) -> Result<Vec<Command>, ReparseError> {
+        self.replace(span.into(), "")
     }
 
-    fn get_context(&mut self, span: Span) -> (Rc<RedNode>, Vec<ZipperStep>, usize) {
+    fn get_context(
+        &mut self,
+        span: ops::Range<usize>,
+        source_text: &str,
+        source_index: &TextIndex,
+    ) -> (Rc<RedNode>, Vec<ZipperStep>, usize) {
         // 1. Ascend to enclose span
         while let Some(parent) = &self.current.parent {
             let width = self.alloc.get_node(self.current.green).width;
-            if self.current.offset <= span.start && self.current.offset + width >= span.end {
+            let current_offset = node_byte_offset(&self.current, source_text, source_index);
+            if current_offset <= span.start && current_offset + width >= span.end {
                 break;
             }
             self.current = Rc::clone(parent);
@@ -164,11 +181,12 @@ impl Reparser {
         while let Some(parent) = &temp.parent {
             let parent_id = parent.green;
             let parent_node = self.alloc.get_node(parent_id);
-            let mut offset = parent.offset;
+            let mut offset = node_byte_offset(parent, source_text, source_index);
+            let temp_offset = node_byte_offset(&temp, source_text, source_index);
             let mut found_idx = None;
 
             for (idx, &child_id) in parent_node.children.iter().enumerate() {
-                if offset == temp.offset && child_id == temp.green {
+                if offset == temp_offset && child_id == temp.green {
                     found_idx = Some(idx);
                     break;
                 }
@@ -189,7 +207,7 @@ impl Reparser {
 
     pub(crate) fn handle_edit(
         &mut self,
-        span: Span,
+        span: Range,
         new_len: usize,
         source_text: &str,
         mut metrics: Option<&mut EditMetrics>,
@@ -200,7 +218,7 @@ impl Reparser {
             None
         };
 
-        if span.len() == 0 && new_len == 0 {
+        if span.is_empty() && new_len == 0 {
             if let Some(m) = &mut metrics {
                 if let Some(start) = total_start {
                     m.total_duration_us = start.elapsed().as_micros();
@@ -212,19 +230,29 @@ impl Reparser {
 
         let old_messages = self.parser.messages.clone();
         let previous_source_text = self.parser.text().to_string();
+        let previous_text_index = self.parser.text_index().clone();
+        let Some(span_bytes) =
+            previous_text_index.range_to_byte_range_with_text(span, &previous_source_text)
+        else {
+            return Err(ReparseError::InvalidSpan { span });
+        };
         self.parser.messages.clear();
         self.parser.set_text(source_text);
-        let (focus_node, mut steps, level) = self.get_context(span);
-        let delta = new_len as isize - span.len() as isize;
+        let (focus_node, mut steps, level) = self.get_context(
+            span_bytes.clone(),
+            &previous_source_text,
+            &previous_text_index,
+        );
+        let delta = new_len as isize - range_len(&span_bytes) as isize;
 
         let specs = self.parser.recovery_specs().cloned();
         let strategy = self.parser.recovery_strategy().cloned();
 
-        let search_span = span;
-        let edit_span = if span.len() == 0 {
-            Span::new(span.start, span.start + new_len)
+        let search_span = span_bytes.clone();
+        let edit_span = if span.is_empty() {
+            span_bytes.start..span_bytes.start + new_len
         } else {
-            span
+            span_bytes.clone()
         };
 
         let zipper_start = if metrics.is_some() {
@@ -236,11 +264,13 @@ impl Reparser {
         let mut zippers = Vec::new();
         collect_from(
             focus_node,
-            search_span,
+            search_span.clone(),
             &self.alloc,
             &mut steps,
             level,
             &mut zippers,
+            &previous_source_text,
+            &previous_text_index,
             &self.parser,
         );
         dedupe_zippers(&mut zippers);
@@ -257,8 +287,10 @@ impl Reparser {
             self.ascend_to_root();
             zippers = collect_affected_zippers(
                 self.current.clone(),
-                search_span,
+                search_span.clone(),
                 &self.alloc,
+                &previous_source_text,
+                &previous_text_index,
                 &self.parser,
             );
             dedupe_zippers(&mut zippers);
@@ -327,7 +359,7 @@ impl Reparser {
         };
 
         let mut root_candidate_cache: Option<Option<StrategyCandidate>> = None;
-        let mut best = pick_candidate(&mut ctx, edit_span, kind);
+        let mut best = pick_candidate(&mut ctx, edit_span.clone(), kind);
         if best.is_none() && (self.config.enforce_sync_bound || self.config.enforce_region_end) {
             ctx.config = ReparserConfig {
                 enforce_sync_bound: false,
@@ -337,16 +369,18 @@ impl Reparser {
             if let Some(m) = ctx.metrics.as_deref_mut() {
                 m.message = "strict candidate filters rejected all zippers; retried with relaxed incremental bounds".to_string();
             }
-            best = pick_candidate(&mut ctx, edit_span, kind);
+            best = pick_candidate(&mut ctx, edit_span.clone(), kind);
         }
 
         if best.is_none() {
             self.ascend_to_root();
-            let root_span = Span::new(0, source_text.len());
+            let root_span = 0..previous_source_text.len();
             let root_zippers = collect_affected_zippers(
                 self.current.clone(),
                 root_span,
                 &self.alloc,
+                &previous_source_text,
+                &previous_text_index,
                 &self.parser,
             );
             let mut root_zippers = root_zippers;
@@ -368,7 +402,7 @@ impl Reparser {
                     metrics: metrics.as_deref_mut(),
                 };
 
-                best = pick_candidate(&mut root_ctx, edit_span, kind);
+                best = pick_candidate(&mut root_ctx, edit_span.clone(), kind);
 
                 if best.is_some() {
                     if let Some(m) = metrics.as_deref_mut() {
@@ -415,7 +449,7 @@ impl Reparser {
                         )
                     );
                     let (root_inside, root_outside) =
-                        count_errors(&root_candidate.messages, edit_span);
+                        count_errors(&root_candidate.messages, edit_span.clone(), source_text);
                     let root_is_cleaner = zipper_green_is_incomplete
                         || root_candidate.messages.is_empty()
                         // Candidate spills more errors outside the edit span than root does.
@@ -560,15 +594,18 @@ impl Reparser {
         let mut seen = FxHashSet::default();
 
         for msg in old_messages {
+            let Some(msg_span) = msg.span.to_byte_range(old_source_text) else {
+                continue;
+            };
             let is_before = if is_point_replace {
-                msg.span.end < replaced_start
+                msg_span.end < replaced_start
             } else {
-                msg.span.end <= replaced_start
+                msg_span.end <= replaced_start
             };
             let is_after = if is_point_replace {
-                msg.span.start > replaced_end
+                msg_span.start > replaced_end
             } else {
-                msg.span.start >= replaced_end
+                msg_span.start >= replaced_end
             };
 
             if is_before {
@@ -577,9 +614,9 @@ impl Reparser {
                 }
             } else if is_after {
                 let mut shifted = msg.clone();
-                let start = (msg.span.start as isize + delta).max(0) as usize;
-                let end = (msg.span.end as isize + delta).max(0) as usize;
-                shifted.span = Span::new(start, end);
+                let start = (msg_span.start as isize + delta).max(0) as usize;
+                let end = (msg_span.end as isize + delta).max(0) as usize;
+                shifted.span = Range::from_byte_range(new_source_text, start, end);
                 if seen.insert(shifted.clone()) {
                     new_messages.push(shifted);
                 }
@@ -754,7 +791,7 @@ impl Zipper {
         if self.steps.is_empty() {
             let updated_root = Rc::new(RedNode {
                 parent: None,
-                offset: self.offset,
+                position: self.node.position,
                 green: new_green,
             });
             return ReplaceResult { root: updated_root };
@@ -779,7 +816,7 @@ impl Zipper {
         // is not used by callers, so we do not construct it.
         let root = Rc::new(RedNode {
             parent: None,
-            offset: self.steps[0].parent.offset,
+            position: self.steps[0].parent.position,
             green: ancestor_greens[0],
         });
 
@@ -793,18 +830,30 @@ pub struct ReplaceResult {
 
 fn collect_affected_zippers(
     root: Rc<RedNode>,
-    span: Span,
+    span: ops::Range<usize>,
     alloc: &TreeAllocRef,
+    source_text: &str,
+    source_index: &TextIndex,
     parser: &Parser,
 ) -> Vec<Zipper> {
     let mut results = Vec::new();
-    collect_from(root, span, alloc, &mut Vec::new(), 0, &mut results, parser);
+    collect_from(
+        root,
+        span.clone(),
+        alloc,
+        &mut Vec::new(),
+        0,
+        &mut results,
+        source_text,
+        source_index,
+        parser,
+    );
 
     // Special handling for insertions in sep-based lists:
     // For insertions, prefer @sep_tail over @sep when available
     // At end-of-list (insertion == sep.offset + sep.width), use the deeper @sep_tail
     // Otherwise, use shallower @sep for broader context
-    if span.len() == 0 && results.len() > 1 {
+    if range_is_empty(&span) && results.len() > 1 {
         let sep_rules: Vec<usize> = (0..results.len())
             .filter(|&idx| {
                 let zipper = &results[idx];
@@ -856,17 +905,20 @@ fn collect_affected_zippers(
 
 fn collect_from(
     node: Rc<RedNode>,
-    span: Span,
+    span: ops::Range<usize>,
     alloc: &TreeAllocRef,
     steps: &mut Vec<ZipperStep>,
     level: usize,
     out: &mut Vec<Zipper>,
+    source_text: &str,
+    source_index: &TextIndex,
     parser: &Parser,
 ) {
     let mut stack = vec![(node, steps.clone(), level)];
 
     while let Some((node, steps, level)) = stack.pop() {
         let green = alloc.get_node(node.green);
+        let node_offset = node_byte_offset(&node, source_text, source_index);
 
         if let Tag::Rule {
             reparse_rule_ix, ..
@@ -875,16 +927,16 @@ fn collect_from(
             out.push(Zipper {
                 node: node.clone(),
                 rule_ix: *reparse_rule_ix,
-                offset: node.offset,
+                offset: node_offset,
                 old_width: green.width,
                 level,
                 steps: steps.clone(),
             });
         }
 
-        let mut offset = node.offset;
+        let mut offset = node_offset;
         let mut overlaps = Vec::new();
-        let is_insertion = span.len() == 0;
+        let is_insertion = range_is_empty(&span);
 
         let mut has_separator_children = false;
         let mut separator_index = vec![false; green.children.len()];
@@ -1061,7 +1113,7 @@ fn collect_from(
 
         let child_node = Rc::new(RedNode {
             parent: Some(node.clone()),
-            offset: child_start,
+            position: child_position(node.position, node_offset, child_start, source_text),
             green: child_id,
         });
 
@@ -1098,7 +1150,7 @@ fn collect_from(
                     {
                         let remaining_name = parser.grammar.name(*remaining_rule);
                         if remaining_name == "@sep_tail" || remaining_name.ends_with("_tail") {
-                            let mut remaining_start = node.offset;
+                            let mut remaining_start = node_offset;
                             for &prior_id in green.children.iter().take(remaining_idx) {
                                 remaining_start += alloc.get_node(prior_id).width;
                             }
@@ -1110,7 +1162,12 @@ fn collect_from(
 
                             let tail_node = Rc::new(RedNode {
                                 parent: Some(node.clone()),
-                                offset: remaining_start,
+                                position: child_position(
+                                    node.position,
+                                    node_offset,
+                                    remaining_start,
+                                    source_text,
+                                ),
                                 green: remaining_id,
                             });
 
@@ -1123,4 +1180,32 @@ fn collect_from(
 
         stack.push((child_node, child_steps, level + 1));
     }
+}
+
+fn node_byte_offset(node: &RedNode, source_text: &str, source_index: &TextIndex) -> usize {
+    source_index
+        .position_to_byte_with_text(node.position, source_text)
+        .unwrap_or(0)
+}
+
+fn child_position(
+    parent_position: Position,
+    parent_byte_offset: usize,
+    child_byte_offset: usize,
+    text: &str,
+) -> Position {
+    advance_position_by_bytes(
+        text,
+        parent_byte_offset,
+        parent_position,
+        child_byte_offset.saturating_sub(parent_byte_offset),
+    )
+}
+
+fn range_len(range: &ops::Range<usize>) -> usize {
+    range.end.saturating_sub(range.start)
+}
+
+fn range_is_empty(range: &ops::Range<usize>) -> bool {
+    range.start == range.end
 }

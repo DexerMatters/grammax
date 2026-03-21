@@ -23,6 +23,7 @@ use crate::{
         compiler::{ContainsPath, Down, Here, TypedTree},
         dispatcher::GlobalEventDispatcher,
     },
+    utils,
     scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText},
 };
 
@@ -141,8 +142,14 @@ where
 
                 if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
                     let source = state.buffer.clone();
-                    let settled =
-                        <Self as Interface<Tree>>::edit_source_text(self, 0, usize::MAX, &source);
+                    let settled = <Self as Interface<Tree>>::edit_source_text(
+                        self,
+                        utils::Range::new(
+                            utils::Position::zero(),
+                            utils::Position::new(usize::MAX, usize::MAX),
+                        ),
+                        &source,
+                    );
 
                     let num_lines = state.buffer.matches('\n').count() as u16 + 1;
                     move_to(stdout, 0, state.origin_row + num_lines)?;

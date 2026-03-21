@@ -9,6 +9,7 @@ use crate::{
         layers::{AstArena, ParseTreeIR, SourceText},
         passes::{IncrementalLowerer, ParserPass, reparser::Reparser},
     },
+    utils::Position,
 };
 
 type CstTree = Then<SourceText, ParserPass, End<ParseTreeIR>>;
@@ -26,10 +27,10 @@ fn test_arith_reparser() {
 
     let parser = Parser::new(grammar);
     let mut reparser = Reparser::from_parser(parser);
-    reparser.insert(0, "1 + 2 * 3").unwrap();
+    reparser.insert((0, 0), "1 + 2 * 3").unwrap();
     println!("{}", reparser.current_view());
 
-    reparser.delete(0, 3).unwrap();
+    reparser.delete(((0, 0), (0, 3))).unwrap();
     println!("{}", reparser.current_view());
 }
 
@@ -53,8 +54,10 @@ fn test_json() {
 
     let compiler = compiler.build_runtime::<BasicInterface<_>>(grammar);
 
-    compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
-    compiler.replace(10, 14, "Doe").expect("update");
+    compiler
+        .insert(Position::zero(), r#"{"name": "John"}"#)
+        .expect("submit");
+    compiler.replace(((0, 10), (0, 14)), "Doe").expect("update");
 }
 
 #[test]
@@ -76,7 +79,9 @@ fn test_tap_prints_cst_commands() {
     let cst_obs: ObservedLayer<CstTree, Down<Here>> = cst_tree.observe::<Down<Here>>();
 
     let compiler = cst_tree.build_runtime::<BasicInterface<_>>(grammar);
-    compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
+    compiler
+        .insert((0, 0), r#"{"name": "John"}"#)
+        .expect("submit");
 
     // The observer receives one update per submitted transaction.
     let (revision, txn) = cst_obs

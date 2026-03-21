@@ -1,37 +1,37 @@
 use std::ops::{self, RangeBounds};
 
 use crate::parsec::words::{IntoMatcher, MatcherRef, token};
-use crate::utils::Span;
+use crate::utils::Range;
 use rustc_hash::FxHashMap;
 
 #[doc(hidden)]
 #[derive(Clone, Debug)]
 pub enum GrammarNode {
-    Terminal(MatcherRef, Span),
-    Alternative(Vec<GrammarNode>, Span),
-    Sequence(Vec<GrammarNode>, Span),
+    Terminal(MatcherRef, Range),
+    Alternative(Vec<GrammarNode>, Range),
+    Sequence(Vec<GrammarNode>, Range),
     /// Bound reference resolved at compile-time via function pointer
-    Reference(fn() -> GrammarNode, &'static str, Span),
+    Reference(fn() -> GrammarNode, &'static str, Range),
     /// Unbound reference resolved at runtime via GrammarRegistry
-    UnboundReference(String, Span),
-    Field(&'static str, Box<GrammarNode>, Span),
+    UnboundReference(String, Range),
+    Field(&'static str, Box<GrammarNode>, Range),
     Drop {
         node: Box<GrammarNode>,
         count: usize,
-        span: Span,
+        span: Range,
     },
     Repetition {
         node: Box<GrammarNode>,
         min: usize,
         max: Option<usize>,
-        span: Span,
+        span: Range,
     },
     SeparatedRepetition {
         node: Box<GrammarNode>,
         separator: Box<GrammarNode>,
         min: usize,
         max: Option<usize>,
-        span: Span,
+        span: Range,
     },
 }
 
@@ -40,7 +40,7 @@ impl GrammarNode {
         GrammarNode::Drop {
             node: Box::new(self),
             count,
-            span: Span::empty(),
+            span: Range::empty(),
         }
     }
 }
@@ -51,31 +51,31 @@ impl GrammarNode {
 ///
 /// Use the `r!` macro for more ergonomic syntax when defining rules.
 pub fn r(f: fn() -> GrammarNode, name: &'static str) -> GrammarNode {
-    GrammarNode::Reference(f, name, Span::empty())
+    GrammarNode::Reference(f, name, Range::empty())
 }
 
 /// Defines a terminal matcher in the grammar.
 pub fn t<M: IntoMatcher>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(matcher.into_matcher_ref(), Span::empty())
+    GrammarNode::Terminal(matcher.into_matcher_ref(), Range::empty())
 }
 
 /// Defines a terminal matcher which skips leading trivia (whitespace/newlines).
 pub fn tt<M: IntoMatcher>(matcher: M) -> GrammarNode {
-    GrammarNode::Terminal(token(matcher).into_matcher_ref(), Span::empty())
+    GrammarNode::Terminal(token(matcher).into_matcher_ref(), Range::empty())
 }
 
 /// Defines a sequence of grammar nodes.
 ///
 /// Use the `+` operator for more ergonomic syntax when defining sequences.
 pub fn seq(nodes: Vec<GrammarNode>) -> GrammarNode {
-    GrammarNode::Sequence(nodes, Span::empty())
+    GrammarNode::Sequence(nodes, Range::empty())
 }
 
 /// Defines an alternative between grammar nodes.
 ///
 /// Use the `|` operator for more ergonomic syntax when defining alternatives.
 pub fn alt(nodes: Vec<GrammarNode>) -> GrammarNode {
-    GrammarNode::Alternative(nodes, Span::empty())
+    GrammarNode::Alternative(nodes, Range::empty())
 }
 
 /// Defines an optional grammar node (zero or one occurrence).
@@ -86,7 +86,7 @@ pub fn opt(node: GrammarNode) -> GrammarNode {
         node: Box::new(node),
         min: 0,
         max: Some(1),
-        span: Span::empty(),
+        span: Range::empty(),
     }
 }
 
@@ -111,7 +111,7 @@ pub fn repeat<R: RangeBounds<usize>>(node: GrammarNode, range: R) -> GrammarNode
         node: Box::new(node),
         min,
         max,
-        span: Span::empty(),
+        span: Range::empty(),
     }
 }
 
@@ -123,7 +123,7 @@ pub fn many(node: GrammarNode) -> GrammarNode {
         node: Box::new(node),
         min: 0,
         max: None,
-        span: Span::empty(),
+        span: Range::empty(),
     }
 }
 
@@ -135,7 +135,7 @@ pub fn some(node: GrammarNode) -> GrammarNode {
         node: Box::new(node),
         min: 1,
         max: None,
-        span: Span::empty(),
+        span: Range::empty(),
     }
 }
 
@@ -146,7 +146,7 @@ pub fn sep(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
         separator: Box::new(separator),
         min: 0,
         max: None,
-        span: Span::empty(),
+        span: Range::empty(),
     }
 }
 
@@ -157,13 +157,13 @@ pub fn sep1(node: GrammarNode, separator: GrammarNode) -> GrammarNode {
         separator: Box::new(separator),
         min: 1,
         max: None,
-        span: Span::empty(),
+        span: Range::empty(),
     }
 }
 
 /// Defines a named field in the grammar, which is convenient for AST construction and semantic analysis.
 pub fn field(name: &'static str, node: GrammarNode) -> GrammarNode {
-    GrammarNode::Field(name, Box::new(node), Span::empty())
+    GrammarNode::Field(name, Box::new(node), Range::empty())
 }
 
 // Operator overloading for ergonomic DSL
@@ -177,7 +177,7 @@ impl ops::Add for GrammarNode {
                 nodes.push(rhs);
                 GrammarNode::Sequence(nodes, span)
             }
-            _ => GrammarNode::Sequence(vec![self, rhs], Span::empty()),
+            _ => GrammarNode::Sequence(vec![self, rhs], Range::empty()),
         }
     }
 }
@@ -191,7 +191,7 @@ impl ops::BitOr for GrammarNode {
                 nodes.push(rhs);
                 GrammarNode::Alternative(nodes, span)
             }
-            _ => GrammarNode::Alternative(vec![self, rhs], Span::empty()),
+            _ => GrammarNode::Alternative(vec![self, rhs], Range::empty()),
         }
     }
 }

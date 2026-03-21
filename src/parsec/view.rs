@@ -15,7 +15,7 @@ use crate::{
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
     scheme::layers::NodePath,
-    utils::Span,
+    utils::{Position, Range, advance_position_by_bytes},
 };
 
 /// Action returned by typed visitor closures.
@@ -39,7 +39,8 @@ pub struct NodeView {
     source: Arc<str>,
     token_texts: Arc<FxHashMap<usize, String>>,
     green: usize,
-    offset: usize,
+    position: Position,
+    byte_offset: usize,
     path: NodePath,
     children: OnceLock<Vec<NodeView>>,
     /// Grammar-derived field name for this node (set by parent's `each()` or by
@@ -55,7 +56,8 @@ impl Clone for NodeView {
             source: self.source.clone(),
             token_texts: self.token_texts.clone(),
             green: self.green,
-            offset: self.offset,
+            position: self.position,
+            byte_offset: self.byte_offset,
             path: self.path.clone(),
             children: OnceLock::new(),
             grammar_field_name: self.grammar_field_name,
@@ -70,7 +72,8 @@ impl NodeView {
         source: impl Into<Arc<str>>,
         token_texts: Arc<FxHashMap<usize, String>>,
         green: usize,
-        offset: usize,
+        position: Position,
+        byte_offset: usize,
     ) -> Self {
         Self {
             grammar,
@@ -78,7 +81,8 @@ impl NodeView {
             source: source.into(),
             token_texts,
             green,
-            offset,
+            position,
+            byte_offset,
             path: NodePath::root(),
             children: OnceLock::new(),
             grammar_field_name: None,
@@ -92,6 +96,7 @@ impl NodeView {
             result.source,
             Arc::new(FxHashMap::default()),
             result.root.green,
+            result.root.position,
             0,
         )
     }
@@ -101,7 +106,8 @@ impl NodeView {
         alloc: TreeAllocRef,
         source: impl Into<Arc<str>>,
         green: usize,
-        offset: usize,
+        position: Position,
+        byte_offset: usize,
     ) -> Self {
         Self::init(
             grammar,
@@ -109,7 +115,8 @@ impl NodeView {
             source,
             Arc::new(FxHashMap::default()),
             green,
-            offset,
+            position,
+            byte_offset,
         )
     }
 
@@ -139,8 +146,11 @@ impl NodeView {
             // Fall back to source slice when token_texts is not populated.
             if !self.source.is_empty() {
                 let width = node.width;
-                let start = self.offset.min(self.source.len());
-                let end = self.offset.saturating_add(width).min(self.source.len());
+                let start = self.byte_offset.min(self.source.len());
+                let end = self
+                    .byte_offset
+                    .saturating_add(width)
+                    .min(self.source.len());
                 return self.source[start..end].to_string();
             }
             return String::new();
@@ -148,8 +158,11 @@ impl NodeView {
 
         if !self.source.is_empty() {
             let width = node.width;
-            let start = self.offset.min(self.source.len());
-            let end = self.offset.saturating_add(width).min(self.source.len());
+            let start = self.byte_offset.min(self.source.len());
+            let end = self
+                .byte_offset
+                .saturating_add(width)
+                .min(self.source.len());
             return self.source[start..end].to_string();
         }
 
@@ -195,12 +208,14 @@ impl NodeView {
 
     pub fn span_bytes(&self) -> (usize, usize) {
         let node = self.alloc.node(self.green);
-        (self.offset, self.offset + node.width)
+        (self.byte_offset, self.byte_offset + node.width)
     }
 
-    pub fn span(&self) -> Span {
-        let (start, end) = self.span_bytes();
-        Span::new(start, end)
+    pub fn span(&self) -> Range {
+        let node = self.alloc.node(self.green);
+        let end =
+            advance_position_by_bytes(&self.source, self.byte_offset, self.position, node.width);
+        Range::new(self.position, end)
     }
 
     pub fn rule_name(&self) -> Option<&'static str> {
@@ -278,7 +293,8 @@ impl NodeView {
             };
 
             let mut out = Vec::with_capacity(n_children);
-            let mut child_offset = self.offset;
+            let mut child_position = self.position;
+            let mut child_byte_offset = self.byte_offset;
             for (ix, &child) in node.children.iter().enumerate() {
                 let width = self.alloc.width_of(child);
                 let mut child_path = self.path.0.clone();
@@ -289,7 +305,8 @@ impl NodeView {
                     self.source.clone(),
                     self.token_texts.clone(),
                     child,
-                    child_offset,
+                    child_position,
+                    child_byte_offset,
                 )
                 .with_path(NodePath(child_path));
                 let child_view = match field_map[ix] {
@@ -297,7 +314,13 @@ impl NodeView {
                     None => child_view,
                 };
                 out.push(child_view);
-                child_offset += width;
+                child_position = advance_position_by_bytes(
+                    &self.source,
+                    child_byte_offset,
+                    child_position,
+                    width,
+                );
+                child_byte_offset += width;
             }
             out
         })
@@ -413,7 +436,7 @@ impl NodeView {
     }
 
     pub fn view<T: 'static>(&self, viewer: &Viewer) -> T {
-        viewer.view_at::<T>(self.green, self.offset)
+        viewer.view_at::<T>(self.green, self.position, self.byte_offset)
     }
 }
 
@@ -424,7 +447,11 @@ impl Display for NodeView {
             "{}",
             format_ast(
                 self.grammar,
-                &RedNode::root(self.green),
+                &RedNode {
+                    parent: None,
+                    position: self.position,
+                    green: self.green,
+                },
                 &self.alloc,
                 &self.source,
             )
@@ -476,14 +503,15 @@ impl Viewer {
         self
     }
 
-    pub fn node(&self, green: usize, offset: usize) -> NodeView {
+    pub fn node(&self, green: usize, position: Position, byte_offset: usize) -> NodeView {
         NodeView::init(
             self.grammar,
             self.alloc.clone(),
             self.source.clone(),
             self.token_texts.clone(),
             green,
-            offset,
+            position,
+            byte_offset,
         )
     }
 
@@ -551,12 +579,12 @@ impl Viewer {
         self
     }
 
-    pub fn view<T: 'static>(&self, green: usize, offset: usize) -> T {
-        self.view_at::<T>(green, offset)
+    pub fn view<T: 'static>(&self, green: usize, position: Position, byte_offset: usize) -> T {
+        self.view_at::<T>(green, position, byte_offset)
     }
 
-    fn view_at<T: 'static>(&self, green: usize, offset: usize) -> T {
-        let obj = self.node(green, offset);
+    fn view_at<T: 'static>(&self, green: usize, position: Position, byte_offset: usize) -> T {
+        let obj = self.node(green, position, byte_offset);
         let green_node = self.alloc.node(green);
         let ty = TypeId::of::<T>();
 

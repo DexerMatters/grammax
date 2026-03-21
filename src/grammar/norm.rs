@@ -4,7 +4,7 @@ use crate::grammar::GrammarError;
 use crate::grammar::edsl::{GrammarNode, GrammarRegistry};
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::parsec::words::MatcherRef;
-use crate::utils::Span;
+use crate::utils::Range;
 
 /// Normalized grammar optimized for LR parsing
 #[derive(Debug, Clone)]
@@ -672,24 +672,24 @@ impl Normalizer {
     /// Placeholder for converting normalized back to DSL (for repetition desugaring)
     fn denormalize_node(&self, node: NormalizedNode) -> GrammarNode {
         match node {
-            NormalizedNode::Terminal(m) => GrammarNode::Terminal(m, Span::empty()),
+            NormalizedNode::Terminal(m) => GrammarNode::Terminal(m, Range::empty()),
             NormalizedNode::Alternative(alts) => GrammarNode::Alternative(
                 alts.into_iter().map(|a| self.denormalize_node(a)).collect(),
-                Span::empty(),
+                Range::empty(),
             ),
             NormalizedNode::Sequence(parts) => GrammarNode::Sequence(
                 parts
                     .into_iter()
                     .map(|p| self.denormalize_node(p))
                     .collect(),
-                Span::empty(),
+                Range::empty(),
             ),
             NormalizedNode::Reference(ix) => {
                 let name = self.rules[ix].name;
-                GrammarNode::Reference(|| unreachable!(), name, Span::empty())
+                GrammarNode::Reference(|| unreachable!(), name, Range::empty())
             }
             NormalizedNode::Field(name, inner) => {
-                GrammarNode::Field(name, Box::new(self.denormalize_node(*inner)), Span::empty())
+                GrammarNode::Field(name, Box::new(self.denormalize_node(*inner)), Range::empty())
             }
         }
     }

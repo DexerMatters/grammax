@@ -66,19 +66,18 @@ pub trait Interface<Tree: TypedTree> {
     fn query_source_text(
         &self,
         revision: Option<runtime::RevisionId>,
-        span: utils::Span,
+        range: utils::Range,
     ) -> runtime::RuntimeResult<String>
     where
         Tree: ContainsPath<Here, Target = scheme::SourceText>,
         Self: Sized,
     {
-        self.query_layer::<Here>(revision, span)
+        self.query_layer::<Here>(revision, range)
     }
 
     fn edit_source_text(
         &self,
-        start: usize,
-        end: usize,
+        range: utils::Range,
         text: &str,
     ) -> runtime::RuntimeResult<runtime::RevisionId>
     where
@@ -87,7 +86,7 @@ pub trait Interface<Tree: TypedTree> {
         match request(
             self,
             runtime::RuntimeRequest::ApplyTextEdit {
-                span: utils::Span::new(start, end),
+                range,
                 text: text.to_string(),
             },
         )? {
@@ -100,8 +99,7 @@ pub trait Interface<Tree: TypedTree> {
 
     fn edit_source_text_till<Path>(
         &self,
-        start: usize,
-        end: usize,
+        range: utils::Range,
         text: &str,
     ) -> runtime::RuntimeResult<(
         runtime::RevisionId,
@@ -118,7 +116,7 @@ pub trait Interface<Tree: TypedTree> {
         match request(
             self,
             runtime::RuntimeRequest::ApplyAndFetch {
-                span: utils::Span::new(start, end),
+                range,
                 text: text.to_string(),
                 layer_path: <Tree as ContainsPath<Path>>::runtime_path(),
             },
@@ -181,20 +179,26 @@ impl<Tree> BasicInterface<Tree>
 where
     Tree: TypedTree + ContainsPath<Here, Target = scheme::SourceText>,
 {
-    pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(offset, offset, text)
+    pub fn insert(
+        &self,
+        position: impl Into<utils::Position>,
+        text: &str,
+    ) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.edit_source_text(utils::Range::point(position.into()), text)
     }
 
-    pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(start, end, "")
+    pub fn delete(
+        &self,
+        range: impl Into<utils::Range>,
+    ) -> runtime::RuntimeResult<runtime::RevisionId> {
+        self.edit_source_text(range.into(), "")
     }
 
     pub fn replace(
         &self,
-        start: usize,
-        end: usize,
+        range: impl Into<utils::Range>,
         text: &str,
     ) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(start, end, text)
+        self.edit_source_text(range.into(), text)
     }
 }

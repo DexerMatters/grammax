@@ -4,7 +4,7 @@ use crossbeam::channel;
 
 use crate::{
     scheme,
-    utils::{self, Span},
+    utils::{self, Range},
 };
 
 use super::{
@@ -135,8 +135,8 @@ fn handle_request<Tree: TypedTree>(
 ) -> bool {
     match request {
         // Fire-and-forget edit: reply immediately with Accepted.
-        RuntimeRequest::ApplyTextEdit { span, text } => {
-            let txn = edit_to_txn(span, text);
+        RuntimeRequest::ApplyTextEdit { range, text } => {
+            let txn = edit_to_txn(range, text);
             let result = compiler
                 .submit_source(txn)
                 .map(|revision| RuntimeSignal::Accepted { revision });
@@ -146,11 +146,11 @@ fn handle_request<Tree: TypedTree>(
 
         // Edit + wait: park reply until the pipeline settles the target layer.
         RuntimeRequest::ApplyAndFetch {
-            span,
+            range,
             text,
             layer_path,
         } => {
-            let txn = edit_to_txn(span, text);
+            let txn = edit_to_txn(range, text);
             match compiler.submit_source(txn) {
                 Ok(revision) => pending_fetches.push(PendingFetch {
                     revision,
@@ -289,22 +289,22 @@ fn fail_all(
     }
 }
 
-fn edit_to_txn(span: Span, text: String) -> scheme::Transaction<scheme::layers::SourceText> {
+fn edit_to_txn(range: Range, text: String) -> scheme::Transaction<scheme::layers::SourceText> {
     use scheme::Command;
-    if span.start == span.end && text.is_empty() {
+    if range.is_empty() && text.is_empty() {
         return Arc::new(Vec::new());
     }
-    if span.start == span.end {
+    if range.is_empty() {
         return Arc::new(vec![
             Command::Create { id: 0, value: text },
-            Command::Insert { index: span, id: 0 },
+            Command::Insert { index: range, id: 0 },
         ]);
     }
     if text.is_empty() {
-        return Arc::new(vec![Command::Delete { index: span }]);
+        return Arc::new(vec![Command::Delete { index: range }]);
     }
     Arc::new(vec![
         Command::Create { id: 0, value: text },
-        Command::Replace { index: span, id: 0 },
+        Command::Replace { index: range, id: 0 },
     ])
 }

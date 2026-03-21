@@ -40,7 +40,7 @@ struct TerminalInfo {
 #[derive(serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 enum WebAction {
-    ApplyTextEdit { span: utils::Span, text: String },
+    ApplyTextEdit { range: utils::Range, text: String },
     GetSource,
     GetTree,
     Shutdown,
@@ -167,14 +167,20 @@ where
             "api/action" => {
                 let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
                 match body {
-                    WebAction::ApplyTextEdit { span, text } => self
-                        .edit_source_text_till::<Down<Here>>(span.start, span.end, &text)
+                    WebAction::ApplyTextEdit { range, text } => self
+                        .edit_source_text_till::<Down<Here>>(range, &text)
                         .map(|(_, transaction)| {
                             rouille::Response::json(&commands_to_web_json(&transaction))
                         })
                         .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
                     WebAction::GetSource => {
-                        match self.query_source_text(None, utils::Span::new(0, usize::MAX)) {
+                        match self.query_source_text(
+                            None,
+                            utils::Range::new(
+                                utils::Position::zero(),
+                                utils::Position::new(usize::MAX, usize::MAX),
+                            ),
+                        ) {
                             Ok(source) => rouille::Response::json(&source),
                             Err(e) => rouille::Response::json(&e).with_status_code(500),
                         }
@@ -202,7 +208,10 @@ where
         let source = <Self as Interface<Tree>>::query_source_text(
             self,
             revision,
-            utils::Span::new(0, usize::MAX),
+            utils::Range::new(
+                utils::Position::zero(),
+                utils::Position::new(usize::MAX, usize::MAX),
+            ),
         )?;
 
         let mut parser = crate::parsec::Parser::new(self.grammar);

@@ -7,7 +7,7 @@ use crate::{
         self,
         layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText},
     },
-    utils::Span,
+    utils::Range,
 };
 
 use super::{
@@ -90,7 +90,7 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
     }
 }
 
-fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
+fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Range, usize)> {
     // Collect staged string lengths for Create commands.
     let mut staged_len: FxHashMap<usize, usize> = FxHashMap::default();
     let mut edit_count = 0usize;

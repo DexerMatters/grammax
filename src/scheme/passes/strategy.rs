@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops, sync::Arc};
 
 use rustc_hash::FxHashMap;
 
@@ -13,7 +13,7 @@ use crate::{
         metrics::EditMetrics,
         reparser::{ReparserConfig, Zipper},
     },
-    utils::Span,
+    utils::Range,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -62,7 +62,7 @@ impl Clone for StrategyCandidate {
 
 pub(crate) struct StrategyContext<'a> {
     pub parser: &'a mut Parser,
-    pub span: Span,
+    pub span: Range,
     pub delta: isize,
     pub specs: Option<&'a RecoverySpecs>,
     pub recovery_strategy: Option<&'a ErrorRecoveryStrategy>,
@@ -88,7 +88,7 @@ struct MemoizedCandidate {
 
 pub(crate) fn pick_candidate(
     ctx: &mut StrategyContext,
-    edit_span: Span,
+    edit_span: ops::Range<usize>,
     kind: EditKind,
 ) -> Option<StrategyCandidate> {
     let eval_start = if ctx.metrics.is_some() {
@@ -110,13 +110,13 @@ pub(crate) fn pick_candidate(
 
         let candidate = match kind {
             EditKind::Insertion => {
-                evaluate_candidate(ctx, zipper, edit_span, true, &mut candidate_memo)
+                evaluate_candidate(ctx, zipper, edit_span.clone(), true, &mut candidate_memo)
             }
             EditKind::Deletion => {
-                evaluate_candidate(ctx, zipper, edit_span, false, &mut candidate_memo)
+                evaluate_candidate(ctx, zipper, edit_span.clone(), false, &mut candidate_memo)
             }
             EditKind::Update => {
-                evaluate_candidate(ctx, zipper, edit_span, true, &mut candidate_memo)
+                evaluate_candidate(ctx, zipper, edit_span.clone(), true, &mut candidate_memo)
             }
         };
 
@@ -162,7 +162,7 @@ fn should_replace(best: &Option<StrategyCandidate>, candidate: &StrategyCandidat
 fn evaluate_candidate(
     ctx: &mut StrategyContext,
     zipper: &Zipper,
-    edit_span: Span,
+    edit_span: ops::Range<usize>,
     enforce_region_end: bool,
     memo: &mut FxHashMap<(usize, usize, usize, bool), Option<MemoizedCandidate>>,
 ) -> Option<StrategyCandidate> {
@@ -249,10 +249,11 @@ fn evaluate_candidate(
     }
 
     if let Some(strategy) = ctx.recovery_strategy {
-        if let Some(sync_point) = strategy.find_sync_point(ctx.parser.text(), ctx.span.end) {
+        let ctx_span = ctx.span.to_byte_range(ctx.parser.text())?;
+        if let Some(sync_point) = strategy.find_sync_point(ctx.parser.text(), ctx_span.end) {
             let is_insertion = enforce_region_end;
             let insertion_spans_sync_point =
-                is_insertion && ctx.span.start <= sync_point && check_end > sync_point;
+                is_insertion && ctx_span.start <= sync_point && check_end > sync_point;
 
             if !insertion_spans_sync_point
                 && sync_point >= zipper.offset
@@ -265,7 +266,8 @@ fn evaluate_candidate(
         }
     }
 
-    let (mut errors_inside, mut errors_outside) = count_errors(&ctx.parser.messages, edit_span);
+    let (mut errors_inside, mut errors_outside) =
+        count_errors(&ctx.parser.messages, edit_span, ctx.parser.text());
 
     if ctx.config.min_level > 0 {
         errors_inside = 0;
@@ -294,12 +296,19 @@ fn evaluate_candidate(
     })
 }
 
-pub(crate) fn count_errors(messages: &ParserMessages, edit_span: Span) -> (usize, usize) {
+pub(crate) fn count_errors(
+    messages: &ParserMessages,
+    edit_span: ops::Range<usize>,
+    source: &str,
+) -> (usize, usize) {
     let mut inside = 0usize;
     let mut outside = 0usize;
 
     for msg in messages {
-        let span = msg.span;
+        let Some(span) = msg.span.to_byte_range(source) else {
+            outside += 1;
+            continue;
+        };
         let overlaps = span.start < edit_span.end && span.end > edit_span.start;
         if overlaps {
             inside += 1;

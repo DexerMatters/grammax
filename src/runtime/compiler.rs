@@ -19,7 +19,7 @@ use crate::{
     interface::Interface,
     runtime::RuntimeService,
     scheme::{self, IR, Pipeline, QueryHandle, layers::SourceText},
-    utils::{self, Span},
+    utils,
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
@@ -940,7 +940,7 @@ pub(crate) struct ComposedCompiler<Tree: TypedTree> {
     settled_layer_path: RuntimePath,
     settled_pass_path: RuntimePath,
     next_revision: AtomicU64,
-    source_len: usize,
+    source_text: String,
     shutdown_hooks: SharedShutdownHooks,
     event_sender: SharedEventSender,
     _marker: PhantomData<fn() -> Tree>,
@@ -948,7 +948,7 @@ pub(crate) struct ComposedCompiler<Tree: TypedTree> {
 
 impl<Tree: TypedTree> ComposedCompiler<Tree> {
     pub fn submit_source(&mut self, txn: SourceTxn) -> RuntimeResult<RevisionId> {
-        let next_len = validate_source_txn_len(self.source_len, &txn)?;
+        let next_text = validate_source_txn(&self.source_text, &txn)?;
         let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
 
         if let Err(err) = (self.submit_top)(revision, txn) {
@@ -956,7 +956,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
             return Err(err);
         }
 
-        self.source_len = next_len;
+        self.source_text = next_text;
         Ok(revision)
     }
 
@@ -1053,7 +1053,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
             settled_layer_path,
             settled_pass_path,
             next_revision: AtomicU64::new(1),
-            source_len: 0,
+            source_text: String::new(),
             shutdown_hooks: core.shutdown_hooks,
             event_sender: core.event_sender,
             _marker: PhantomData,
@@ -1161,56 +1161,12 @@ fn send_runtime_error_text(
     });
 }
 
-fn validate_source_txn_len(
-    current_len: usize,
-    txn: &[scheme::Command<SourceText>],
-) -> RuntimeResult<usize> {
-    let mut len = current_len;
-    let mut staged: Vec<Option<usize>> = Vec::new();
-
-    for command in txn {
-        match command {
-            scheme::Command::Create { id, value } => {
-                if *id >= staged.len() {
-                    staged.resize(*id + 1, None);
-                }
-                staged[*id] = Some(value.len());
-            }
-            scheme::Command::Insert { index, id } => {
-                if index.start != index.end {
-                    return Err(runtime_invalid(format!(
-                        "invalid insert span: start {} != end {}",
-                        index.start, index.end
-                    )));
-                }
-                let frag_len = staged
-                    .get(*id)
-                    .and_then(|v| *v)
-                    .ok_or_else(|| runtime_invalid(format!("unknown staging id: {id}")))?;
-                len = len.saturating_add(frag_len);
-            }
-            scheme::Command::Delete { index } => {
-                let span = clamp_span(*index, len);
-                len = len.saturating_sub(span.end - span.start);
-            }
-            scheme::Command::Replace { index, id } => {
-                let span = clamp_span(*index, len);
-                let frag_len = staged
-                    .get(*id)
-                    .and_then(|v| *v)
-                    .ok_or_else(|| runtime_invalid(format!("unknown staging id: {id}")))?;
-                len = len - (span.end - span.start) + frag_len;
-            }
-        }
-    }
-
-    Ok(len)
-}
-
-fn clamp_span(span: Span, len: usize) -> Span {
-    let start = span.start.min(len);
-    let end = span.end.min(len);
-    Span::new(start.min(end), end)
+fn validate_source_txn(current_text: &str, txn: &[scheme::Command<SourceText>]) -> RuntimeResult<String> {
+    let mut source = SourceText::from_string(current_text.to_owned());
+    source.apply_transaction(std::sync::Arc::new(txn.to_vec())).map_err(|err| {
+        runtime_invalid(format!("invalid source transaction: {err:?}"))
+    })?;
+    Ok(source.text())
 }
 
 fn runtime_invalid(message: impl Into<String>) -> RuntimeError {

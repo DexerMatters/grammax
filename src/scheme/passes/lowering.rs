@@ -18,6 +18,7 @@ use crate::{
             ast::AstMapAny,
         },
     },
+    utils::Position,
 };
 
 type CstCommand = crate::scheme::Command<ParseTreeIR>;
@@ -511,7 +512,7 @@ impl IncrementalLowerer {
         let offset = upstream.offset_at_path(cst_path)?;
         let mut node = upstream
             .viewer(self.grammar)
-            .node(green, offset)
+            .node(green, Position::zero(), offset)
             .with_path(cst_path.clone());
 
         // Attach grammar-derived field name from parent context.

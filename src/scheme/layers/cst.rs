@@ -9,7 +9,7 @@ use crate::{
         view::Viewer,
     },
     scheme::{self, IR},
-    utils::Span,
+    utils::{Position, Range, advance_position_with_text},
 };
 
 #[derive(
@@ -415,27 +415,35 @@ impl ParseTreeIR {
         }
     }
 
-    fn collect_messages_from_green(
-        &self,
-        root: usize,
-        root_offset: usize,
-        out: &mut ParserMessages,
-    ) {
+    fn end_position_of_green(&self, green: usize, start: Position) -> Position {
+        if let Some(text) = self.token_text_of(green) {
+            return advance_position_with_text(start, text);
+        }
+
+        let node = self.alloc.node(green);
+        if node.children.is_empty() {
+            Position::new(start.line, start.character.saturating_add(node.width))
+        } else {
+            node.children.iter().fold(start, |position, child| {
+                self.end_position_of_green(*child, position)
+            })
+        }
+    }
+
+    fn collect_messages_from_green(&self, root: usize, root_position: Position, out: &mut ParserMessages) {
         // Iterative DFS to avoid stack overflow on deep/right-skewed trees.
-        let mut stack: Vec<(usize, usize)> = vec![(root, root_offset)];
-        while let Some((green, offset)) = stack.pop() {
+        let mut stack: Vec<(usize, Position)> = vec![(root, root_position)];
+        while let Some((green, position)) = stack.pop() {
             let node = self.alloc.node(green);
             let tag = node.tag.clone();
-            let width = node.width;
-            // Compute child offsets before dropping the node borrow.
-            let children_with_offsets: Vec<(usize, usize)> = {
-                let mut child_offset = offset;
+            // Compute child positions before dropping the node borrow.
+            let children_with_positions: Vec<(usize, Position)> = {
+                let mut child_position = position;
                 node.children
                     .iter()
                     .map(|&child| {
-                        let w = self.alloc.width_of(child);
-                        let spec = (child, child_offset);
-                        child_offset = child_offset.saturating_add(w);
+                        let spec = (child, child_position);
+                        child_position = self.end_position_of_green(child, child_position);
                         spec
                     })
                     .collect()
@@ -457,13 +465,13 @@ impl ParseTreeIR {
                     }
                 };
                 out.push(ParserMessage {
-                    span: Span::new(offset, offset + width),
+                    span: Range::new(position, self.end_position_of_green(green, position)),
                     message,
                 });
             }
 
             // Push in reverse so children are popped in forward order.
-            for pair in children_with_offsets.into_iter().rev() {
+            for pair in children_with_positions.into_iter().rev() {
                 stack.push(pair);
             }
         }
@@ -480,7 +488,7 @@ impl ParseTreeIR {
         // MissingToken nodes from incremental recovery).  Merge with forwarded
         // messages and deduplicate by span so neither source is lost.
         if let Some(root) = self.root {
-            self.collect_messages_from_green(root, 0, &mut messages);
+            self.collect_messages_from_green(root, Position::zero(), &mut messages);
         }
         messages.sort_by_key(|m| (m.span.start, m.span.end));
         messages.dedup_by(|a, b| a.span == b.span && a.message == b.message);

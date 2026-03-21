@@ -1,5 +1,6 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::hash::Hash;
 use std::ops;
 
@@ -198,134 +199,279 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct Span {
-    pub start: usize,
-    pub end: usize,
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct Position {
+    pub line: usize,
+    pub character: usize,
 }
 
-impl Span {
-    pub const fn new(start: usize, end: usize) -> Self {
-        Span { start, end }
+impl Position {
+    pub const fn new(line: usize, character: usize) -> Self {
+        Self { line, character }
     }
-    pub const fn new_len(offset: usize, len: usize) -> Self {
-        Span {
-            start: offset,
-            end: offset + len,
-        }
+
+    pub const fn zero() -> Self {
+        Self::new(0, 0)
     }
+}
+
+impl From<(usize, usize)> for Position {
+    fn from((line, character): (usize, usize)) -> Self {
+        Self::new(line, character)
+    }
+}
+
+impl From<(&usize, &usize)> for Position {
+    fn from((line, character): (&usize, &usize)) -> Self {
+        Self::new(*line, *character)
+    }
+}
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:{}", self.line, self.character)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+pub struct Range {
+    pub start: Position,
+    pub end: Position,
+}
+
+impl Range {
+    pub const fn new(start: Position, end: Position) -> Self {
+        Self { start, end }
+    }
+
+    pub const fn point(position: Position) -> Self {
+        Self::new(position, position)
+    }
+
     pub const fn empty() -> Self {
-        Span { start: 0, end: 0 }
+        Self::point(Position::zero())
     }
-    pub const fn len(&self) -> usize {
-        if self.end >= self.start {
-            self.end - self.start
-        } else {
-            0
-        }
-    }
+
     pub const fn is_empty(&self) -> bool {
-        self.start == self.end
+        self.start.line == self.end.line && self.start.character == self.end.character
     }
 
-    pub fn start_line_col(&self, text: &str) -> (usize, usize) {
-        let index = LineIndex::new(text);
-        let line_col = index.byte_to_line_col_with_text(self.start, text);
-        (line_col.line, line_col.col)
+    pub fn line_char(&self) -> ((usize, usize), (usize, usize)) {
+        (
+            (self.start.line, self.start.character),
+            (self.end.line, self.end.character),
+        )
     }
 
-    pub fn end_line_col(&self, text: &str) -> (usize, usize) {
-        let index = LineIndex::new(text);
-        let line_col = index.byte_to_line_col_with_text(self.end, text);
-        (line_col.line, line_col.col)
+    pub fn from_byte_range(text: &str, start: usize, end: usize) -> Self {
+        TextIndex::new(text).range_from_byte_range(text, start, end)
+    }
+
+    pub fn to_byte_range(&self, text: &str) -> Option<ops::Range<usize>> {
+        TextIndex::new(text).range_to_byte_range_with_text(*self, text)
     }
 }
 
-impl ops::Add for Span {
-    type Output = Span;
+impl<P: Into<Position>> From<(P, P)> for Range {
+    fn from((start, end): (P, P)) -> Self {
+        Self::new(start.into(), end.into())
+    }
+}
 
-    fn add(self, other: Span) -> Span {
-        Span {
+impl<P: Into<Position>> From<(P,)> for Range {
+    fn from((position,): (P,)) -> Self {
+        Self::point(position.into())
+    }
+}
+
+impl ops::Add for Range {
+    type Output = Range;
+
+    fn add(self, other: Range) -> Range {
+        Range {
             start: self.start,
             end: other.end,
         }
     }
 }
 
-impl From<Span> for ops::Range<usize> {
-    fn from(span: Span) -> Self {
-        span.start..span.end
+impl fmt::Display for Range {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}..{}", self.start, self.end)
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct LineIndex {
+pub fn advance_position_with_text(mut position: Position, text: &str) -> Position {
+    for ch in text.chars() {
+        if ch == '\n' {
+            position.line += 1;
+            position.character = 0;
+        } else {
+            position.character += ch.len_utf16();
+        }
+    }
+    position
+}
+
+pub fn advance_position_by_bytes(
+    text: &str,
+    byte_offset: usize,
+    position: Position,
+    byte_len: usize,
+) -> Position {
+    let start = byte_offset.min(text.len());
+    let end = start.saturating_add(byte_len).min(text.len());
+    match text.get(start..end) {
+        Some(fragment) => advance_position_with_text(position, fragment),
+        None => position,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TextIndex {
     line_starts: Vec<usize>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LineCol {
-    pub line: usize,
-    pub col: usize,
-}
-
-impl LineIndex {
+impl TextIndex {
     pub fn new(text: &str) -> Self {
         let mut line_starts = vec![0];
-        let mut line_utf16_offsets = vec![0];
-        let mut utf16_offset = 0;
 
         let mut chars = text.char_indices().peekable();
         while let Some((_byte_pos, ch)) = chars.next() {
-            let ch_utf16_len = ch.len_utf16();
-            utf16_offset += ch_utf16_len;
-
             if ch == '\n' {
-                // Next line starts after this \n
                 if let Some(&(next_byte_pos, _)) = chars.peek() {
                     line_starts.push(next_byte_pos);
-                    line_utf16_offsets.push(utf16_offset);
                 }
             }
         }
 
-        LineIndex { line_starts }
+        TextIndex { line_starts }
     }
 
-    pub fn byte_to_line_col_with_text(&self, byte_pos: usize, text: &str) -> LineCol {
-        // Binary search for the line containing this byte offset
+    pub fn range_from_byte_range(&self, text: &str, start: usize, end: usize) -> Range {
+        Range {
+            start: self.byte_to_position_with_text(start, text),
+            end: self.byte_to_position_with_text(end, text),
+        }
+    }
+
+    pub fn byte_to_position_with_text(&self, byte_pos: usize, text: &str) -> Position {
+        let clamped_byte = byte_pos.min(text.len());
         let line_idx = self
             .line_starts
-            .binary_search(&byte_pos)
+            .binary_search(&clamped_byte)
             .unwrap_or_else(|next_idx| next_idx.saturating_sub(1));
 
-        let line = line_idx + 1; // Convert to 1-indexed
         let line_start_byte = self.line_starts[line_idx];
-
-        // Find the end of this line
         let line_end_byte = self
             .line_starts
             .get(line_idx + 1)
             .copied()
             .unwrap_or(text.len());
-
-        // Get the line text
         let line_text = &text[line_start_byte..line_end_byte];
-
-        // Compute UTF-16 column: count UTF-16 code units from line start to the position within the line
-        let offset_in_line = byte_pos.saturating_sub(line_start_byte);
-        let mut col = 0;
+        let offset_in_line = clamped_byte.saturating_sub(line_start_byte);
+        let mut character = 0;
 
         for (byte_offset, ch) in line_text.char_indices() {
             if byte_offset >= offset_in_line {
                 break;
             }
-            col += ch.len_utf16();
+            character += ch.len_utf16();
         }
 
-        LineCol { line, col }
+        Position {
+            line: line_idx,
+            character,
+        }
+    }
+
+    pub fn position_to_byte_with_text(&self, position: Position, text: &str) -> Option<usize> {
+        let line_start = *self.line_starts.get(position.line)?;
+        let line_end = self
+            .line_starts
+            .get(position.line + 1)
+            .copied()
+            .unwrap_or(text.len());
+        let line_text = &text[line_start..line_end];
+
+        if position.character == 0 {
+            return Some(line_start);
+        }
+
+        let mut utf16_offset = 0;
+        for (byte_offset, ch) in line_text.char_indices() {
+            if utf16_offset == position.character {
+                return Some(line_start + byte_offset);
+            }
+            utf16_offset += ch.len_utf16();
+            if utf16_offset == position.character {
+                return Some(line_start + byte_offset + ch.len_utf8());
+            }
+            if utf16_offset > position.character {
+                return None;
+            }
+        }
+
+        if utf16_offset == position.character {
+            Some(line_end)
+        } else {
+            None
+        }
+    }
+
+    pub fn clamp_position_with_text(&self, position: Position, text: &str) -> Position {
+        let Some(&line_start) = self
+            .line_starts
+            .get(position.line.min(self.line_starts.len().saturating_sub(1)))
+        else {
+            return Position::zero();
+        };
+        let clamped_line = position.line.min(self.line_starts.len().saturating_sub(1));
+        let line_end = self
+            .line_starts
+            .get(clamped_line + 1)
+            .copied()
+            .unwrap_or(text.len());
+        let line_text = &text[line_start..line_end];
+
+        let mut utf16_offset = 0;
+        for ch in line_text.chars() {
+            let next_offset = utf16_offset + ch.len_utf16();
+            if next_offset > position.character {
+                break;
+            }
+            utf16_offset = next_offset;
+        }
+
+        Position::new(clamped_line, utf16_offset)
+    }
+
+    pub fn clamp_range_with_text(&self, range: Range, text: &str) -> Range {
+        let start = self.clamp_position_with_text(range.start, text);
+        let end = self.clamp_position_with_text(range.end, text);
+        if start <= end {
+            Range::new(start, end)
+        } else {
+            Range::new(end, end)
+        }
+    }
+
+    pub fn range_to_byte_range_with_text(
+        &self,
+        range: Range,
+        text: &str,
+    ) -> Option<ops::Range<usize>> {
+        let start = self.position_to_byte_with_text(range.start, text)?;
+        let end = self.position_to_byte_with_text(range.end, text)?;
+        if start <= end { Some(start..end) } else { None }
     }
 }
+
+pub(crate) type LineIndex = TextIndex;
 
 use std::any::Any;
 

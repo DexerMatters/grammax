@@ -1,7 +1,7 @@
 use crate::grammar::GrammarError;
 use crate::grammar::ir::{NormalizedNode, Production, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::utils::Span;
+use crate::utils::Range;
 use std::fmt;
 
 const RESET: &str = "\x1b[0m";
@@ -146,7 +146,7 @@ impl fmt::Display for Symbol {
     }
 }
 
-/// Format a grammar error with source context showing the problematic span
+/// Format a grammar error with source context showing the problematic range.
 pub fn format_grammar_error(error: &GrammarError, source: &str) -> String {
     use std::fmt::Write;
 
@@ -158,22 +158,23 @@ pub fn format_grammar_error(error: &GrammarError, source: &str) -> String {
         return format_grammar_error_message(error);
     }
 
-    let span = match error {
+    let range = match error {
         GrammarError::UnboundRuleReference(span, _)
         | GrammarError::DuplicateRuleName(span, _)
         | GrammarError::NoStartRule(span)
         | GrammarError::DropCountExceedsNodeLength(span)
         | GrammarError::DropOnNonReference(span) => span,
-        _ => &Span::empty(),
+        _ => &Range::empty(),
     };
 
-    // If span is empty (start == end == 0), just show the error message
-    if span.start == 0 && span.end == 0 {
+    if range.is_empty() {
         return format_grammar_error_message(error);
     }
 
-    let (start_line, start_col) = Span::new(span.start, span.start).start_line_col(source);
-    let (end_line, end_col) = Span::new(span.end, span.end).end_line_col(source);
+    let start_line = range.start.line;
+    let start_col = range.start.character;
+    let end_line = range.end.line;
+    let end_col = range.end.character;
 
     let error_msg = match error {
         GrammarError::UnboundRuleReference(_, name) => {
@@ -258,24 +259,24 @@ fn format_error_context(
 ) {
     use std::fmt::Write;
 
-    if lines.is_empty() || start_line == 0 {
+    if lines.is_empty() || start_line >= lines.len() {
         return;
     }
 
-    let line_idx = start_line - 1; // Convert to 0-indexed
+    let line_idx = start_line;
     let context_before = if line_idx > 0 { 1 } else { 0 };
     let context_after = if line_idx + 1 < lines.len() { 1 } else { 0 };
 
     let first_line = line_idx.saturating_sub(context_before);
     let last_line = (line_idx + context_after).min(lines.len() - 1);
-    let gutter_width = format!("{}", last_line + 1).len().max(1);
+    let gutter_width = format!("{}", last_line).len().max(1);
 
     // Show lines before
     for i in first_line..line_idx {
         let _ = write!(
             out,
             "\n{:>width$} | {}",
-            i + 1,
+            i,
             lines[i],
             width = gutter_width
         );
@@ -286,7 +287,7 @@ fn format_error_context(
         out,
         "\n{}{:>width$} | {}{}",
         RED,
-        line_idx + 1,
+        line_idx,
         lines[line_idx],
         RESET,
         width = gutter_width
@@ -312,7 +313,7 @@ fn format_error_context(
         let _ = write!(
             out,
             "\n{:>width$} | {}",
-            i + 1,
+            i,
             lines[i],
             width = gutter_width
         );

@@ -1,16 +1,16 @@
 use rustc_hash::FxHashMap;
 
 use crate::scheme::{Command, IR, Transaction};
-use crate::utils::Span;
+use crate::utils::{Range, TextIndex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceTextError {
     /// The staged id was never created in this transaction.
     UnknownStagingId(usize),
-    /// The span references a byte range that falls outside the current text.
-    InvalidSpan { span: Span, text_len: usize },
+    /// The range references a position outside the current text.
+    InvalidRange { range: Range, text_len: usize },
     /// An Insert target must have `start == end`.
-    NotAnInsertionPoint { span: Span },
+    NotAnInsertionPoint { range: Range },
 }
 
 // ── Gap buffer ─────────────────────────────────────────────────────────────────
@@ -185,67 +185,79 @@ impl SourceText {
             .ok_or(SourceTextError::UnknownStagingId(id))
     }
 
-    fn validate_span(&self, span: Span) -> Result<(), SourceTextError> {
-        let len = self.gap.len();
-        if span.start <= span.end && span.end <= len {
-            Ok(())
-        } else {
-            Err(SourceTextError::InvalidSpan {
-                span,
-                text_len: len,
+    fn byte_range_in(
+        &self,
+        range: Range,
+        text: &str,
+        index: &TextIndex,
+    ) -> Result<std::ops::Range<usize>, SourceTextError> {
+        index
+            .range_to_byte_range_with_text(range, text)
+            .ok_or(SourceTextError::InvalidRange {
+                range,
+                text_len: text.len(),
             })
-        }
     }
 
-    fn clamp_span(&self, span: Span) -> Span {
-        let len = self.gap.len();
-        let start = span.start.min(len);
-        let end = span.end.min(len);
-        Span::new(start.min(end), end)
+    fn clamp_range_in(&self, range: Range, text: &str, index: &TextIndex) -> Range {
+        index.clamp_range_with_text(range, text)
     }
 }
 
 // ── IR impl ──────────────────────────────────────────────────────────────────
 
 impl IR for SourceText {
-    type Ix = Span;
+    type Ix = Range;
     /// A text fragment (either stored or staged).
     type Value = String;
     type Error = SourceTextError;
 
     /// Query a substring (the `Value` at `index`).
-    fn query(&self, index: Span) -> Result<String, Self::Error> {
-        let span = self.clamp_span(index);
-        self.validate_span(span)?;
-        Ok(self.gap.slice(span.start, span.end))
+    fn query(&self, index: Range) -> Result<String, Self::Error> {
+        let text = self.text();
+        let text_index = TextIndex::new(&text);
+        let range = self.clamp_range_in(index, &text, &text_index);
+        let byte_range = self.byte_range_in(range, &text, &text_index)?;
+        Ok(self.gap.slice(byte_range.start, byte_range.end))
     }
 
     /// Clears staging table then applies the transaction directly.
     fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Error> {
         self.staging.clear();
+        let mut text = self.text();
+        let mut text_index = TextIndex::new(&text);
         for command in transaction.iter() {
             match command {
                 Command::Create { id, value } => {
                     self.staging.insert(*id, value.clone());
                 }
                 Command::Insert { index, id } => {
-                    if index.start != index.end {
-                        return Err(SourceTextError::NotAnInsertionPoint { span: *index });
+                    if !index.is_empty() {
+                        return Err(SourceTextError::NotAnInsertionPoint { range: *index });
                     }
-                    let at = index.start.min(self.gap.len());
+                    let range = self.clamp_range_in(*index, &text, &text_index);
+                    let byte_range = self.byte_range_in(range, &text, &text_index)?;
+                    let at = byte_range.start;
                     let fragment = self.ensure_staged(*id)?.to_owned();
                     self.gap.insert_str(at, &fragment);
+                    text.insert_str(at, &fragment);
+                    text_index = TextIndex::new(&text);
                 }
                 Command::Delete { index } => {
-                    let span = self.clamp_span(*index);
-                    self.validate_span(span)?;
-                    self.gap.drain(span.start, span.end);
+                    let range = self.clamp_range_in(*index, &text, &text_index);
+                    let byte_range = self.byte_range_in(range, &text, &text_index)?;
+                    self.gap.drain(byte_range.start, byte_range.end);
+                    text.replace_range(byte_range.clone(), "");
+                    text_index = TextIndex::new(&text);
                 }
                 Command::Replace { index, id } => {
-                    let span = self.clamp_span(*index);
-                    self.validate_span(span)?;
+                    let range = self.clamp_range_in(*index, &text, &text_index);
+                    let byte_range = self.byte_range_in(range, &text, &text_index)?;
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.gap.replace_range(span.start, span.end, &fragment);
+                    self.gap
+                        .replace_range(byte_range.start, byte_range.end, &fragment);
+                    text.replace_range(byte_range, &fragment);
+                    text_index = TextIndex::new(&text);
                 }
             }
         }

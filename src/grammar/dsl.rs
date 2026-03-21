@@ -12,7 +12,7 @@ use crate::{
         view::{ViewAction, Viewer},
         words::{self, EndOfInput, IDENT, IntoMatcher, NUMBER, STRING},
     },
-    utils::Span,
+    utils::Range,
 };
 
 thread_local! {
@@ -85,7 +85,7 @@ fn translate_dsl_grammar(result: parsec::Result<'_>) -> Result<&'static Grammar,
     let registry = edsl::GrammarRegistry::from_map(registry_map);
     start_rule
         .map(|start| Grammar::new_uncached_with_registry(start, registry))
-        .unwrap_or_else(|| Err(GrammarError::NoStartRule(Span::empty())))
+        .unwrap_or_else(|| Err(GrammarError::NoStartRule(Range::empty())))
 }
 
 fn build_dsl_viewer(result: &parsec::Result<'_>) -> Viewer {
@@ -263,7 +263,7 @@ fn repetition_node(
     expr: GrammarNode,
     sep: Option<GrammarNode>,
     min: usize,
-    span: Span,
+    span: Range,
 ) -> GrammarNode {
     if let Some(separator) = sep {
         GrammarNode::SeparatedRepetition {
@@ -283,8 +283,8 @@ fn repetition_node(
     }
 }
 
-fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNode {
-    fn mk(raw: bool, matcher: impl IntoMatcher, span: Span) -> GrammarNode {
+fn grammar_token_from_text(token_name: &str, span: Range, raw: bool) -> GrammarNode {
+    fn mk(raw: bool, matcher: impl IntoMatcher, span: Range) -> GrammarNode {
         let matcher = if raw {
             matcher.into_matcher_ref()
         } else {
@@ -303,7 +303,7 @@ fn grammar_token_from_text(token_name: &str, span: Span, raw: bool) -> GrammarNo
     }
 }
 
-fn grammar_literal_from_text(text: &str, span: Span, raw: bool) -> GrammarNode {
+fn grammar_literal_from_text(text: &str, span: Range, raw: bool) -> GrammarNode {
     let text = text.trim();
     let text = Box::leak(text.to_string().into_boxed_str()) as &'static str;
     let matcher = if raw {
@@ -314,7 +314,7 @@ fn grammar_literal_from_text(text: &str, span: Span, raw: bool) -> GrammarNode {
     GrammarNode::Terminal(matcher, span)
 }
 
-fn grammar_regex_from_text(pattern: &str, span: Span, raw: bool) -> GrammarNode {
+fn grammar_regex_from_text(pattern: &str, span: Range, raw: bool) -> GrammarNode {
     let normalized = pattern.replace("\\/", "/");
     let matcher = words::regex(&normalized);
     let matcher = if raw {

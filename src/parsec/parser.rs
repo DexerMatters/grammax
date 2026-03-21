@@ -16,7 +16,7 @@ use crate::parsec::tree::{
     GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt, TreeBuilder,
 };
 use crate::parsec::view::{NodeView, Viewer};
-use crate::utils::{LruCache, Span};
+use crate::utils::{LruCache, Position, Range, TextIndex};
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
 const DEFAULT_REUSE_CAPACITY: usize = 4096;
@@ -134,6 +134,7 @@ pub struct Parser {
     config: ParserConfig,
 
     text: String,
+    text_index: TextIndex,
     pos: usize,
 
     // For incremental/reparsing (stubs)
@@ -156,6 +157,7 @@ impl Parser {
             messages: vec![],
             config: ParserConfig::default(),
             text: String::new(),
+            text_index: TextIndex::new(""),
             pos: 0,
             inc_insert_pos: None,
             bracketed_scope_opened: false,
@@ -180,6 +182,24 @@ impl Parser {
         &self.text
     }
 
+    pub(crate) fn text_index(&self) -> &TextIndex {
+        &self.text_index
+    }
+
+    pub(crate) fn position_to_byte(&self, position: Position) -> Option<usize> {
+        self.text_index
+            .position_to_byte_with_text(position, &self.text)
+    }
+
+    pub(crate) fn byte_range(&self, range: Range) -> Option<std::ops::Range<usize>> {
+        self.text_index
+            .range_to_byte_range_with_text(range, &self.text)
+    }
+
+    pub(crate) fn clamp_range(&self, range: Range) -> Range {
+        self.text_index.clamp_range_with_text(range, &self.text)
+    }
+
     pub(crate) fn recovery_specs(&mut self) -> Option<&RecoverySpecs> {
         if self.recovery_specs_cache.is_none() {
             let strategy = self.build_recovery_strategy();
@@ -197,8 +217,18 @@ impl Parser {
         self.inc_insert_pos = pos;
     }
 
+    fn range_from_bytes(&self, start: usize, end: usize) -> Range {
+        self.text_index
+            .range_from_byte_range(&self.text, start, end)
+    }
+
+    fn point_range(&self, pos: usize) -> Range {
+        self.range_from_bytes(pos, pos)
+    }
+
     pub(crate) fn set_text(&mut self, text: &str) {
         self.text = text.to_string();
+        self.text_index = TextIndex::new(&self.text);
         self.recovery_specs_cache = None;
     }
 
@@ -212,6 +242,7 @@ impl Parser {
 
     pub fn parse_text<'a>(&mut self, text: &'a str) -> Result<'a> {
         self.text = text.to_string();
+        self.text_index = TextIndex::new(&self.text);
         self.recovery_specs_cache = None;
         self.pos = 0;
         self.messages.clear();
@@ -242,7 +273,7 @@ impl Parser {
                         self.update_bracketed_scope(term_idx);
                         if let Tag::Error(_) = self.alloc.get_node(token_node).tag {
                             self.messages.push(ParserMessage::new_unexpected(
-                                Span::new(self.pos, self.pos + token_len),
+                                self.range_from_bytes(self.pos, self.pos + token_len),
                                 self.expected_ids_for_analysis(
                                     &self.grammar.analysis,
                                     current_state_idx,
@@ -299,7 +330,7 @@ impl Parser {
                         }
                         if !self.perform_reduce(prod_idx, &mut state_stack, &mut node_stack) {
                             self.messages.push(ParserMessage::new_unexpected(
-                                Span::new(self.pos, self.pos),
+                                self.point_range(self.pos),
                                 Vec::new(),
                             ));
                             break;
@@ -332,7 +363,7 @@ impl Parser {
                     let expected = self.expected_ids(*state_stack.last().unwrap());
                     let end = (self.pos + token_len).min(self.text.len());
                     self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(self.pos, end),
+                        self.range_from_bytes(self.pos, end),
                         expected,
                     ));
                     break;
@@ -515,7 +546,7 @@ impl Parser {
 
                 if repairs.is_empty() {
                     self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(self.pos, self.pos),
+                        self.point_range(self.pos),
                         self.expected_ids(*state_stack.last().unwrap()),
                     ));
                     break;
@@ -524,7 +555,7 @@ impl Parser {
                 let ops = &repairs[0];
                 if ops.is_empty() {
                     self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(self.pos, self.pos),
+                        self.point_range(self.pos),
                         self.expected_ids(*state_stack.last().unwrap()),
                     ));
                     break;
@@ -536,7 +567,7 @@ impl Parser {
 
                 if !self.apply_repair_ops(ops, &mut state_stack, &mut node_stack) {
                     self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(self.pos, self.pos),
+                        self.point_range(self.pos),
                         self.expected_ids(*state_stack.last().unwrap()),
                     ));
                     break;
@@ -547,7 +578,7 @@ impl Parser {
                     && node_stack == old_node_stack
                 {
                     self.messages.push(ParserMessage::new_unexpected(
-                        Span::new(self.pos, self.pos),
+                        self.point_range(self.pos),
                         self.expected_ids(*state_stack.last().unwrap()),
                     ));
                     break;
@@ -641,7 +672,7 @@ impl Parser {
                     self.update_bracketed_scope(term_idx);
                     if let Tag::Error(_) = self.alloc.get_node(token_node).tag {
                         self.messages.push(ParserMessage::new_unexpected(
-                            Span::new(self.pos, self.pos + token_len),
+                            self.range_from_bytes(self.pos, self.pos + token_len),
                             self.expected_ids_for_analysis(&analysis, current_state_idx, true),
                         ));
                     }
@@ -660,7 +691,7 @@ impl Parser {
                         &analysis,
                     ) {
                         self.messages.push(ParserMessage::new_unexpected(
-                            Span::new(self.pos, self.pos),
+                            self.point_range(self.pos),
                             Vec::new(),
                         ));
                         return self.finalize_parse_rule_failure(
@@ -726,7 +757,7 @@ impl Parser {
 
         if self.messages.is_empty() {
             self.messages.push(ParserMessage::new_unexpected(
-                Span::new(pos, pos + expected_width),
+                self.range_from_bytes(pos, pos + expected_width),
                 Vec::new(),
             ));
         }
@@ -804,9 +835,12 @@ impl Parser {
             .relative_messages
             .iter()
             .cloned()
-            .map(|mut msg| {
-                msg.span = Span::new(msg.span.start + pos, msg.span.end + pos);
-                msg
+            .filter_map(|mut msg| {
+                let cached_index = TextIndex::new(cached.slice.as_ref());
+                let relative =
+                    cached_index.range_to_byte_range_with_text(msg.span, cached.slice.as_ref())?;
+                msg.span = self.range_from_bytes(relative.start + pos, relative.end + pos);
+                Some(msg)
             })
             .collect();
 
@@ -836,12 +870,13 @@ impl Parser {
 
         let relative_messages = messages
             .into_iter()
-            .map(|mut msg| {
-                msg.span = Span::new(
-                    msg.span.start.saturating_sub(pos),
-                    msg.span.end.saturating_sub(pos),
-                );
-                msg
+            .filter_map(|mut msg| {
+                let absolute = self.byte_range(msg.span)?;
+                let start = absolute.start.saturating_sub(pos);
+                let end = absolute.end.saturating_sub(pos);
+                let slice_index = TextIndex::new(&slice);
+                msg.span = slice_index.range_from_byte_range(&slice, start, end);
+                Some(msg)
             })
             .collect();
 
@@ -1144,7 +1179,7 @@ impl Parser {
                         self.alloc.alloc_token(Tag::new_token(term_ix), 0)
                     } else {
                         self.messages.push(ParserMessage::new_missing(
-                            Span::new(self.pos, self.pos),
+                            self.point_range(self.pos),
                             vec![term_ix],
                         ));
                         self.alloc.alloc(
@@ -1422,7 +1457,7 @@ impl Parser {
                             self.alloc.alloc_token(Tag::new_token(term_ix), 0)
                         } else {
                             self.messages.push(ParserMessage::new_missing(
-                                Span::new(self.pos, self.pos),
+                                self.point_range(self.pos),
                                 vec![term_ix],
                             ));
                             self.alloc.alloc(
@@ -1789,7 +1824,7 @@ impl Parser {
         };
 
         self.messages.push(ParserMessage::new_missing(
-            Span::new(self.pos, self.pos),
+            self.point_range(self.pos),
             vec![chosen],
         ));
         let missing = self.alloc.alloc(
@@ -1905,7 +1940,7 @@ impl Parser {
             }
 
             self.messages.push(ParserMessage::new_missing(
-                Span::new(self.pos, self.pos),
+                self.point_range(self.pos),
                 vec![candidate],
             ));
             let missing = self.alloc.alloc(
@@ -1951,7 +1986,7 @@ impl Parser {
             return;
         }
         self.messages.push(ParserMessage::new_unexpected(
-            Span::new(start + leading_ws, start + trailing_ws),
+            self.range_from_bytes(start + leading_ws, start + trailing_ws),
             expected,
         ));
     }

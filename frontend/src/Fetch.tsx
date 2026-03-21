@@ -9,13 +9,18 @@ export interface RuleInfo {
 }
 
 export interface Span {
-  start: number;
-  end: number;
+  line: number;
+  character: number;
+}
+
+export interface Range {
+  start: Span;
+  end: Span;
 }
 
 export interface ApplyTextEditAction {
   type: 'applyTextEdit';
-  span: Span;
+  range: Range;
   text: string;
   completion?: unknown;
 }

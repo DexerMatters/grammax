@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rustc_hash::FxHashMap;
 
 use crate::parsec::{self, Parser};
-use crate::utils::Span;
+use crate::utils::Range;
 
 /// Static storage for cached grammars
 /// Maps cache key to static reference of Grammar
@@ -68,11 +68,11 @@ macro_rules! new_grammar_no_cache {
 #[derive(Debug)]
 pub enum GrammarError {
     ParseError(String),
-    UnboundRuleReference(Span, String),
-    DuplicateRuleName(Span, String),
-    NoStartRule(Span),
-    DropCountExceedsNodeLength(Span),
-    DropOnNonReference(Span),
+    UnboundRuleReference(Range, String),
+    DuplicateRuleName(Range, String),
+    NoStartRule(Range),
+    DropCountExceedsNodeLength(Range),
+    DropOnNonReference(Range),
     UncacheableMatcher(String),
     IoError(io::Error),
 }
@@ -157,7 +157,7 @@ impl Grammar {
         registry: edsl::GrammarRegistry,
     ) -> Result<&'static Self, GrammarError> {
         let node = registry.get(start_rule).cloned().ok_or_else(|| {
-            GrammarError::UnboundRuleReference(Span::empty(), start_rule.to_string())
+            GrammarError::UnboundRuleReference(Range::empty(), start_rule.to_string())
         })?;
 
         let table = norm::RuleTable::normalize_with_registry(node, start_rule, Some(registry))?;

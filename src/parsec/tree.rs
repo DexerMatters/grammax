@@ -7,6 +7,7 @@ use std::rc::Rc;
 
 use crate::grammar::Grammar;
 use crate::parsec::ParserConfig;
+use crate::utils::Position;
 
 /// Error types that can occur during parsing, used for error reporting and recovery.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
@@ -112,11 +113,11 @@ impl Tag {
 }
 
 /// Red nodes are the nodes in the "red" syntax tree,
-/// which includes parent references and offsets for easier traversal and error reporting.
+/// which includes parent references and source positions for easier traversal and error reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RedNode {
     pub parent: Option<Rc<RedNode>>,
-    pub offset: usize,
+    pub position: Position,
     pub green: GreenId,
 }
 
@@ -126,7 +127,7 @@ impl RedNode {
     pub fn root(green: GreenId) -> Self {
         Self {
             parent: None,
-            offset: 0,
+            position: Position::zero(),
             green,
         }
     }

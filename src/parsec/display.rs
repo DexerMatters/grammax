@@ -4,7 +4,7 @@ use crate::grammar::Grammar;
 use crate::grammar::analysis::EOF_TOKEN;
 use crate::parsec::msg::{ErrorMessage, ParserMessage};
 use crate::parsec::tree::{GreenId, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
-use crate::utils::Span;
+use crate::utils::{Position, TextIndex, advance_position_by_bytes};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -15,6 +15,9 @@ const RED: &str = "\x1b[31m";
 pub fn format_ast(grammar: &Grammar, root: &RedNode, alloc: &TreeAllocRef, source: &str) -> String {
     let mut out = String::new();
     let mut stack = Vec::new();
+    let root_byte_offset = TextIndex::new(source)
+        .position_to_byte_with_text(root.position, source)
+        .unwrap_or(0);
     display_with_indent(
         grammar,
         alloc,
@@ -23,7 +26,8 @@ pub fn format_ast(grammar: &Grammar, root: &RedNode, alloc: &TreeAllocRef, sourc
         "",
         true,
         true,
-        root.offset,
+        root.position,
+        root_byte_offset,
         &mut out,
         &mut stack,
     );
@@ -40,8 +44,7 @@ pub fn format_messages_with_source(
     let mut out = String::new();
     let lines: Vec<&str> = source.lines().collect();
 
-    // Group errors by (span, error_type) to accumulate expected tokens
-    let mut grouped: BTreeMap<(usize, usize, &str), (bool, Vec<usize>)> = BTreeMap::new();
+    let mut grouped: BTreeMap<(Position, Position, &str), (bool, Vec<usize>)> = BTreeMap::new();
 
     for msg in messages {
         let (msg_type, is_missing) = match &msg.message {
@@ -72,16 +75,10 @@ pub fn format_messages_with_source(
         }
         first = false;
 
-        let (start_line, start_col) = Span {
-            start: start_pos,
-            end: start_pos,
-        }
-        .start_line_col(source);
-        let (end_line, end_col) = Span {
-            start: start_pos,
-            end: start_pos,
-        }
-        .end_line_col(source);
+        let start_line = start_pos.line;
+        let start_col = start_pos.character;
+        let end_line = start_pos.line;
+        let end_col = start_pos.character;
 
         let display_type = match msg_type {
             "unexpected" => "error: unexpected token",
@@ -121,27 +118,21 @@ fn format_error_context(
     end_col: usize,
     is_missing: bool,
 ) {
-    if lines.is_empty() || start_line == 0 {
+    if lines.is_empty() || start_line >= lines.len() {
         return;
     }
 
-    let line_idx = start_line - 1; // Convert to 0-indexed
+    let line_idx = start_line;
     let context_before = if line_idx > 0 { 1 } else { 0 };
     let context_after = if line_idx + 1 < lines.len() { 1 } else { 0 };
 
     let first_line = line_idx.saturating_sub(context_before);
     let last_line = (line_idx + context_after).min(lines.len() - 1);
-    let gutter_width = format!("{}", last_line + 1).len().max(1);
+    let gutter_width = format!("{}", last_line).len().max(1);
 
     // Show lines before
     for i in first_line..line_idx {
-        let _ = write!(
-            out,
-            "\n{:>width$} | {}",
-            i + 1,
-            lines[i],
-            width = gutter_width
-        );
+        let _ = write!(out, "\n{:>width$} | {}", i, lines[i], width = gutter_width);
     }
 
     // Show error line with red coloring
@@ -149,7 +140,7 @@ fn format_error_context(
         out,
         "\n{}{:>width$} | {}{}",
         RED,
-        line_idx + 1,
+        line_idx,
         lines[line_idx],
         RESET,
         width = gutter_width
@@ -178,13 +169,7 @@ fn format_error_context(
 
     // Show lines after
     for i in (line_idx + 1)..=last_line {
-        let _ = write!(
-            out,
-            "\n{:>width$} | {}",
-            i + 1,
-            lines[i],
-            width = gutter_width
-        );
+        let _ = write!(out, "\n{:>width$} | {}", i, lines[i], width = gutter_width);
     }
 }
 
@@ -196,13 +181,14 @@ fn display_with_indent(
     prefix: &str,
     is_last: bool,
     is_root: bool,
-    offset: usize,
+    position: Position,
+    byte_offset: usize,
     out: &mut String,
     stack: &mut Vec<GreenId>,
 ) {
     if stack.contains(&id) {
         let node = alloc.get_node(id);
-        let (label, extra) = format_label(grammar, alloc, source, id, offset);
+        let (label, extra) = format_label(grammar, alloc, source, id, byte_offset);
         let width = format!(" {}[width: {}]{}", DIM, node.width, RESET);
 
         let branch = if is_root {
@@ -240,7 +226,8 @@ fn display_with_indent(
         if let Some(&child_id) = node.children.first() {
             let child = alloc.get_node(child_id);
             let marker = format!("{}{}:{} ", YELLOW, name, RESET);
-            let (child_label, child_extra) = format_label(grammar, alloc, source, child_id, offset);
+            let (child_label, child_extra) =
+                format_label(grammar, alloc, source, child_id, byte_offset);
             let label = format!("{}{}", marker, child_label);
             let width = format!(" {}[width: {}]{}", DIM, node.width, RESET);
 
@@ -271,7 +258,8 @@ fn display_with_indent(
                 .copied()
                 .filter(|child_id| !is_silent_token(alloc, *child_id))
                 .collect();
-            let mut running_offset = offset;
+            let mut running_position = position;
+            let mut running_byte_offset = byte_offset;
             for (idx, &grandchild_id) in visible_grandchildren.iter().enumerate() {
                 let last = idx + 1 == visible_grandchildren.len();
                 display_with_indent(
@@ -282,21 +270,25 @@ fn display_with_indent(
                     &child_prefix,
                     last,
                     false,
-                    running_offset,
+                    running_position,
+                    running_byte_offset,
                     out,
                     stack,
                 );
                 if !last {
                     out.push('\n');
                 }
-                running_offset += alloc.get_node(grandchild_id).width;
+                let width = alloc.get_node(grandchild_id).width;
+                running_position =
+                    advance_position_by_bytes(source, running_byte_offset, running_position, width);
+                running_byte_offset += width;
             }
             stack.pop();
             return;
         }
     }
 
-    let (label, extra) = format_label(grammar, alloc, source, id, offset);
+    let (label, extra) = format_label(grammar, alloc, source, id, byte_offset);
     let width = format!(" {}[width: {}]{}", DIM, node.width, RESET);
 
     let _ = write!(out, "{}{}{}{}{}", prefix, branch, label, width, extra);
@@ -326,7 +318,8 @@ fn display_with_indent(
         .copied()
         .filter(|child_id| !is_silent_token(alloc, *child_id))
         .collect();
-    let mut child_offset = offset;
+    let mut child_position = position;
+    let mut child_byte_offset = byte_offset;
     for (idx, &child_id) in visible_children.iter().enumerate() {
         let last = idx + 1 == visible_children.len();
         display_with_indent(
@@ -337,14 +330,18 @@ fn display_with_indent(
             &child_prefix,
             last,
             false,
-            child_offset,
+            child_position,
+            child_byte_offset,
             out,
             stack,
         );
         if !last {
             out.push('\n');
         }
-        child_offset += alloc.get_node(child_id).width;
+        let width = alloc.get_node(child_id).width;
+        child_position =
+            advance_position_by_bytes(source, child_byte_offset, child_position, width);
+        child_byte_offset += width;
     }
 
     stack.pop();
@@ -360,7 +357,7 @@ fn format_label(
     alloc: &TreeAllocRef,
     source: &str,
     id: GreenId,
-    offset: usize,
+    byte_offset: usize,
 ) -> (String, String) {
     let node = alloc.get_node(id);
     match &node.tag {
@@ -374,8 +371,8 @@ fn format_label(
         }
         Tag::Token { .. } => {
             if node.children.is_empty() {
-                let end = offset.saturating_add(node.width).min(source.len());
-                let slice = source.get(offset..end).unwrap_or("");
+                let end = byte_offset.saturating_add(node.width).min(source.len());
+                let slice = source.get(byte_offset..end).unwrap_or("");
                 let text = pretty_string(slice.to_string());
                 (format!("{}{}{}", GREEN, text, RESET), String::new())
             } else {

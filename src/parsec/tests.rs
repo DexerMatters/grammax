@@ -8,19 +8,17 @@ use crate::scheme::layers::AstCell;
 #[test]
 fn test_simple_whitespaces() {
     let grammar = new_grammar_no_cache!(
-        start where
-        start -> r!(expr) + tt(EndOfInput)
-        expr -> r!(list1) | r!(list2)
-        id -> tt(NUMBER)
-        list1 -> tt("(") + sep(r!(id), tt(",")) + tt(")")
-        list2 -> tt("(") + sep(r!(id), t(" ")) + tt(")")
+      lilies where lilies -> r!(exprs)
+      exprs -> r!(strings)
+      strings -> r!(normal_string)
+      normal_string -> tt('"') + t(STRING) + t('"')
     );
 
     let mut parser = Parser::new(grammar);
 
     println!("Grammar:\n{}", grammar.table);
 
-    let text = "(1 22)";
+    let text = r#""""#;
     let result = parser.parse_text(text);
 
     let output = result.format_ast();
@@ -29,7 +27,7 @@ fn test_simple_whitespaces() {
 
     assert!(
         result.messages.is_empty(),
-        "Expected no errors, got: {}",
+        "expected successful parse, got: {}",
         result.format_messages()
     );
 }
@@ -113,12 +111,7 @@ fn test_json() {
 
     println!("Grammar:\n{}", grammar.table);
 
-    let text = r#"
-{
-"key1": "value1",
-"key2": 123
-}
-"#;
+    let text = r#""""#;
     let result = parser.parse_text(text);
 
     println!("AST:\n{}", result.format_ast());

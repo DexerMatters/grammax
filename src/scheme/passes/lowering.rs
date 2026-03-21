@@ -114,9 +114,17 @@ impl<'a> AstMapCtx<'a> {
     }
 
     /// Forward to the first child, or `None` if there are no children.
-    pub fn forward_first_child(&self, node: &NodeView) -> Option<AstMapIntent> {
+    pub fn try_forward_first(&self, node: &NodeView) -> Option<AstMapIntent> {
         let child = node.each().first()?;
         Some(AstMapIntent::forward(child.path().clone()))
+    }
+
+    /// Forward to the first child, or skip if there are no children.
+    pub fn forward_first(&self, node: &NodeView) -> AstMapIntent {
+        node.each()
+            .first()
+            .map(|child| AstMapIntent::forward(child.path().clone()))
+            .unwrap_or_else(AstMapIntent::skip)
     }
 
     /// Build an [`AstVec`] rooted at `parent`'s CST path.
@@ -222,6 +230,51 @@ impl AstMapper {
 
     pub fn skip_field(mut self, field_name: &'static str) -> Self {
         self.skip_fields.insert(field_name);
+        self
+    }
+
+    /// Register a rule handler that returns `AstMapIntent` directly (no `Option`).
+    pub fn rule<F>(mut self, rule_name: &'static str, visitor: F) -> Self
+    where
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> AstMapIntent + Send + Sync + 'static,
+    {
+        self.rule_visitors.insert(
+            rule_name,
+            Arc::new(move |ctx, node| Some(visitor(ctx, node))),
+        );
+        self
+    }
+
+    /// Register a field handler that returns `AstMapIntent` directly (no `Option`).
+    pub fn field<F>(mut self, field_name: &'static str, visitor: F) -> Self
+    where
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> AstMapIntent + Send + Sync + 'static,
+    {
+        self.field_visitors.insert(
+            field_name,
+            Arc::new(move |ctx, node| Some(visitor(ctx, node))),
+        );
+        self
+    }
+
+    /// Register a token handler that returns `AstMapIntent` directly (no `Option`).
+    pub fn token<F>(mut self, token_name: &'static str, visitor: F) -> Self
+    where
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> AstMapIntent + Send + Sync + 'static,
+    {
+        self.token_visitors.insert(
+            token_name,
+            Arc::new(move |ctx, node| Some(visitor(ctx, node))),
+        );
+        self
+    }
+
+    /// Register an error handler that returns `AstMapIntent` directly (no `Option`).
+    pub fn error<F>(mut self, visitor: F) -> Self
+    where
+        F: Fn(&AstMapCtx<'_>, &NodeView) -> AstMapIntent + Send + Sync + 'static,
+    {
+        self.error_visitor = Some(Arc::new(move |ctx, node| Some(visitor(ctx, node))));
         self
     }
 

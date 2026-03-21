@@ -32,15 +32,16 @@ fn test_tap_prints_cst_commands() {
 
     let mapper = AstMapper::new()
         .skip_rule("start")
-        .on_error(|ctx, _node| Some(ctx.emit(Json::Error)))
+        .error(|ctx, _node| ctx.emit(Json::Error))
         // json is purely a dispatch-level rule; forward straight through.
-        .on_rule("json", |ctx, node| ctx.forward_first_child(node))
+        .rule("json", |ctx, node| ctx.forward_first(node))
         // object: emit a stable AstVec rooted at this node's path.
         // Pair nodes are stored as direct-ish children in the arena.
-        .on_rule("object", |ctx, node| {
-            Some(ctx.emit(Json::Object(ctx.collect_vec(node))))
+        .rule("object", |ctx, node| {
+            ctx.emit(Json::Object(ctx.collect_vec(node)))
         })
         // pair: read key text from CST; resolve value through the mapper.
+        // Uses on_rule because it needs the ? operator
         .on_rule("pair", |ctx, node| {
             // key: navigate to the `string` node and grab the STRING token (child 1).
             let key_str_node = node.try_first_with_field("key")?;
@@ -53,29 +54,29 @@ fn test_tap_prints_cst_commands() {
             Some(ctx.emit(Json::Pair(key, value)))
         })
         // array: emit a stable AstVec; Json children are at descendant paths.
-        .on_rule("array", |ctx, node| {
-            Some(ctx.emit(Json::Array(ctx.collect_vec(node))))
+        .rule("array", |ctx, node| {
+            ctx.emit(Json::Array(ctx.collect_vec(node)))
         })
         // string: middle child (index 1) is the STRING token content (no quotes).
-        .on_rule("string", |ctx, node| {
+        .rule("string", |ctx, node| {
             let content = node
                 .try_nth(1)
                 .map(|n| ctx.read_text(n))
                 .unwrap_or_default();
-            Some(ctx.emit(Json::String(content)))
+            ctx.emit(Json::String(content))
         })
-        .on_rule("number", |ctx, node| {
+        .rule("number", |ctx, node| {
             let n: f64 = ctx.read_text(node).parse().unwrap_or(0.0);
-            Some(ctx.emit(Json::Number(n)))
+            ctx.emit(Json::Number(n))
         })
-        .on_rule("boolean", |ctx, node| {
-            Some(ctx.emit(Json::Boolean(ctx.read_text(node) == "true")))
+        .rule("boolean", |ctx, node| {
+            ctx.emit(Json::Boolean(ctx.read_text(node) == "true"))
         })
-        .on_rule("null", |ctx, _node| Some(ctx.emit(Json::Null)))
+        .rule("null", |ctx, _node| ctx.emit(Json::Null))
         // key field: read text directly in the pair handler above; nothing to store.
         .skip_field("key")
         // value field: forward into the json node so `read_cell` resolves it.
-        .on_field("value", |ctx, node| ctx.forward_first_child(node));
+        .field("value", |ctx, node| ctx.forward_first(node));
 
     let grammar = new_grammar!(
         start where
@@ -139,8 +140,8 @@ fn test_arith_commands() {
 
     let mapper = AstMapper::new()
         .skip_rule("start")
-        .on_error(|ctx, _node| Some(ctx.emit(Expr::Error)))
-        .on_rule("expr", |ctx, node| ctx.forward_first_child(node))
+        .error(|ctx, _node| ctx.emit(Expr::Error))
+        .rule("expr", |ctx, node| ctx.forward_first(node))
         .on_rule("primary", |ctx, node| {
             if let Some(expr_node) = node.try_first_with_rule("expr") {
                 return Some(ctx.forward(expr_node));
@@ -149,8 +150,8 @@ fn test_arith_commands() {
             let num: usize = ctx.read_text(token).parse().unwrap_or(0);
             Some(ctx.emit(Expr::Num(num)))
         })
-        .on_field("lhs:", |ctx, node| ctx.forward_first_child(node))
-        .on_field("rhs:", |ctx, node| ctx.forward_first_child(node))
+        .field("lhs:", |ctx, node| ctx.forward_first(node))
+        .field("rhs:", |ctx, node| ctx.forward_first(node))
         .on_rule("add", |ctx, node| {
             let lhs = ctx.read_cell(node.try_first_with_field("lhs:")?)?;
             let rhs = ctx.read_cell(node.try_first_with_field("rhs:")?)?;

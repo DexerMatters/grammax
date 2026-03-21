@@ -96,7 +96,10 @@ impl IntoMatcher for String {
 
 impl IntoMatcher for char {
     fn into_matcher_box(self) -> MatcherBox {
-        Box::new(CharLiteral(self))
+        Box::new(CharLiteral {
+            ch: self,
+            ch_str: self.to_string(),
+        })
     }
 }
 
@@ -267,8 +270,11 @@ pub struct WhitespacesMatcher;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OwnedLiteral(pub String);
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
-pub struct CharLiteral(pub char);
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CharLiteral {
+    pub ch: char,
+    ch_str: String,
+}
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct EmptyMatcher;
@@ -700,7 +706,7 @@ impl Matcher for CharLiteral {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
         let start = *pos;
         if let Some(next_char) = input[*pos..].chars().next() {
-            if next_char == self.0 {
+            if next_char == self.ch {
                 *pos += next_char.len_utf8();
                 return Some(*pos - start);
             }
@@ -709,7 +715,7 @@ impl Matcher for CharLiteral {
     }
 
     fn display(&self) -> String {
-        format!("'{}'", self.0)
+        format!("'{}'", self.ch)
     }
 
     fn is_nullable(&self) -> bool {
@@ -721,7 +727,7 @@ impl Matcher for CharLiteral {
     }
 
     fn preview(&self) -> Option<&str> {
-        None
+        Some(&self.ch_str)
     }
 }
 

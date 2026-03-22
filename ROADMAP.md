@@ -1,0 +1,1 @@
+<img src="./assets/roadmap.drawio.svg" alt="The roadmap" style="color-scheme: light dark;">

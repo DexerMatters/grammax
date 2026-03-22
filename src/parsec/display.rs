@@ -4,7 +4,7 @@ use crate::grammar::Grammar;
 use crate::grammar::analysis::EOF_TOKEN;
 use crate::parsec::msg::{ErrorMessage, ParserMessage};
 use crate::parsec::tree::{GreenId, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
-use crate::utils::Span;
+use crate::utils::{Range, Span};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";
@@ -72,16 +72,14 @@ pub fn format_messages_with_source(
         }
         first = false;
 
-        let (start_line, start_col) = Span {
+        let Range {
+            start: (start_line, start_col),
+            end: (end_line, end_col),
+        } = Span {
             start: start_pos,
             end: start_pos,
         }
-        .start_line_col(source);
-        let (end_line, end_col) = Span {
-            start: start_pos,
-            end: start_pos,
-        }
-        .end_line_col(source);
+        .to_range(source);
 
         let display_type = match msg_type {
             "unexpected" => "error: unexpected token",

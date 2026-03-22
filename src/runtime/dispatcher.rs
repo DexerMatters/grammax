@@ -32,7 +32,7 @@ struct PendingFetch {
     reply: channel::Sender<RuntimeResult>,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct GlobalEventDispatcher {
     pub(crate) envelope_tx: channel::Sender<RuntimeEnvelope>,
 }

@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::hash::Hash;
-use std::ops;
+use std::{fmt, ops};
 
 #[macro_export]
 macro_rules! impl_listener {
@@ -199,6 +199,67 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct Range {
+    pub start: (usize, usize), // (line, column), 0-based
+    pub end: (usize, usize),
+}
+
+impl fmt::Display for Range {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.start == self.end {
+            write!(f, "{}:{}", self.start.0, self.start.1)
+        } else {
+            write!(
+                f,
+                "{}:{}-{}:{}",
+                self.start.0, self.start.1, self.end.0, self.end.1
+            )
+        }
+    }
+}
+
+impl From<ops::Range<(usize, usize)>> for Range {
+    fn from(r: ops::Range<(usize, usize)>) -> Self {
+        Range {
+            start: r.start,
+            end: r.end,
+        }
+    }
+}
+
+impl From<((usize, usize), (usize, usize))> for Range {
+    fn from(r: ((usize, usize), (usize, usize))) -> Self {
+        Range {
+            start: r.0,
+            end: r.1,
+        }
+    }
+}
+
+impl From<(usize, usize)> for Range {
+    fn from(pos: (usize, usize)) -> Self {
+        Range {
+            start: pos,
+            end: pos,
+        }
+    }
+}
+
+impl Range {
+    pub fn new(start: (usize, usize), end: (usize, usize)) -> Self {
+        Range { start, end }
+    }
+
+    /// Convert this line:col range to a byte-offset `Span` using the global line index cache.
+    pub fn to_span(&self, text: &str) -> Span {
+        Span {
+            start: self.start.into_byte(text),
+            end: self.end.into_byte(text),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Span {
     pub start: usize,
     pub end: usize,
@@ -228,16 +289,12 @@ impl Span {
         self.start == self.end
     }
 
-    pub fn start_line_col(&self, text: &str) -> (usize, usize) {
-        let index = LineIndex::new(text);
-        let line_col = index.byte_to_line_col_with_text(self.start, text);
-        (line_col.line, line_col.col)
-    }
-
-    pub fn end_line_col(&self, text: &str) -> (usize, usize) {
-        let index = LineIndex::new(text);
-        let line_col = index.byte_to_line_col_with_text(self.end, text);
-        (line_col.line, line_col.col)
+    /// Convert this byte-offset span to a `Range` (0-based line:col) using the global line index cache.
+    pub fn to_range(&self, text: &str) -> Range {
+        Range {
+            start: self.start.into_line_col(text),
+            end: self.end.into_line_col(text),
+        }
     }
 }
 
@@ -258,72 +315,114 @@ impl From<Span> for ops::Range<usize> {
     }
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct LineIndex {
-    line_starts: Vec<usize>,
+use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+use std::sync::{Mutex, OnceLock};
+
+fn get_line_index_cache() -> &'static Mutex<HashMap<u64, Vec<usize>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<usize>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct LineCol {
-    pub line: usize,
-    pub col: usize,
+fn hash_text(text: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    text.hash(&mut hasher);
+    hasher.finish()
 }
 
-impl LineIndex {
-    pub fn new(text: &str) -> Self {
-        let mut line_starts = vec![0];
-        let mut line_utf16_offsets = vec![0];
-        let mut utf16_offset = 0;
+fn get_or_create_line_index(text: &str) -> Vec<usize> {
+    let hash = hash_text(text);
+    let cache = get_line_index_cache();
 
-        let mut chars = text.char_indices().peekable();
-        while let Some((_byte_pos, ch)) = chars.next() {
-            let ch_utf16_len = ch.len_utf16();
-            utf16_offset += ch_utf16_len;
-
-            if ch == '\n' {
-                // Next line starts after this \n
-                if let Some(&(next_byte_pos, _)) = chars.peek() {
-                    line_starts.push(next_byte_pos);
-                    line_utf16_offsets.push(utf16_offset);
-                }
-            }
-        }
-
-        LineIndex { line_starts }
+    let mut map = cache.lock().unwrap();
+    if let Some(index) = map.get(&hash) {
+        return index.clone();
     }
 
-    pub fn byte_to_line_col_with_text(&self, byte_pos: usize, text: &str) -> LineCol {
-        // Binary search for the line containing this byte offset
-        let line_idx = self
-            .line_starts
-            .binary_search(&byte_pos)
-            .unwrap_or_else(|next_idx| next_idx.saturating_sub(1));
+    let index = build_line_index(text);
+    map.insert(hash, index.clone());
+    index
+}
 
-        let line = line_idx + 1; // Convert to 1-indexed
-        let line_start_byte = self.line_starts[line_idx];
+fn build_line_index(text: &str) -> Vec<usize> {
+    let mut line_starts = vec![0];
+    let mut chars = text.char_indices().peekable();
 
-        // Find the end of this line
-        let line_end_byte = self
-            .line_starts
-            .get(line_idx + 1)
-            .copied()
-            .unwrap_or(text.len());
-
-        // Get the line text
-        let line_text = &text[line_start_byte..line_end_byte];
-
-        // Compute UTF-16 column: count UTF-16 code units from line start to the position within the line
-        let offset_in_line = byte_pos.saturating_sub(line_start_byte);
-        let mut col = 0;
-
-        for (byte_offset, ch) in line_text.char_indices() {
-            if byte_offset >= offset_in_line {
-                break;
+    while let Some((_byte_pos, ch)) = chars.next() {
+        if ch == '\n' {
+            if let Some(&(next_byte_pos, _)) = chars.peek() {
+                line_starts.push(next_byte_pos);
             }
-            col += ch.len_utf16();
+        }
+    }
+
+    line_starts
+}
+
+fn convert_byte_to_line_col(byte_pos: usize, line_starts: &[usize], text: &str) -> (usize, usize) {
+    let line_idx = line_starts
+        .binary_search(&byte_pos)
+        .unwrap_or_else(|next_idx| next_idx.saturating_sub(1));
+
+    let line_start_byte = line_starts[line_idx];
+    let line_end_byte = line_starts.get(line_idx + 1).copied().unwrap_or(text.len());
+
+    let line_text = &text[line_start_byte..line_end_byte];
+    let offset_in_line = byte_pos.saturating_sub(line_start_byte);
+    let mut col = 0;
+
+    for (byte_offset, ch) in line_text.char_indices() {
+        if byte_offset >= offset_in_line {
+            break;
+        }
+        col += ch.len_utf16();
+    }
+
+    (line_idx, col)
+}
+
+pub trait IntoLineCol {
+    fn into_line_col(&self, text: &str) -> (usize, usize);
+}
+
+impl IntoLineCol for usize {
+    fn into_line_col(&self, text: &str) -> (usize, usize) {
+        let line_starts = get_or_create_line_index(text);
+        convert_byte_to_line_col(*self, &line_starts, text)
+    }
+}
+
+pub trait IntoByte {
+    fn into_byte(&self, text: &str) -> usize;
+}
+
+impl IntoByte for (usize, usize) {
+    fn into_byte(&self, text: &str) -> usize {
+        let line_starts = get_or_create_line_index(text);
+        let (line, col) = self;
+
+        if *line >= line_starts.len() {
+            return text.len();
         }
 
-        LineCol { line, col }
+        let line_start = line_starts[*line];
+        let line_end = line_starts.get(line + 1).copied().unwrap_or(text.len());
+        let line_text = &text[line_start..line_end];
+
+        // Convert UTF-16 column back to byte offset
+        let mut byte_offset = 0;
+        let mut utf16_col = 0;
+
+        for (offset, ch) in line_text.char_indices() {
+            if utf16_col >= *col {
+                break;
+            }
+            utf16_col += ch.len_utf16();
+            byte_offset = offset;
+        }
+
+        line_start + byte_offset
     }
 }
 

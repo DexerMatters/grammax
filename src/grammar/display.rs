@@ -1,7 +1,7 @@
 use crate::grammar::GrammarError;
 use crate::grammar::ir::{NormalizedNode, Production, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::utils::Span;
+use crate::utils::{Range, Span};
 use std::fmt;
 
 const RESET: &str = "\x1b[0m";
@@ -172,8 +172,10 @@ pub fn format_grammar_error(error: &GrammarError, source: &str) -> String {
         return format_grammar_error_message(error);
     }
 
-    let (start_line, start_col) = Span::new(span.start, span.start).start_line_col(source);
-    let (end_line, end_col) = Span::new(span.end, span.end).end_line_col(source);
+    let Range {
+        start: (start_line, start_col),
+        end: (end_line, end_col),
+    } = Span::new(span.start, span.start).to_range(source);
 
     let error_msg = match error {
         GrammarError::UnboundRuleReference(_, name) => {

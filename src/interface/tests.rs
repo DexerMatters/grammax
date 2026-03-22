@@ -3,7 +3,7 @@ use color_print::cprintln;
 
 #[cfg(feature = "webui")]
 use crate::{
-    interface::BasicInterface,
+    interface::{BasicInterface, webui::WebPreviewInterface},
     new_grammar,
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
@@ -121,10 +121,8 @@ fn test_tap_prints_cst_commands() {
         }
     });
 
-    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
-    runtime
-        .insert(0, r#"{"key1": "value1", "key2": 123}"#)
-        .unwrap();
+    let runtime = pass.build_runtime::<WebPreviewInterface<_>>(grammar);
+    runtime.run().unwrap();
 }
 
 #[cfg(feature = "webui")]

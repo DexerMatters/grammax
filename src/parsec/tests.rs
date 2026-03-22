@@ -1,9 +1,7 @@
 use crate::new_grammar_no_cache;
-use crate::parsec::ParserConfig;
 use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
 use crate::parsec::view::ViewAction;
-use crate::scheme::layers::AstCell;
 
 #[test]
 fn test_simple_whitespaces() {

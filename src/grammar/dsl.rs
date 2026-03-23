@@ -12,7 +12,7 @@ use crate::{
         view::{ViewAction, Viewer},
         words::{self, EndOfInput, IDENT, IntoMatcher, NUMBER, STRING},
     },
-    utils::Span,
+    scheme::Span,
 };
 
 thread_local! {

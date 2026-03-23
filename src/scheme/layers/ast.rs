@@ -1,7 +1,7 @@
 /// Path-based AST arena storage and transaction support.
 ///
 /// The new design:
-/// - Arena stores type-erased nodes indexed by NodePath (tree structure)
+/// - Arena stores type-erased nodes indexed by DocumentNodePath (tree structure)
 /// - Transactions operate on paths, enabling incremental updates
 /// - Commands use paths, not flat slot indices
 /// - Direct path-based storage via BTreeMap
@@ -15,15 +15,17 @@ use std::{
     ptr::NonNull,
 };
 
+use rustc_hash::FxHashMap;
+
 use crate::scheme;
-use crate::scheme::layers::NodePath;
+use crate::scheme::{URI, layers::DocumentNodePath};
 
 thread_local! {
     static AST_CELL_CLONE_ARENA: Cell<Option<NonNull<()>>> = const { Cell::new(None) };
 }
 
 pub struct AstCell<T> {
-    pub(crate) path: NodePath,
+    pub(crate) path: DocumentNodePath,
     pub(crate) arena: Option<NonNull<()>>,
     pub(crate) arena_ty: Option<&'static str>,
     pub(crate) _marker: PhantomData<fn() -> T>,
@@ -96,7 +98,7 @@ impl<T> Ord for AstCell<T> {
 }
 
 impl<T> AstCell<T> {
-    pub fn new(path: NodePath) -> Self {
+    pub fn new(path: DocumentNodePath) -> Self {
         Self {
             path,
             arena: None,
@@ -105,11 +107,11 @@ impl<T> AstCell<T> {
         }
     }
 
-    pub fn from_path(path: &NodePath) -> Self {
+    pub fn from_path(path: &DocumentNodePath) -> Self {
         Self::new(path.clone())
     }
 
-    pub fn path(&self) -> &NodePath {
+    pub fn path(&self) -> &DocumentNodePath {
         &self.path
     }
 
@@ -143,7 +145,7 @@ impl<T> AstCell<T> {
 
     /// Cast the phantom type parameter to `U`.
     ///
-    /// The cell itself is just a `NodePath`; the type parameter is only a
+    /// The cell itself is just a `DocumentNodePath`; the type parameter is only a
     /// compile-time hint for typed retrieval.  Use this when the mapper
     /// operates in heterogeneous mode (`AstMapAny`) but the stored value
     /// is known to be of type `U` at the call site.
@@ -171,7 +173,7 @@ impl<'de, T> serde::Deserialize<'de> for AstCell<T> {
     where
         D: serde::Deserializer<'de>,
     {
-        let path = NodePath::deserialize(deserializer)?;
+        let path = DocumentNodePath::deserialize(deserializer)?;
         Ok(Self::new(path))
     }
 }
@@ -241,7 +243,7 @@ unsafe impl Send for AstMapAny {}
 unsafe impl Sync for AstMapAny {}
 
 pub struct AstVec<T> {
-    pub(crate) base: NodePath,
+    pub(crate) base: DocumentNodePath,
     pub(crate) arena: Option<NonNull<()>>,
     pub(crate) _marker: PhantomData<fn() -> T>,
 }
@@ -307,7 +309,7 @@ impl<T> AstVec<T> {
     ///
     /// Prefer using [`AstMapCtx::collect_vec`] inside a mapper handler, which
     /// supplies the correct base path automatically.
-    pub fn new(base: NodePath) -> Self {
+    pub fn new(base: DocumentNodePath) -> Self {
         Self {
             base,
             arena: None,
@@ -317,7 +319,7 @@ impl<T> AstVec<T> {
 
     /// The base path — direct children of this path in the arena are the
     /// vector's elements.
-    pub fn base(&self) -> &NodePath {
+    pub fn base(&self) -> &DocumentNodePath {
         &self.base
     }
 
@@ -355,7 +357,7 @@ impl<T> AstVec<T> {
     where
         T: 'static,
     {
-        let paths: Vec<NodePath> = arena
+        let paths: Vec<DocumentNodePath> = arena
             .storage
             .iter_mapped_children(&self.base)
             .into_iter()
@@ -421,19 +423,19 @@ where
     }
 
     /// Stage a value and insert it at the given path
-    pub(crate) fn insert_value(&mut self, path: NodePath, value: T) {
+    pub(crate) fn insert_value(&mut self, path: DocumentNodePath, value: T) {
         let id = self.stage(value);
         self.ops.push(scheme::Command::Insert { index: path, id });
     }
 
     /// Stage a value and replace the existing node at the given path
-    pub(crate) fn replace_value(&mut self, path: NodePath, value: T) {
+    pub(crate) fn replace_value(&mut self, path: DocumentNodePath, value: T) {
         let id = self.stage(value);
         self.ops.push(scheme::Command::Replace { index: path, id });
     }
 
     /// Delete the node at the given path
-    pub(crate) fn delete(&mut self, path: NodePath) {
+    pub(crate) fn delete(&mut self, path: DocumentNodePath) {
         self.ops.push(scheme::Command::Delete { index: path });
     }
 
@@ -445,10 +447,10 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AstArenaError {
     MissingPath {
-        path: NodePath,
+        path: DocumentNodePath,
     },
     TypeMismatch {
-        path: NodePath,
+        path: DocumentNodePath,
         expected: &'static str,
     },
 }
@@ -462,8 +464,8 @@ pub struct AstArena<T> {
 #[derive(Debug, Clone)]
 pub(crate) struct AstArenaStorage {
     /// Path-based storage for all AST nodes
-    pub(crate) nodes: BTreeMap<NodePath, ErasedAstNode>,
-    pub(crate) root: Option<NodePath>,
+    pub(crate) nodes: BTreeMap<DocumentNodePath, ErasedAstNode>,
+    pub(crate) roots: FxHashMap<URI, DocumentNodePath>,
 }
 
 impl AstArenaStorage {
@@ -478,14 +480,17 @@ impl AstArenaStorage {
     /// This handles `sep`-desugared grammars where list elements are at
     /// non-uniform depths (e.g. `P.1.0`, `P.2.1.0`, `P.2.2.1.0`, …) but
     /// are still logically "one level" below the containing list node.
-    pub(crate) fn iter_mapped_children(&self, base: &NodePath) -> Vec<(NodePath, &ErasedAstNode)> {
+    pub(crate) fn iter_mapped_children(
+        &self,
+        base: &DocumentNodePath,
+    ) -> Vec<(DocumentNodePath, &ErasedAstNode)> {
         let start = base.child(0);
         let mut result = Vec::new();
-        let mut last_included: Option<NodePath> = None;
+        let mut last_included: Option<DocumentNodePath> = None;
         for (path, node) in self
             .nodes
             .range(start..)
-            .take_while(|(p, _)| base.is_prefix_of(p))
+            .take_while(|(p, _)| p.0 == base.0 && base.is_prefix_of(p))
         {
             // Skip paths that are descendants of an already-included mapped node.
             if let Some(ref last) = last_included {
@@ -594,7 +599,7 @@ impl<T> Default for AstArena<T> {
         Self {
             storage: Box::new(AstArenaStorage {
                 nodes: BTreeMap::new(),
-                root: None,
+                roots: FxHashMap::default(),
             }),
             _marker: PhantomData,
         }
@@ -606,45 +611,50 @@ impl<T> AstArena<T> {
         Self::default()
     }
 
-    pub fn root_path(&self) -> Option<&NodePath> {
-        self.storage.root.as_ref()
+    pub fn root_path_for(&self, uri: &URI) -> Option<&DocumentNodePath> {
+        self.storage.roots.get(uri)
+    }
+
+    /// Convenience helper for the default document URI.
+    pub fn root_path(&self) -> Option<&DocumentNodePath> {
+        self.root_path_for(&URI::default())
     }
 
     /// Insert a new value at the given path (path must not already exist)
-    pub fn insert<U>(&mut self, path: NodePath, node: U) -> AstCell<U>
+    pub fn insert<U>(&mut self, path: DocumentNodePath, node: U) -> AstCell<U>
     where
         U: fmt::Debug + Clone + PartialEq + Send + 'static,
     {
         let cell = self
             .insert_erased(path.clone(), ErasedAstNode::new(node))
             .cast();
-        self.refresh_root();
+        self.refresh_roots();
         cell
     }
 
     /// Update the value at the given path (path must exist)
-    pub fn set<U>(&mut self, path: NodePath, node: U)
+    pub fn set<U>(&mut self, path: DocumentNodePath, node: U)
     where
         U: fmt::Debug + Clone + PartialEq + Send + 'static,
     {
         self.set_erased(path, ErasedAstNode::new(node));
-        self.refresh_root();
+        self.refresh_roots();
     }
 
     /// Remove the node at the given path
-    pub fn remove<U>(&mut self, path: NodePath) -> Option<U>
+    pub fn remove<U>(&mut self, path: DocumentNodePath) -> Option<U>
     where
         U: Send + 'static,
     {
         let removed = self
             .remove_erased(path)
             .and_then(ErasedAstNode::into_downcast);
-        self.refresh_root();
+        self.refresh_roots();
         removed
     }
 
     /// Query the node at the given path
-    pub fn get<U>(&self, path: &NodePath) -> Option<&U>
+    pub fn get<U>(&self, path: &DocumentNodePath) -> Option<&U>
     where
         U: 'static,
     {
@@ -667,20 +677,24 @@ impl<T> AstArena<T> {
         self.get_by_cell(cell).cloned()
     }
 
-    pub(crate) fn insert_erased(&mut self, path: NodePath, node: ErasedAstNode) -> AstCell<()> {
+    pub(crate) fn insert_erased(
+        &mut self,
+        path: DocumentNodePath,
+        node: ErasedAstNode,
+    ) -> AstCell<()> {
         self.storage.nodes.insert(path.clone(), node);
         self.cell(path)
     }
 
-    pub(crate) fn set_erased(&mut self, path: NodePath, node: ErasedAstNode) {
+    pub(crate) fn set_erased(&mut self, path: DocumentNodePath, node: ErasedAstNode) {
         self.storage.nodes.insert(path, node);
     }
 
-    pub(crate) fn remove_erased(&mut self, path: NodePath) -> Option<ErasedAstNode> {
+    pub(crate) fn remove_erased(&mut self, path: DocumentNodePath) -> Option<ErasedAstNode> {
         self.storage.nodes.remove(&path)
     }
 
-    pub(crate) fn get_erased(&self, path: &NodePath) -> Option<&ErasedAstNode> {
+    pub(crate) fn get_erased(&self, path: &DocumentNodePath) -> Option<&ErasedAstNode> {
         self.storage.nodes.get(path)
     }
 
@@ -690,12 +704,12 @@ impl<T> AstArena<T> {
     /// it simply wraps the underlying [`ErasedAstNode`] without downcasting.
     /// Use it in heterogeneous pipelines where the arena's stored type is
     /// `AstMapAny` and you need to compare or forward the erased value.
-    pub fn get_erased_as_any(&self, path: &NodePath) -> Option<AstMapAny> {
+    pub fn get_erased_as_any(&self, path: &DocumentNodePath) -> Option<AstMapAny> {
         let path = self.resolve_path(path)?;
         self.get_erased(path).map(|n| AstMapAny(n.clone()))
     }
 
-    pub fn get_cell(&self, path: &NodePath) -> Option<AstCell<T>>
+    pub fn get_cell(&self, path: &DocumentNodePath) -> Option<AstCell<T>>
     where
         T: 'static,
     {
@@ -708,24 +722,36 @@ impl<T> AstArena<T> {
         })
     }
 
-    fn resolve_path<'a>(&'a self, path: &'a NodePath) -> Option<&'a NodePath> {
-        if path.0.is_empty() {
-            self.storage.root.as_ref()
+    fn resolve_path<'a>(
+        &'a self,
+        path: &'a DocumentNodePath,
+    ) -> Option<&'a DocumentNodePath> {
+        if path.1.is_empty() {
+            self.storage.roots.get(&path.0)
         } else {
             Some(path)
         }
     }
 
-    fn refresh_root(&mut self) {
-        self.storage.root = self
-            .storage
-            .nodes
-            .keys()
-            .min_by(|a, b| a.0.len().cmp(&b.0.len()).then_with(|| a.0.cmp(&b.0)))
-            .cloned();
+    fn refresh_roots(&mut self) {
+        let mut roots: FxHashMap<URI, DocumentNodePath> = FxHashMap::default();
+        for path in self.storage.nodes.keys() {
+            let uri = path.0.clone();
+            let should_replace = match roots.get(&uri) {
+                None => true,
+                Some(existing) => {
+                    path.1.len() < existing.1.len()
+                        || (path.1.len() == existing.1.len() && path.1.cmp(&existing.1).is_lt())
+                }
+            };
+            if should_replace {
+                roots.insert(uri, path.clone());
+            }
+        }
+        self.storage.roots = roots;
     }
 
-    fn cell(&self, path: NodePath) -> AstCell<()> {
+    fn cell(&self, path: DocumentNodePath) -> AstCell<()> {
         let node_ty = self
             .get_erased(&path)
             .map(|n| n.type_name)
@@ -744,11 +770,11 @@ impl<T> AstArena<T> {
 }
 
 impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena<T> {
-    type Ix = NodePath;
+    type Ix = DocumentNodePath;
     type Value = T;
     type Error = AstArenaError;
 
-    fn query(&self, index: NodePath) -> Result<T, Self::Error> {
+    fn query(&self, index: DocumentNodePath) -> Result<T, Self::Error> {
         let query_path = index;
         let Some(path) = self.resolve_path(&query_path) else {
             return Err(AstArenaError::MissingPath { path: query_path });
@@ -829,7 +855,7 @@ impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena
                 }
             }
         }
-        self.refresh_root();
+        self.refresh_roots();
         Ok(())
     }
 }

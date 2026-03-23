@@ -14,8 +14,7 @@ use crate::{
         parser,
         tree::{ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt},
     },
-    scheme::layers::NodePath,
-    utils::Span,
+    scheme::{Span, layers::NodePath},
 };
 
 /// Action returned by typed visitor closures.

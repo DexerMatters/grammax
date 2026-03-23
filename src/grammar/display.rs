@@ -1,7 +1,7 @@
 use crate::grammar::GrammarError;
 use crate::grammar::ir::{NormalizedNode, Production, Symbol};
 use crate::grammar::norm::RuleTable;
-use crate::utils::{Range, Span};
+use crate::scheme::{Range, Span};
 use std::fmt;
 
 const RESET: &str = "\x1b[0m";

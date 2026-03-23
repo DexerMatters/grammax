@@ -1,7 +1,7 @@
 use std::ops::{self, RangeBounds};
 
 use crate::parsec::words::{IntoMatcher, MatcherRef, token};
-use crate::utils::Span;
+use crate::scheme::Span;
 use rustc_hash::FxHashMap;
 
 #[doc(hidden)]

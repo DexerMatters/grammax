@@ -3,8 +3,8 @@ use std::{sync::Arc, thread};
 use crossbeam::channel;
 
 use crate::{
-    scheme,
-    utils::{self, Span},
+    scheme::{self, DocumentSpan, Span, URI},
+    utils::{self},
 };
 
 use super::{
@@ -135,8 +135,8 @@ fn handle_request<Tree: TypedTree>(
 ) -> bool {
     match request {
         // Fire-and-forget edit: reply immediately with Accepted.
-        RuntimeRequest::ApplyTextEdit { span, text } => {
-            let txn = edit_to_txn(span, text);
+        RuntimeRequest::ApplyTextEdit { uri, span, text } => {
+            let txn = edit_to_txn(uri, span, text);
             let result = compiler
                 .submit_source(txn)
                 .map(|revision| RuntimeSignal::Accepted { revision });
@@ -146,11 +146,12 @@ fn handle_request<Tree: TypedTree>(
 
         // Edit + wait: park reply until the pipeline settles the target layer.
         RuntimeRequest::ApplyAndFetch {
+            uri,
             span,
             text,
             layer_path,
         } => {
-            let txn = edit_to_txn(span, text);
+            let txn = edit_to_txn(uri, span, text);
             match compiler.submit_source(txn) {
                 Ok(revision) => pending_fetches.push(PendingFetch {
                     revision,
@@ -289,22 +290,23 @@ fn fail_all(
     }
 }
 
-fn edit_to_txn(span: Span, text: String) -> scheme::Transaction<scheme::layers::SourceText> {
+fn edit_to_txn(uri: URI, span: Span, text: String) -> scheme::Transaction<scheme::layers::SourceText> {
     use scheme::Command;
     if span.start == span.end && text.is_empty() {
         return Arc::new(Vec::new());
     }
+    let doc_span = DocumentSpan { uri: uri.clone(), span };
     if span.start == span.end {
         return Arc::new(vec![
             Command::Create { id: 0, value: text },
-            Command::Insert { index: span, id: 0 },
+            Command::Insert { index: doc_span, id: 0 },
         ]);
     }
     if text.is_empty() {
-        return Arc::new(vec![Command::Delete { index: span }]);
+        return Arc::new(vec![Command::Delete { index: doc_span }]);
     }
     Arc::new(vec![
         Command::Create { id: 0, value: text },
-        Command::Replace { index: span, id: 0 },
+        Command::Replace { index: doc_span, id: 0 },
     ])
 }

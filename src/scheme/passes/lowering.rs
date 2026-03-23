@@ -12,10 +12,10 @@ use crate::{
         view::NodeView,
     },
     scheme::{
-        self,
+        self, URI,
         layers::{
-            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, NodePath, ParseTreeIR,
-            ast::AstMapAny,
+            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, DocumentNodePath, ParseTreeIR,
+            ParseTreeQuery, ast::AstMapAny,
         },
     },
 };
@@ -27,7 +27,7 @@ type MapperHandler = Arc<dyn Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapInten
 pub enum AstMapAction {
     Skip,
     /// This CST node's AST slot is wherever `target_cst_path` resolves to.
-    Forward(NodePath),
+    Forward(DocumentNodePath),
     Emit(AstMapAny),
 }
 
@@ -35,7 +35,7 @@ pub enum AstMapAction {
 pub struct AstMapIntent {
     pub action: AstMapAction,
     /// Override the anchor CST path (default: the emitting node's own path).
-    pub anchor: Option<NodePath>,
+    pub anchor: Option<DocumentNodePath>,
 }
 
 impl AstMapIntent {
@@ -55,17 +55,17 @@ impl AstMapIntent {
     }
 
     /// Forward: this CST node's AST slot is wherever `cst_path` resolves.
-    pub fn forward(cst_path: NodePath) -> Self {
+    pub fn forward(cst_path: DocumentNodePath) -> Self {
         Self::new(AstMapAction::Forward(cst_path))
     }
 
-    pub fn with_anchor_path(mut self, path: NodePath) -> Self {
+    pub fn with_anchor_path(mut self, path: DocumentNodePath) -> Self {
         self.anchor = Some(path);
         self
     }
 
-    pub fn with_anchor_node(mut self, node: &NodeView) -> Self {
-        self.anchor = Some(node.path().clone());
+    pub fn with_anchor_node(mut self, uri: &URI, node: &NodeView) -> Self {
+        self.anchor = Some(DocumentNodePath(uri.clone(), node.path().0.clone()));
         self
     }
 }
@@ -74,7 +74,8 @@ pub type AstNode = NodeView;
 
 pub struct AstMapCtx<'a> {
     pub upstream: &'a ParseTreeIR,
-    resolve_ast_path: &'a dyn Fn(&NodeView) -> Option<NodePath>,
+    pub uri: &'a URI,
+    resolve_ast_path: &'a dyn Fn(&NodeView) -> Option<DocumentNodePath>,
 }
 
 impl<'a> AstMapCtx<'a> {
@@ -105,7 +106,7 @@ impl<'a> AstMapCtx<'a> {
 
     /// Produce a `Forward` intent to resolve at the given node's path.
     pub fn forward(&self, node: &NodeView) -> AstMapIntent {
-        AstMapIntent::forward(node.path().clone())
+        AstMapIntent::forward(DocumentNodePath(self.uri.clone(), node.path().0.clone()))
     }
 
     /// Produce a `Skip` intent.
@@ -116,14 +117,20 @@ impl<'a> AstMapCtx<'a> {
     /// Forward to the first child, or `None` if there are no children.
     pub fn try_forward_first(&self, node: &NodeView) -> Option<AstMapIntent> {
         let child = node.each().first()?;
-        Some(AstMapIntent::forward(child.path().clone()))
+        Some(AstMapIntent::forward(DocumentNodePath(
+            self.uri.clone(),
+            child.path().0.clone(),
+        )))
     }
 
     /// Forward to the first child, or skip if there are no children.
     pub fn forward_first(&self, node: &NodeView) -> AstMapIntent {
         node.each()
             .first()
-            .map(|child| AstMapIntent::forward(child.path().clone()))
+            .map(|child| AstMapIntent::forward(DocumentNodePath(
+                self.uri.clone(),
+                child.path().0.clone(),
+            )))
             .unwrap_or_else(AstMapIntent::skip)
     }
 
@@ -143,17 +150,17 @@ impl<'a> AstMapCtx<'a> {
     /// .on_rule("item", |ctx, node| Some(ctx.emit(Expr::Item(...))))
     /// ```
     pub fn collect_vec<U>(&self, parent: &NodeView) -> AstVec<U> {
-        AstVec::new(parent.path().clone())
+        AstVec::new(DocumentNodePath(self.uri.clone(), parent.path().0.clone()))
     }
 
     /// All parser-level diagnostics for the current transaction.
     pub fn parser_messages(&self) -> ParserMessages {
-        self.upstream.parser_messages()
+        self.upstream.parser_messages(self.uri).unwrap_or_default()
     }
 
     /// Returns `true` if the current transaction has any parser errors.
     pub fn has_errors(&self) -> bool {
-        !self.upstream.parser_messages().is_empty()
+        !self.upstream.parser_messages(self.uri).unwrap_or_default().is_empty()
     }
 }
 
@@ -340,11 +347,13 @@ impl IncrementalLowerer {
     fn apply_from_ir(
         &mut self,
         upstream: &ParseTreeIR,
+        uri: &URI,
         downstream: &AstArena<AstMapAny>,
         commands: &[CstCommand],
     ) -> AstDelta<AstMapAny> {
-        let memo: RefCell<FxHashMap<NodePath, AstMapIntent>> = RefCell::new(FxHashMap::default());
-        let resolving: RefCell<FxHashSet<NodePath>> = RefCell::new(FxHashSet::default());
+        let memo: RefCell<FxHashMap<DocumentNodePath, AstMapIntent>> =
+            RefCell::new(FxHashMap::default());
+        let resolving: RefCell<FxHashSet<DocumentNodePath>> = RefCell::new(FxHashSet::default());
 
         // Discover dirty anchors from the transaction:
         // - Root Insert (full parse): DFS-scan the entire upstream CST to find all anchors.
@@ -352,38 +361,47 @@ impl IncrementalLowerer {
         //   The incremental reparser only emits a Replace for the changed leaf token;
         //   the containing rule node (e.g. `primary`) won't appear in the transaction
         //   but its subtree changed, so we must find it by walking up.
-        let mut dirty_anchors: FxHashSet<NodePath> = FxHashSet::default();
+        let mut dirty_anchors: FxHashSet<DocumentNodePath> = FxHashSet::default();
         for cmd in commands {
             match cmd {
                 CstCommand::Insert { index, .. } => {
-                    let crate::scheme::layers::ParseTreeQuery::Path(path) = index else {
+                    let ParseTreeQuery::Path(path) = index else {
                         continue;
                     };
-                    if path.0.is_empty() {
+                    if path.1.is_empty() {
                         // Root insert: this is a full parse — DFS the whole tree.
                         self.collect_upstream_anchors(
                             upstream,
-                            &NodePath::root(),
+                            uri,
+                            &DocumentNodePath::root(uri.clone()),
                             &memo,
                             &resolving,
                             &mut dirty_anchors,
                         );
                     } else {
                         // Non-root insert (incremental mid-tree insert).
-                        if let Some(anchor) =
-                            self.resolve_anchor_or_ancestor(upstream, path, &memo, &resolving)
-                        {
+                        if let Some(anchor) = self.resolve_anchor_or_ancestor(
+                            upstream,
+                            uri,
+                            path,
+                            &memo,
+                            &resolving,
+                        ) {
                             dirty_anchors.insert(anchor);
                         }
                     }
                 }
                 CstCommand::Replace { index, .. } => {
-                    let crate::scheme::layers::ParseTreeQuery::Path(path) = index else {
+                    let ParseTreeQuery::Path(path) = index else {
                         continue;
                     };
-                    if let Some(anchor) =
-                        self.resolve_anchor_or_ancestor(upstream, path, &memo, &resolving)
-                    {
+                    if let Some(anchor) = self.resolve_anchor_or_ancestor(
+                        upstream,
+                        uri,
+                        path,
+                        &memo,
+                        &resolving,
+                    ) {
                         dirty_anchors.insert(anchor);
                     }
                 }
@@ -395,10 +413,11 @@ impl IncrementalLowerer {
 
         // Delete AST anchors whose CST source path no longer exists in the tree.
         // `downstream.storage.nodes` is the ground truth for currently-live anchors.
-        let stale: Vec<NodePath> = downstream
+        let stale: Vec<DocumentNodePath> = downstream
             .storage
             .nodes
             .keys()
+            .filter(|p| p.0 == *uri)
             .filter(|p| upstream.green_at_path(p).is_none())
             .cloned()
             .collect();
@@ -415,10 +434,11 @@ impl IncrementalLowerer {
         // so the simple `green_at_path == None` cleanup above does not remove
         // it. We must sweep existing AST nodes under dirty anchors and delete
         // any path that no longer resolves to itself as a live AST anchor.
-        let stale_in_dirty: Vec<NodePath> = downstream
+        let stale_in_dirty: Vec<DocumentNodePath> = downstream
             .storage
             .nodes
             .keys()
+            .filter(|p| p.0 == *uri)
             .filter(|existing_path| {
                 dirty_anchors
                     .iter()
@@ -426,7 +446,7 @@ impl IncrementalLowerer {
             })
             .filter(|existing_path| upstream.green_at_path(existing_path).is_some())
             .filter(|existing_path| {
-                self.resolve_anchor_path(upstream, existing_path, &memo, &resolving)
+                self.resolve_anchor_path(upstream, uri, existing_path, &memo, &resolving)
                     .as_ref()
                     != Some(*existing_path)
             })
@@ -438,12 +458,13 @@ impl IncrementalLowerer {
 
         // Re-lower dirty anchors deepest-first so child anchors are settled
         // before parent anchors that reference them via read_cell.
-        let mut dirty: Vec<NodePath> = dirty_anchors.into_iter().collect();
-        dirty.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+        let mut dirty: Vec<DocumentNodePath> = dirty_anchors.into_iter().collect();
+        dirty.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.1.cmp(&b.1)));
 
         for anchor in dirty {
             self.relower_anchor(
                 upstream,
+                uri,
                 downstream,
                 &anchor,
                 &mut builder,
@@ -458,13 +479,14 @@ impl IncrementalLowerer {
     fn relower_anchor(
         &mut self,
         upstream: &ParseTreeIR,
+        uri: &URI,
         downstream: &AstArena<AstMapAny>,
-        anchor_path: &NodePath,
+        anchor_path: &DocumentNodePath,
         builder: &mut AstTxnBuilder<AstMapAny>,
-        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
-        resolving: &RefCell<FxHashSet<NodePath>>,
+        memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<DocumentNodePath>>,
     ) {
-        let Some(intent) = self.resolve_intent(upstream, anchor_path, memo, resolving) else {
+        let Some(intent) = self.resolve_intent(upstream, uri, anchor_path, memo, resolving) else {
             return;
         };
 
@@ -499,9 +521,10 @@ impl IncrementalLowerer {
     fn resolve_intent(
         &self,
         upstream: &ParseTreeIR,
-        cst_path: &NodePath,
-        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
-        resolving: &RefCell<FxHashSet<NodePath>>,
+        uri: &URI,
+        cst_path: &DocumentNodePath,
+        memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<DocumentNodePath>>,
     ) -> Option<AstMapIntent> {
         if let Some(cached) = memo.borrow().get(cst_path).cloned() {
             return Some(cached);
@@ -512,13 +535,13 @@ impl IncrementalLowerer {
         let mut node = upstream
             .viewer(self.grammar)
             .node(green, offset)
-            .with_path(cst_path.clone());
+            .with_path(cst_path.1.clone().into());
 
         // Attach grammar-derived field name from parent context.
         // `ParseTreeIR` uses `Tag::Rule` for everything (field wrappers are
         // transparent in the protocol), so the only way to know a child is at a
         // named field position is to look at the parent production's field_positions.
-        if let Some(child_ix) = cst_path.0.last().copied() {
+        if let Some(child_ix) = cst_path.1.last().copied() {
             if let Some(parent_path) = cst_path.parent() {
                 if let Some(parent_green) = upstream.green_at_path(&parent_path) {
                     let parent_node = upstream.alloc.node(parent_green);
@@ -547,10 +570,13 @@ impl IncrementalLowerer {
             return Some(AstMapIntent::skip());
         }
 
-        let resolve_ast_path =
-            |child: &NodeView| self.resolve_ast_path(upstream, child.path(), memo, resolving);
+        let resolve_ast_path = |child: &NodeView| {
+            let child_path = DocumentNodePath(uri.clone(), child.path().0.clone());
+            self.resolve_ast_path(upstream, uri, &child_path, memo, resolving)
+        };
         let ctx = AstMapCtx {
             upstream,
+            uri,
             resolve_ast_path: &resolve_ast_path,
         };
 
@@ -563,15 +589,16 @@ impl IncrementalLowerer {
     fn resolve_ast_path(
         &self,
         upstream: &ParseTreeIR,
-        cst_path: &NodePath,
-        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
-        resolving: &RefCell<FxHashSet<NodePath>>,
-    ) -> Option<NodePath> {
-        let intent = self.resolve_intent(upstream, cst_path, memo, resolving)?;
+        uri: &URI,
+        cst_path: &DocumentNodePath,
+        memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<DocumentNodePath>>,
+    ) -> Option<DocumentNodePath> {
+        let intent = self.resolve_intent(upstream, uri, cst_path, memo, resolving)?;
         match intent.action {
             AstMapAction::Skip => None,
             AstMapAction::Forward(target) => {
-                self.resolve_ast_path(upstream, &target, memo, resolving)
+                self.resolve_ast_path(upstream, uri, &target, memo, resolving)
             }
             AstMapAction::Emit(_) => Some(intent.anchor.unwrap_or_else(|| cst_path.clone())),
         }
@@ -580,15 +607,16 @@ impl IncrementalLowerer {
     fn collect_upstream_anchors(
         &self,
         upstream: &ParseTreeIR,
-        root_path: &NodePath,
-        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
-        resolving: &RefCell<FxHashSet<NodePath>>,
-        dirty_anchors: &mut FxHashSet<NodePath>,
+        uri: &URI,
+        root_path: &DocumentNodePath,
+        memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<DocumentNodePath>>,
+        dirty_anchors: &mut FxHashSet<DocumentNodePath>,
     ) {
         // Iterative DFS to avoid stack overflow on deep trees.
-        let mut stack: Vec<NodePath> = vec![root_path.clone()];
+        let mut stack: Vec<DocumentNodePath> = vec![root_path.clone()];
         while let Some(path) = stack.pop() {
-            if let Some(anchor) = self.resolve_anchor_path(upstream, &path, memo, resolving) {
+            if let Some(anchor) = self.resolve_anchor_path(upstream, uri, &path, memo, resolving) {
                 dirty_anchors.insert(anchor);
                 // Still recurse: children may be independent mapped anchors
                 // (e.g. `primary` and `mul` are both inside `add`'s subtree).
@@ -598,9 +626,7 @@ impl IncrementalLowerer {
                 let n_children = node.children.len();
                 drop(node);
                 for ix in 0..n_children {
-                    let mut child_path = path.0.clone();
-                    child_path.push(ix);
-                    stack.push(NodePath(child_path));
+                    stack.push(path.child(ix));
                 }
             }
         }
@@ -609,18 +635,19 @@ impl IncrementalLowerer {
     fn resolve_anchor_or_ancestor(
         &self,
         upstream: &ParseTreeIR,
-        cst_path: &NodePath,
-        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
-        resolving: &RefCell<FxHashSet<NodePath>>,
-    ) -> Option<NodePath> {
+        uri: &URI,
+        cst_path: &DocumentNodePath,
+        memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<DocumentNodePath>>,
+    ) -> Option<DocumentNodePath> {
         // Try the path itself first (covers full-parse case where every node appears).
-        if let Some(anchor) = self.resolve_anchor_path(upstream, cst_path, memo, resolving) {
+        if let Some(anchor) = self.resolve_anchor_path(upstream, uri, cst_path, memo, resolving) {
             return Some(anchor);
         }
         // Walk up the ancestor chain (covers incremental case where only the leaf appears).
         let mut cur = cst_path.parent()?;
         loop {
-            if let Some(anchor) = self.resolve_anchor_path(upstream, &cur, memo, resolving) {
+            if let Some(anchor) = self.resolve_anchor_path(upstream, uri, &cur, memo, resolving) {
                 return Some(anchor);
             }
             cur = cur.parent()?;
@@ -630,15 +657,16 @@ impl IncrementalLowerer {
     fn resolve_anchor_path(
         &self,
         upstream: &ParseTreeIR,
-        cst_path: &NodePath,
-        memo: &RefCell<FxHashMap<NodePath, AstMapIntent>>,
-        resolving: &RefCell<FxHashSet<NodePath>>,
-    ) -> Option<NodePath> {
-        let intent = self.resolve_intent(upstream, cst_path, memo, resolving)?;
+        uri: &URI,
+        cst_path: &DocumentNodePath,
+        memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
+        resolving: &RefCell<FxHashSet<DocumentNodePath>>,
+    ) -> Option<DocumentNodePath> {
+        let intent = self.resolve_intent(upstream, uri, cst_path, memo, resolving)?;
         match intent.action {
             AstMapAction::Emit(_) => Some(intent.anchor.unwrap_or_else(|| cst_path.clone())),
             AstMapAction::Forward(target) => {
-                self.resolve_anchor_path(upstream, &target, memo, resolving)
+                self.resolve_anchor_path(upstream, uri, &target, memo, resolving)
             }
             AstMapAction::Skip => None,
         }
@@ -654,6 +682,30 @@ impl scheme::Pass<ParseTreeIR, AstArena<AstMapAny>> for IncrementalLowerer {
         downstream: &AstArena<AstMapAny>,
         txn: scheme::Transaction<ParseTreeIR>,
     ) -> Result<scheme::Transaction<AstArena<AstMapAny>>, Self::Error> {
-        Ok(Arc::new(self.apply_from_ir(upstream, downstream, &txn)))
+        // Every CST transaction must carry at least one path command that
+        // identifies which document changed. No URI → nothing to do.
+        let Some(uri) = extract_uri_from_commands(&txn) else {
+            return Ok(std::sync::Arc::new(Vec::new()));
+        };
+        Ok(std::sync::Arc::new(
+            self.apply_from_ir(upstream, &uri, downstream, &txn),
+        ))
     }
+}
+
+/// Extract the document URI from a CST command batch.
+/// Returns `None` only if the batch is empty or contains no path/message commands.
+fn extract_uri_from_commands(commands: &[CstCommand]) -> Option<URI> {
+    commands.iter().find_map(|cmd| {
+        let index = match cmd {
+            CstCommand::Insert { index, .. } | CstCommand::Replace { index, .. } => index,
+            CstCommand::Delete { index } => index,
+            CstCommand::Create { .. } => return None,
+        };
+        match index {
+            ParseTreeQuery::Path(dnp) => Some(dnp.0.clone()),
+            ParseTreeQuery::Message(uri) => Some(uri.clone()),
+            ParseTreeQuery::Allocator => None,
+        }
+    })
 }

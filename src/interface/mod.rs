@@ -9,7 +9,7 @@ use crate::{
         compiler::{ContainsPath, Here, TypedTree},
         dispatcher::GlobalEventDispatcher,
     },
-    scheme::{self},
+    scheme::{self, DocumentSpan, Span, URI},
     utils,
 };
 
@@ -66,17 +66,25 @@ pub trait Interface<Tree: TypedTree> {
     fn query_source_text(
         &self,
         revision: Option<runtime::RevisionId>,
-        span: utils::Span,
+        uri: &URI,
+        span: Span,
     ) -> runtime::RuntimeResult<String>
     where
         Tree: ContainsPath<Here, Target = scheme::SourceText>,
         Self: Sized,
     {
-        self.query_layer::<Here>(revision, span)
+        self.query_layer::<Here>(
+            revision,
+            DocumentSpan {
+                uri: uri.clone(),
+                span,
+            },
+        )
     }
 
     fn edit_source_text(
         &self,
+        uri: &URI,
         start: usize,
         end: usize,
         text: &str,
@@ -87,7 +95,8 @@ pub trait Interface<Tree: TypedTree> {
         match request(
             self,
             runtime::RuntimeRequest::ApplyTextEdit {
-                span: utils::Span::new(start, end),
+                uri: uri.clone(),
+                span: Span::new(start, end),
                 text: text.to_string(),
             },
         )? {
@@ -100,6 +109,7 @@ pub trait Interface<Tree: TypedTree> {
 
     fn edit_source_text_till<Path>(
         &self,
+        uri: &URI,
         start: usize,
         end: usize,
         text: &str,
@@ -118,7 +128,8 @@ pub trait Interface<Tree: TypedTree> {
         match request(
             self,
             runtime::RuntimeRequest::ApplyAndFetch {
-                span: utils::Span::new(start, end),
+                uri: uri.clone(),
+                span: Span::new(start, end),
                 text: text.to_string(),
                 layer_path: <Tree as ContainsPath<Path>>::runtime_path(),
             },
@@ -182,11 +193,11 @@ where
     Tree: TypedTree + ContainsPath<Here, Target = scheme::SourceText>,
 {
     pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(offset, offset, text)
+        self.edit_source_text(&URI::default(), offset, offset, text)
     }
 
     pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(start, end, "")
+        self.edit_source_text(&URI::default(), start, end, "")
     }
 
     pub fn replace(
@@ -195,6 +206,6 @@ where
         end: usize,
         text: &str,
     ) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(start, end, text)
+        self.edit_source_text(&URI::default(), start, end, text)
     }
 }

@@ -9,11 +9,13 @@ use crate::{
         msg::ParserMessages,
         tree::{ParsecError, Tag, TreeAllocRefExt},
     },
-    scheme::passes::{
-        metrics::EditMetrics,
-        reparser::{ReparserConfig, Zipper},
+    scheme::{
+        Span,
+        passes::{
+            metrics::EditMetrics,
+            reparser::{ReparserConfig, Zipper},
+        },
     },
-    utils::Span,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]

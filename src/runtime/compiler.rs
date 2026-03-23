@@ -18,8 +18,8 @@ use crate::{
     grammar,
     interface::Interface,
     runtime::RuntimeService,
-    scheme::{self, IR, Pipeline, QueryHandle, layers::SourceText},
-    utils::{self, Span},
+    scheme::{self, IR, Pipeline, QueryHandle, Span, layers::SourceText},
+    utils::{self},
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
@@ -1177,10 +1177,10 @@ fn validate_source_txn_len(
                 staged[*id] = Some(value.len());
             }
             scheme::Command::Insert { index, id } => {
-                if index.start != index.end {
+                if index.span.start != index.span.end {
                     return Err(runtime_invalid(format!(
                         "invalid insert span: start {} != end {}",
-                        index.start, index.end
+                        index.span.start, index.span.end
                     )));
                 }
                 let frag_len = staged
@@ -1190,11 +1190,11 @@ fn validate_source_txn_len(
                 len = len.saturating_add(frag_len);
             }
             scheme::Command::Delete { index } => {
-                let span = clamp_span(*index, len);
+                let span = clamp_span(index.span, len);
                 len = len.saturating_sub(span.end - span.start);
             }
             scheme::Command::Replace { index, id } => {
-                let span = clamp_span(*index, len);
+                let span = clamp_span(index.span, len);
                 let frag_len = staged
                     .get(*id)
                     .and_then(|v| *v)

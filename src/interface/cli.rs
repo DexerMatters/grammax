@@ -23,8 +23,16 @@ use crate::{
         compiler::{ContainsPath, Down, Here, TypedTree},
         dispatcher::GlobalEventDispatcher,
     },
-    scheme::layers::{NodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText},
+    scheme::{
+        URI,
+        layers::{DocumentNodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText},
+    },
 };
+
+/// The document URI used by the CLI (single stdin document).
+fn cli_document_uri() -> URI {
+    URI::new("cli", "stdin")
+}
 
 pub struct CliInterface<Tree: TypedTree> {
     ged: GlobalEventDispatcher,
@@ -95,7 +103,7 @@ where
     ) -> runtime::RuntimeResult<(String, String)> {
         let rev = Some(revision);
 
-        let messages = match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Message)? {
+        let messages = match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Message(cli_document_uri()))? {
             ParseTreeValue::Messages(m) => m,
             other => {
                 return Err(runtime::RuntimeError::UndefinedBehavior {
@@ -112,7 +120,7 @@ where
             }
         };
         let root_id =
-            match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Path(NodePath::root()))? {
+            match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Path(DocumentNodePath::root(cli_document_uri())))? {
                 ParseTreeValue::GreenId(id) => id,
                 other => {
                     return Err(runtime::RuntimeError::UndefinedBehavior {
@@ -142,7 +150,7 @@ where
                 if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
                     let source = state.buffer.clone();
                     let settled =
-                        <Self as Interface<Tree>>::edit_source_text(self, 0, usize::MAX, &source);
+                        <Self as Interface<Tree>>::edit_source_text(self, &cli_document_uri(), 0, usize::MAX, &source);
 
                     let num_lines = state.buffer.matches('\n').count() as u16 + 1;
                     move_to(stdout, 0, state.origin_row + num_lines)?;

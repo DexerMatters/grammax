@@ -4,10 +4,9 @@ use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
     scheme::{
-        self,
+        self, DocumentSpan, Span, URI,
         layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText},
     },
-    utils::Span,
 };
 
 use super::{
@@ -54,20 +53,23 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         downstream: &ParseTreeIR,
         txn: scheme::Transaction<SourceText>,
     ) -> Result<scheme::Transaction<ParseTreeIR>, Self::Error> {
-        let new_text_owned = upstream.text();
+        // Every SourceText transaction must carry at least one edit command that
+        // identifies which document changed.  No URI → nothing to do.
+        let Some(uri) = find_uri_in_txn(&txn) else {
+            return Ok(std::sync::Arc::new(Vec::new()));
+        };
+
+        let new_text_owned = upstream.text(&uri);
         let new_text = new_text_owned.as_str();
 
-        let edit = extract_edit(&txn);
-
-        // Only attempt incremental re-parse when a CST already exists.
-        // `downstream.root.is_some()` is the ground truth: if no CST root has
-        // been set yet the reparser has nothing to reuse, and we must full-parse.
-        if downstream.root.is_some() {
-            if let Some((span, new_len)) = edit {
-                let result = self.reparser.handle_edit(span, new_len, new_text, None);
+        // For single-edit transactions, attempt incremental re-parse.
+        if let Some((edit_uri, span, new_len)) = extract_edit(&txn) {
+            debug_assert_eq!(edit_uri, uri);
+            if downstream.roots.contains_key(&uri) {
+                let result = self.reparser.handle_edit(&uri, span, new_len, new_text, None);
                 if let Ok(edit_result) = result {
                     let cmds =
-                        prepend_messages_command(&self.reparser.parser.messages, edit_result);
+                        prepend_messages_command(&uri, &self.reparser.parser.messages, edit_result);
                     return Ok(std::sync::Arc::new(cmds));
                 }
                 // Incremental re-parse failed; fall through to full re-parse.
@@ -80,47 +82,60 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         let tree_cmds = {
             delta::generate_commands_for_full_tree(
                 &self.reparser.parser.alloc,
+                &uri,
                 root.green,
                 new_text,
             )
         };
-        let cmds = prepend_messages_command(&self.reparser.parser.messages, tree_cmds);
+        let cmds = prepend_messages_command(&uri, &self.reparser.parser.messages, tree_cmds);
 
         Ok(std::sync::Arc::new(cmds))
     }
 }
 
-fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
-    // Collect staged string lengths for Create commands.
+/// Extract the single edit (URI, Span, new_len) from a SourceText transaction.
+/// Returns `None` for multi-edit batches or transactions with no edit commands.
+fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(URI, Span, usize)> {
     let mut staged_len: FxHashMap<usize, usize> = FxHashMap::default();
     let mut edit_count = 0usize;
-    let mut result = None;
+    let mut result: Option<(URI, Span, usize)> = None;
 
     for cmd in txn {
         match cmd {
             scheme::Command::Create { id, value } => {
                 staged_len.insert(*id, value.len());
             }
-            scheme::Command::Delete { index: span } => {
+            scheme::Command::Delete { index: ds } => {
                 edit_count += 1;
-                result = Some((*span, 0));
+                result = Some((ds.uri.clone(), ds.span, 0));
             }
-            scheme::Command::Insert { index: span, id } => {
+            scheme::Command::Insert { index: ds, id } => {
                 let new_len = staged_len.get(id).copied().unwrap_or(0);
                 edit_count += 1;
-                result = Some((*span, new_len));
+                result = Some((ds.uri.clone(), ds.span, new_len));
             }
-            scheme::Command::Replace { index: span, id } => {
+            scheme::Command::Replace { index: ds, id } => {
                 let new_len = staged_len.get(id).copied().unwrap_or(0);
                 edit_count += 1;
-                result = Some((*span, new_len));
+                result = Some((ds.uri.clone(), ds.span, new_len));
             }
         }
     }
 
-    // Only use incremental reparse for exactly one edit; multi-edit batches
-    // fall through to full reparse to avoid incorrect partial-edit hints.
     if edit_count == 1 { result } else { None }
+}
+
+/// Extract just the URI from any edit command in the transaction (for multi-edit batches).
+fn find_uri_in_txn(txn: &[scheme::Command<SourceText>]) -> Option<URI> {
+    for cmd in txn {
+        match cmd {
+            scheme::Command::Delete { index: ds } => return Some(ds.uri.clone()),
+            scheme::Command::Insert { index: ds, .. } => return Some(ds.uri.clone()),
+            scheme::Command::Replace { index: ds, .. } => return Some(ds.uri.clone()),
+            scheme::Command::Create { .. } => {}
+        }
+    }
+    None
 }
 
 /// Prepend a `ParseNodeValue::Messages` Create command (id=0) carrying the
@@ -128,6 +143,7 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(Span, usize)> {
 /// encoded as error nodes in the green tree (e.g. panic-mode skip errors
 /// dropped by `finalize_root`).  Tree-node IDs start at 1, so id=0 is safe.
 fn prepend_messages_command(
+    uri: &URI,
     messages: &crate::parsec::msg::ParserMessages,
     rest: Vec<scheme::Command<ParseTreeIR>>,
 ) -> Vec<scheme::Command<ParseTreeIR>> {
@@ -138,6 +154,7 @@ fn prepend_messages_command(
     cmds.push(scheme::Command::Create {
         id: 0,
         value: ParseTreeValue::Node(ParseNodeValue::Messages {
+            uri: uri.clone(),
             messages: messages.clone(),
         }),
     });

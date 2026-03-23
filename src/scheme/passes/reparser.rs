@@ -10,6 +10,7 @@ use crate::{
         view::{NodeView, Viewer},
     },
     scheme::{
+        Span, URI,
         layers::{ParseTreeIR, cst::NodePath},
         passes::{
             delta,
@@ -20,7 +21,6 @@ use crate::{
             },
         },
     },
-    utils::Span,
 };
 
 pub type Command = crate::scheme::Command<ParseTreeIR>;
@@ -135,7 +135,7 @@ impl Reparser {
         let span = Span::new(start, end);
         let new_len = text.len();
 
-        self.handle_edit(span, new_len, &new_source, None)
+        self.handle_edit(&URI::default(), span, new_len, &new_source, None)
     }
 
     pub fn insert(&mut self, offset: usize, text: &str) -> Result<Vec<Command>, ReparseError> {
@@ -189,6 +189,7 @@ impl Reparser {
 
     pub(crate) fn handle_edit(
         &mut self,
+        uri: &URI,
         span: Span,
         new_len: usize,
         source_text: &str,
@@ -276,6 +277,7 @@ impl Reparser {
                     delta,
                     &previous_source_text,
                     source_text,
+                    uri,
                     metrics.as_deref_mut(),
                 );
                 if let Some(m) = &mut metrics {
@@ -454,6 +456,7 @@ impl Reparser {
                 delta,
                 &previous_source_text,
                 source_text,
+                uri,
                 metrics.as_deref_mut(),
             );
             if let Some(m) = &mut metrics {
@@ -543,6 +546,7 @@ impl Reparser {
         delta: isize,
         old_source_text: &str,
         new_source_text: &str,
+        uri: &URI,
         mut metrics: Option<&mut EditMetrics>,
     ) -> Vec<Command> {
         if let Some(m) = &mut metrics {
@@ -614,6 +618,7 @@ impl Reparser {
         );
         let semantic_commands = delta::generate_commands_incremental(
             &self.alloc,
+            uri,
             &path,
             candidate.zipper.node.green,
             candidate.green,

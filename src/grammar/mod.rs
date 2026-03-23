@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use rustc_hash::FxHashMap;
 
 use crate::parsec::{self, Parser};
-use crate::utils::Span;
+use crate::scheme::Span;
 
 /// Static storage for cached grammars
 /// Maps cache key to static reference of Grammar

@@ -4,7 +4,7 @@ use crate::grammar::Grammar;
 use crate::grammar::analysis::EOF_TOKEN;
 use crate::parsec::msg::{ErrorMessage, ParserMessage};
 use crate::parsec::tree::{GreenId, RedNode, Tag, TreeAllocRef, TreeAllocRefExt};
-use crate::utils::{Range, Span};
+use crate::scheme::{Range, Span};
 
 const RESET: &str = "\x1b[0m";
 const DIM: &str = "\x1b[2m";

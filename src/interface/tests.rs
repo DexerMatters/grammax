@@ -7,7 +7,8 @@ use crate::{
     new_grammar,
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
-        layers::{AstArena, AstCell, AstVec, NodePath, ParseTreeIR},
+        URI,
+        layers::{AstArena, AstCell, AstVec, DocumentNodePath, ParseTreeIR},
         passes::{AstMapper, IncrementalLowerer},
     },
 };
@@ -110,7 +111,7 @@ fn test_tap_prints_cst_commands() {
 
     thread::spawn(move || {
         while let Some(transaction) = ast_observer.recv() {
-            if let Ok(root) = ast_observer.query(NodePath::root()) {
+            if let Ok(root) = ast_observer.query(DocumentNodePath::root(URI::default())) {
                 println!("=== Current JSON AST ===");
                 cprintln!("<cyan>{:#?}</>", root);
             }
@@ -187,7 +188,7 @@ fn test_arith_commands() {
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
-            let Ok(result) = observer.query(NodePath::root()) else {
+            let Ok(result) = observer.query(DocumentNodePath::root(URI::default())) else {
                 continue;
             };
             println!("=== Current AST: {:?} ===", result);

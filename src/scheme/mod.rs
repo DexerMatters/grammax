@@ -1,5 +1,7 @@
+pub mod doc;
 pub mod layers;
 pub mod passes;
+pub use doc::*;
 pub use layers::SourceText;
 
 use std::thread::{self, JoinHandle};

@@ -8,47 +8,115 @@ use crate::{
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
         view::Viewer,
     },
-    scheme::{self, IR},
-    utils::Span,
+    scheme::{self, IR, Span, URI},
 };
 
+/// Internal path within a single document's parse tree.
+/// Each element is a child index at that level of the tree.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, Ord, PartialOrd, Default, Serialize, serde::Deserialize,
+    Debug, Clone, PartialEq, Eq, Hash, Default, PartialOrd, Ord, Serialize, serde::Deserialize,
 )]
 pub struct NodePath(pub Vec<usize>);
+
+impl NodePath {
+    /// Root path (empty).
+    pub fn root() -> Self {
+        NodePath(vec![])
+    }
+
+    /// Return the `index`-th direct child of this path.
+    pub fn child(&self, index: usize) -> Self {
+        let mut v = self.0.clone();
+        v.push(index);
+        NodePath(v)
+    }
+
+    /// Parent path, or `None` if this is the root.
+    pub fn parent(&self) -> Option<Self> {
+        if self.0.is_empty() {
+            None
+        } else {
+            let mut v = self.0.clone();
+            v.pop();
+            Some(NodePath(v))
+        }
+    }
+
+    pub fn is_prefix_of(&self, other: &NodePath) -> bool {
+        self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(a, b)| a == b)
+    }
+
+    pub fn is_direct_child_of(&self, parent: &NodePath) -> bool {
+        self.0.len() == parent.0.len() + 1 && parent.is_prefix_of(self)
+    }
+}
+
+impl From<Vec<usize>> for NodePath {
+    fn from(path: Vec<usize>) -> Self {
+        Self(path)
+    }
+}
+
+/// Full document-addressed path: URI identifying the document plus the
+/// in-tree `NodePath`.  Used at the CST IR API boundary (transactions and
+/// queries that must specify which document to target).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default, Serialize, serde::Deserialize)]
+pub struct DocumentNodePath(pub URI, pub Vec<usize>);
+
+impl PartialOrd for DocumentNodePath {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DocumentNodePath {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0
+            .scheme
+            .cmp(&other.0.scheme)
+            .then_with(|| self.0.path.cmp(&other.0.path))
+            .then_with(|| self.1.cmp(&other.1))
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 pub enum ParseTreeQuery {
-    Path(NodePath),
-    Message,
+    Path(DocumentNodePath),
+    Message(URI),
     Allocator,
 }
 
 impl Default for ParseTreeQuery {
     fn default() -> Self {
-        Self::Path(NodePath::default())
+        Self::Path(DocumentNodePath::default())
     }
 }
 
-impl NodePath {
-    pub fn root() -> Self {
-        Self(Vec::new())
+impl DocumentNodePath {
+    pub fn root_default() -> Self {
+        Self(URI::default(), Vec::new())
+    }
+
+    pub fn root(uri: URI) -> Self {
+        Self(uri, Vec::new())
     }
 
     /// Return the `index`-th direct child of this path.
     pub fn child(&self, index: usize) -> Self {
-        let mut path = self.0.clone();
+        let mut path = self.1.clone();
         path.push(index);
-        Self(path)
+        Self(self.0.clone(), path)
     }
 
     pub fn is_prefix_of(&self, other: &Self) -> bool {
-        self.0.len() <= other.0.len() && self.0.iter().zip(other.0.iter()).all(|(a, b)| a == b)
+        self.0 == other.0
+            && self.1.len() <= other.1.len()
+            && self.1.iter().zip(other.1.iter()).all(|(a, b)| a == b)
     }
 
     pub fn is_direct_child_of(&self, parent: &Self) -> bool {
-        self.0.len() == parent.0.len() + 1 && parent.is_prefix_of(self)
+        self.1.len() == parent.1.len() + 1 && parent.is_prefix_of(self)
     }
 
     pub fn overlaps_subtree(&self, other: &Self) -> bool {
@@ -56,12 +124,12 @@ impl NodePath {
     }
 
     pub fn parent(&self) -> Option<Self> {
-        if self.0.is_empty() {
+        if self.1.is_empty() {
             None
         } else {
-            let mut path = self.0.clone();
+            let mut path = self.1.clone();
             path.pop();
-            Some(Self(path))
+            Some(Self(self.0.clone(), path))
         }
     }
 }
@@ -85,14 +153,15 @@ pub enum ParseNodeValue {
         field: String,
     },
     Messages {
+        uri: URI,
         messages: ParserMessages,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ParseTreeError {
-    MissingRoot,
-    InvalidPath(NodePath),
+    InvalidPath(DocumentNodePath),
+    UnknownURI(URI),
 }
 
 #[derive(Clone)]
@@ -152,13 +221,15 @@ impl ParseNodeValue {
 #[derive(Clone)]
 pub struct ParseTreeIR {
     pub(crate) alloc: TreeAllocRef,
-    pub root: Option<usize>,
+    /// Per-URI root green node IDs.
+    pub roots: FxHashMap<URI, usize>,
     pub staging: FxHashMap<usize, ParseNodeValue>,
     created: FxHashMap<usize, usize>,
+    /// Green node → field name (shared across all documents; green IDs are globally unique).
     fields: FxHashMap<usize, String>,
     token_text: FxHashMap<usize, String>,
-    pub forwarded_messages: ParserMessages,
-    messages_cache: ParserMessages,
+    pub forwarded_messages: FxHashMap<URI, ParserMessages>,
+    messages_cache: FxHashMap<URI, ParserMessages>,
 }
 
 // SAFETY: ParseTreeIR is always owned by a single worker thread when used in
@@ -169,7 +240,7 @@ unsafe impl Send for ParseTreeIR {}
 impl fmt::Debug for ParseTreeIR {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ParseTreeIR")
-            .field("root", &self.root)
+            .field("roots_count", &self.roots.len())
             .field("staging_len", &self.staging.len())
             .field("created_len", &self.created.len())
             .finish()
@@ -186,13 +257,13 @@ impl ParseTreeIR {
     pub fn new() -> Self {
         Self {
             alloc: TreeAllocRef::create(),
-            root: None,
+            roots: FxHashMap::default(),
             staging: FxHashMap::default(),
             created: FxHashMap::default(),
             fields: FxHashMap::default(),
             token_text: FxHashMap::default(),
-            forwarded_messages: Vec::new(),
-            messages_cache: Vec::new(),
+            forwarded_messages: FxHashMap::default(),
+            messages_cache: FxHashMap::default(),
         }
     }
 
@@ -213,10 +284,10 @@ impl ParseTreeIR {
         self.token_text.get(&green).map(String::as_str)
     }
 
-    pub fn offset_at_path(&self, path: &NodePath) -> Option<usize> {
-        let mut current = self.root?;
+    pub fn offset_at_path(&self, path: &DocumentNodePath) -> Option<usize> {
+        let mut current = *self.roots.get(&path.0)?;
         let mut offset = 0;
-        for &ix in &path.0 {
+        for &ix in &path.1 {
             let node = self.alloc.node(current);
             if ix > node.children.len() {
                 return None;
@@ -275,10 +346,11 @@ impl ParseTreeIR {
 
     fn rebuild_parent_with_edit(
         &mut self,
+        uri: &URI,
         parent_path: &[usize],
         edit: impl FnOnce(&mut Vec<usize>),
     ) {
-        let Some(mut current) = self.root else {
+        let Some(mut current) = self.roots.get(uri).copied() else {
             return;
         };
 
@@ -299,7 +371,7 @@ impl ParseTreeIR {
             if let Some(field) = self.fields.get(&old).cloned() {
                 self.fields.insert(rebuilt, field);
             }
-            self.root = Some(rebuilt);
+            self.roots.insert(uri.clone(), rebuilt);
             return;
         }
 
@@ -346,15 +418,15 @@ impl ParseTreeIR {
             rebuilt = next;
         }
 
-        self.root = Some(rebuilt);
+        self.roots.insert(uri.clone(), rebuilt);
     }
 
-    fn apply_child_edits(&mut self, parent_path: &[usize], edits: &[PendingChildEdit]) {
+    fn apply_child_edits(&mut self, uri: &URI, parent_path: &[usize], edits: &[PendingChildEdit]) {
         if edits.is_empty() {
             return;
         }
 
-        self.rebuild_parent_with_edit(parent_path, |children| {
+        self.rebuild_parent_with_edit(uri, parent_path, |children| {
             for edit in edits {
                 match *edit {
                     PendingChildEdit::Insert { at, green } => {
@@ -376,9 +448,9 @@ impl ParseTreeIR {
         });
     }
 
-    pub fn green_at_path(&self, path: &NodePath) -> Option<usize> {
-        let mut current = self.root?;
-        for &ix in &path.0 {
+    pub fn green_at_path(&self, path: &DocumentNodePath) -> Option<usize> {
+        let mut current = *self.roots.get(&path.0)?;
+        for &ix in &path.1 {
             let node = self.alloc.node(current);
             if ix >= node.children.len() {
                 return None;
@@ -386,6 +458,41 @@ impl ParseTreeIR {
             current = node.children[ix];
         }
         Some(current)
+    }
+
+    /// Look up a green node by URI and in-tree `NodePath`.
+    pub fn green_at_node_path(&self, path: &DocumentNodePath) -> Option<usize> {
+        let mut current = *self.roots.get(&path.0)?;
+        for &ix in &path.1 {
+            let node = self.alloc.node(current);
+            if ix >= node.children.len() {
+                return None;
+            }
+            current = node.children[ix];
+        }
+        Some(current)
+    }
+
+    /// Return the byte offset (from document start) of the node at `path`
+    /// within the document identified by `uri`.
+    pub fn offset_at_node_path(&self, path: &DocumentNodePath) -> Option<usize> {
+        let mut current = *self.roots.get(&path.0)?;
+        let mut offset = 0;
+        for &ix in &path.1 {
+            let node = self.alloc.node(current);
+            if ix > node.children.len() {
+                return None;
+            }
+            offset += node
+                .children
+                .iter()
+                .take(ix)
+                .map(|&child| self.alloc.width_of(child))
+                .sum::<usize>();
+            let next = *node.children.get(ix)?;
+            current = next;
+        }
+        Some(offset)
     }
 
     pub fn value_of_green(&self, green: usize) -> ParseNodeValue {
@@ -469,30 +576,36 @@ impl ParseTreeIR {
         }
     }
 
-    pub fn parser_messages(&self) -> ParserMessages {
-        // Pre-computed in `apply_transaction`; O(1) to return.
-        self.messages_cache.clone()
+    /// Returns messages for a specific URI. Returns `None` if the URI is unknown.
+    pub fn parser_messages(&self, uri: &URI) -> Option<ParserMessages> {
+        self.messages_cache.get(uri).cloned()
     }
 
-    fn compute_parser_messages(&self) -> ParserMessages {
-        let mut messages = self.forwarded_messages.clone();
-        // Also collect error nodes encoded directly in the green tree (e.g.
-        // MissingToken nodes from incremental recovery).  Merge with forwarded
-        // messages and deduplicate by span so neither source is lost.
-        if let Some(root) = self.root {
-            self.collect_messages_from_green(root, 0, &mut messages);
+    fn compute_parser_messages(&self) -> FxHashMap<URI, ParserMessages> {
+        let mut result: FxHashMap<URI, ParserMessages> = FxHashMap::default();
+
+        // Seed with forwarded messages per URI.
+        for (uri, fwd) in &self.forwarded_messages {
+            result
+                .entry(uri.clone())
+                .or_default()
+                .extend(fwd.iter().cloned());
         }
-        messages.sort_by_key(|m| (m.span.start, m.span.end));
-        messages.dedup_by(|a, b| a.span == b.span && a.message == b.message);
-        messages
+
+        // Collect error nodes from each document's green tree.
+        for (uri, &root) in &self.roots {
+            let messages = result.entry(uri.clone()).or_default();
+            self.collect_messages_from_green(root, 0, messages);
+            messages.sort_by_key(|m| (m.span.start, m.span.end));
+            messages.dedup_by(|a, b| a.span == b.span && a.message == b.message);
+        }
+
+        result
     }
 
     fn live_green_ids(&self) -> FxHashSet<usize> {
         let mut live = FxHashSet::default();
-        let Some(root) = self.root else {
-            return live;
-        };
-        let mut stack = vec![root];
+        let mut stack: Vec<usize> = self.roots.values().copied().collect();
         while let Some(green) = stack.pop() {
             if live.insert(green) {
                 let node = self.alloc.node(green);
@@ -512,15 +625,25 @@ impl IR for ParseTreeIR {
 
     fn query(&self, index: ParseTreeQuery) -> Result<ParseTreeValue, Self::Error> {
         match index {
-            ParseTreeQuery::Message => Ok(ParseTreeValue::Messages(self.parser_messages())),
+            ParseTreeQuery::Message(uri) => {
+                // Strict: error if this URI has never been seen.
+                if !self.roots.contains_key(&uri) && !self.messages_cache.contains_key(&uri) {
+                    return Err(ParseTreeError::UnknownURI(uri));
+                }
+                Ok(ParseTreeValue::Messages(
+                    self.messages_cache.get(&uri).cloned().unwrap_or_default(),
+                ))
+            }
             ParseTreeQuery::Allocator => Ok(ParseTreeValue::Allocator(self.alloc.clone())),
             ParseTreeQuery::Path(path) => {
-                let green = match self.green_at_path(&path) {
-                    Some(green) => green,
-                    None if self.root.is_none() => return Err(ParseTreeError::MissingRoot),
-                    None => return Err(ParseTreeError::InvalidPath(path)),
-                };
-                Ok(ParseTreeValue::GreenId(green))
+                // Strict: error if this URI has never been initialised.
+                if !self.roots.contains_key(&path.0) {
+                    return Err(ParseTreeError::UnknownURI(path.0.clone()));
+                }
+                match self.green_at_path(&path) {
+                    Some(green) => Ok(ParseTreeValue::GreenId(green)),
+                    None => Err(ParseTreeError::InvalidPath(path)),
+                }
             }
         }
     }
@@ -529,12 +652,13 @@ impl IR for ParseTreeIR {
         &mut self,
         transaction: scheme::Transaction<Self>,
     ) -> Result<(), Self::Error> {
+        // Flush a batch of child edits for the current (URI, parent_path) pair.
         let flush_pending =
             |this: &mut Self,
-             pending_parent: &mut Option<Vec<usize>>,
+             pending_parent: &mut Option<(URI, Vec<usize>)>,
              pending_edits: &mut Vec<PendingChildEdit>| {
-                if let Some(parent_path) = pending_parent.take() {
-                    this.apply_child_edits(&parent_path, pending_edits);
+                if let Some((uri, parent_path)) = pending_parent.take() {
+                    this.apply_child_edits(&uri, &parent_path, pending_edits);
                     pending_edits.clear();
                 }
             };
@@ -542,7 +666,7 @@ impl IR for ParseTreeIR {
         self.staging.clear();
         self.created.clear();
         self.forwarded_messages.clear();
-        let mut pending_parent: Option<Vec<usize>> = None;
+        let mut pending_parent: Option<(URI, Vec<usize>)> = None;
         let mut pending_edits: Vec<PendingChildEdit> = Vec::new();
 
         for command in transaction.iter() {
@@ -554,9 +678,10 @@ impl IR for ParseTreeIR {
                         _ => continue,
                     };
 
-                    // Messages variant carries forwarded parser-level errors.
-                    if let ParseNodeValue::Messages { messages } = value {
-                        self.forwarded_messages.clone_from(messages);
+                    // Messages variant carries forwarded parser-level errors for a URI.
+                    if let ParseNodeValue::Messages { uri, messages } = value {
+                        self.forwarded_messages
+                            .insert(uri.clone(), messages.clone());
                         continue;
                     }
 
@@ -574,18 +699,25 @@ impl IR for ParseTreeIR {
                         continue;
                     };
 
-                    if index.0.is_empty() {
+                    let uri = &index.0;
+                    let path = &index.1;
+
+                    if path.is_empty() {
+                        // Setting/initialising the root for this URI.
                         flush_pending(self, &mut pending_parent, &mut pending_edits);
-                        self.root = Some(green);
+                        self.roots.insert(uri.clone(), green);
                         continue;
                     }
 
-                    let parent_path = &index.0[..index.0.len() - 1];
-                    let at = index.0[index.0.len() - 1];
+                    let parent_path = &path[..path.len() - 1];
+                    let at = path[path.len() - 1];
 
-                    if pending_parent.as_deref() != Some(parent_path) {
+                    let matches = pending_parent
+                        .as_ref()
+                        .is_some_and(|(u, p)| u == uri && p.as_slice() == parent_path);
+                    if !matches {
                         flush_pending(self, &mut pending_parent, &mut pending_edits);
-                        pending_parent = Some(parent_path.to_vec());
+                        pending_parent = Some((uri.clone(), parent_path.to_vec()));
                     }
                     pending_edits.push(PendingChildEdit::Insert { at, green });
                 }
@@ -593,18 +725,25 @@ impl IR for ParseTreeIR {
                     let ParseTreeQuery::Path(index) = index else {
                         continue;
                     };
-                    if index.0.is_empty() {
+
+                    let uri = &index.0;
+                    let path = &index.1;
+
+                    if path.is_empty() {
                         flush_pending(self, &mut pending_parent, &mut pending_edits);
-                        self.root = None;
+                        self.roots.remove(uri);
                         continue;
                     }
 
-                    let parent_path = &index.0[..index.0.len() - 1];
-                    let at = index.0[index.0.len() - 1];
+                    let parent_path = &path[..path.len() - 1];
+                    let at = path[path.len() - 1];
 
-                    if pending_parent.as_deref() != Some(parent_path) {
+                    let matches = pending_parent
+                        .as_ref()
+                        .is_some_and(|(u, p)| u == uri && p.as_slice() == parent_path);
+                    if !matches {
                         flush_pending(self, &mut pending_parent, &mut pending_edits);
-                        pending_parent = Some(parent_path.to_vec());
+                        pending_parent = Some((uri.clone(), parent_path.to_vec()));
                     }
                     pending_edits.push(PendingChildEdit::Delete { at });
                 }
@@ -616,18 +755,25 @@ impl IR for ParseTreeIR {
                         continue;
                     };
 
-                    if index.0.is_empty() {
+                    let uri = &index.0;
+                    let path = &index.1;
+
+                    if path.is_empty() {
+                        // Replace root — init if not yet present, matches source.rs behaviour.
                         flush_pending(self, &mut pending_parent, &mut pending_edits);
-                        self.root = Some(green);
+                        self.roots.insert(uri.clone(), green);
                         continue;
                     }
 
-                    let parent_path = &index.0[..index.0.len() - 1];
-                    let at = index.0[index.0.len() - 1];
+                    let parent_path = &path[..path.len() - 1];
+                    let at = path[path.len() - 1];
 
-                    if pending_parent.as_deref() != Some(parent_path) {
+                    let matches = pending_parent
+                        .as_ref()
+                        .is_some_and(|(u, p)| u == uri && p.as_slice() == parent_path);
+                    if !matches {
                         flush_pending(self, &mut pending_parent, &mut pending_edits);
-                        pending_parent = Some(parent_path.to_vec());
+                        pending_parent = Some((uri.clone(), parent_path.to_vec()));
                     }
                     pending_edits.push(PendingChildEdit::Replace { at, green });
                 }
@@ -635,7 +781,7 @@ impl IR for ParseTreeIR {
         }
         flush_pending(self, &mut pending_parent, &mut pending_edits);
 
-        // Evict stale metadata for green nodes no longer in the tree (fix 5).
+        // Evict stale metadata for green nodes no longer in any tree.
         let live = self.live_green_ids();
         self.fields.retain(|id, _| live.contains(id));
         self.token_text.retain(|id, _| live.contains(id));

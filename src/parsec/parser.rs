@@ -16,7 +16,8 @@ use crate::parsec::tree::{
     GreenId, ParsecError, RedNode, Tag, TreeAllocRef, TreeAllocRefExt, TreeBuilder,
 };
 use crate::parsec::view::{NodeView, Viewer};
-use crate::utils::{LruCache, Span};
+use crate::scheme::Span;
+use crate::utils::LruCache;
 
 const UNKNOWN_TOKEN: usize = usize::MAX - 1;
 const DEFAULT_REUSE_CAPACITY: usize = 4096;

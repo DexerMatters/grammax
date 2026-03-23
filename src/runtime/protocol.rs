@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use crossbeam::channel;
 
-use crate::utils::{Payload, Span};
+use crate::{scheme::{Span, URI}, utils::Payload};
 
 pub type RevisionId = u64;
 
@@ -71,12 +71,14 @@ pub(crate) enum RuntimeSignal {
 pub(crate) enum RuntimeRequest {
     /// Fire-and-forget edit; replies immediately with `Accepted { revision }`.
     ApplyTextEdit {
+        uri: URI,
         span: Span,
         text: String,
     },
     /// Edit and wait for `layer_path` to settle; replies with `EditResult`
     /// containing the `Transaction<I>` produced by that layer.
     ApplyAndFetch {
+        uri: URI,
         span: Span,
         text: String,
         layer_path: RuntimePath,

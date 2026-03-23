@@ -1,4 +1,4 @@
-use crate::utils::Span;
+use crate::scheme::Span;
 
 /// Error messages generated during parsing, which can be either unexpected tokens, missing tokens, or custom messages.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]

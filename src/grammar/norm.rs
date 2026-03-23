@@ -4,7 +4,7 @@ use crate::grammar::GrammarError;
 use crate::grammar::edsl::{GrammarNode, GrammarRegistry};
 use crate::grammar::ir::{NormalizedNode, Production, RuleInfo, Symbol};
 use crate::parsec::words::MatcherRef;
-use crate::utils::Span;
+use crate::scheme::Span;
 
 /// Normalized grammar optimized for LR parsing
 #[derive(Debug, Clone)]

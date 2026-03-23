@@ -2,10 +2,22 @@ use rustc_hash::FxHashMap;
 
 use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
-    scheme::layers::{NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue},
+    scheme::{
+        URI,
+        layers::{
+            DocumentNodePath, NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue,
+        },
+    },
 };
 
 const MAX_LCS_CELLS: usize = 4096;
+
+/// Wrap an internal `NodePath` into a `ParseTreeQuery::Path` with the given URI.
+/// This is the boundary between in-tree path arithmetic and addressable IR commands.
+#[inline(always)]
+fn path_query(uri: &URI, path: &NodePath) -> ParseTreeQuery {
+    ParseTreeQuery::Path(DocumentNodePath(uri.clone(), path.0.clone()))
+}
 
 type Command = crate::scheme::Command<ParseTreeIR>;
 type EqCache = FxHashMap<(usize, usize, usize, usize, bool), bool>;
@@ -13,6 +25,7 @@ type AlignCache = FxHashMap<(usize, usize), bool>;
 
 pub(crate) fn generate_commands_incremental(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     old_green: usize,
     new_green: usize,
@@ -29,6 +42,7 @@ pub(crate) fn generate_commands_incremental(
 
     emit_commands_for_delta(
         alloc,
+        uri,
         old_green,
         new_green,
         old_green_offset,
@@ -55,6 +69,7 @@ pub(crate) fn generate_commands_incremental(
 /// This keeps the transaction size at O(N) instead of O(2N).
 pub(crate) fn generate_commands_for_full_tree(
     alloc: &TreeAllocRef,
+    uri: &URI,
     root_green: usize,
     source_text: &str,
 ) -> Vec<Command> {
@@ -71,7 +86,7 @@ pub(crate) fn generate_commands_for_full_tree(
     );
 
     creates.push(Command::Insert {
-        index: ParseTreeQuery::Path(NodePath(vec![])),
+        index: path_query(uri, &NodePath::root()),
         id: root_id,
     });
     creates
@@ -170,8 +185,10 @@ fn collect_full_tree_creates(
     node_id
 }
 
+#[allow(clippy::too_many_arguments)]
 fn emit_commands_for_delta(
     alloc: &TreeAllocRef,
+    uri: &URI,
     old_green: usize,
     new_green: usize,
     old_green_offset: usize,
@@ -204,6 +221,7 @@ fn emit_commands_for_delta(
     if old_node.tag != new_node.tag {
         emit_replace_at_path(
             alloc,
+            uri,
             old_green,
             path,
             new_green,
@@ -228,6 +246,7 @@ fn emit_commands_for_delta(
             drop(new_node);
             emit_commands_for_delta(
                 alloc,
+                uri,
                 old_child,
                 new_child,
                 old_green_offset,
@@ -251,6 +270,7 @@ fn emit_commands_for_delta(
     if old_children.is_empty() && new_children.is_empty() {
         emit_replace_at_path(
             alloc,
+            uri,
             old_green,
             path,
             new_green,
@@ -315,7 +335,7 @@ fn emit_commands_for_delta(
                 next_node_id,
             );
             out.push(Command::Insert {
-                index: ParseTreeQuery::Path(insert_path.clone()),
+                index: path_query(uri, &insert_path),
                 id: node_id,
             });
         }
@@ -327,7 +347,7 @@ fn emit_commands_for_delta(
             let mut delete_path = path.clone();
             delete_path.0.push(ix);
             out.push(Command::Delete {
-                index: ParseTreeQuery::Path(delete_path),
+                index: path_query(uri, &delete_path),
             });
         }
         return;
@@ -340,6 +360,7 @@ fn emit_commands_for_delta(
     // and only flushed on success.
     if try_emit_by_greedy_tag_match(
         alloc,
+        uri,
         path,
         old_children,
         new_children,
@@ -361,6 +382,7 @@ fn emit_commands_for_delta(
 
     if try_emit_insertions_as_subsequence_aligned(
         alloc,
+        uri,
         path,
         old_children,
         new_children,
@@ -382,6 +404,7 @@ fn emit_commands_for_delta(
 
     if try_emit_deletions_as_subsequence_aligned(
         alloc,
+        uri,
         path,
         old_children,
         new_children,
@@ -404,6 +427,7 @@ fn emit_commands_for_delta(
     if old_mid_len.saturating_mul(new_mid_len) > MAX_LCS_CELLS {
         emit_linear_splice_diff(
             alloc,
+            uri,
             path,
             old_children,
             new_children,
@@ -421,6 +445,7 @@ fn emit_commands_for_delta(
 
     emit_lcs_diff(
         alloc,
+        uri,
         path,
         old_children,
         new_children,
@@ -442,6 +467,7 @@ fn emit_commands_for_delta(
 #[allow(clippy::too_many_arguments)]
 fn emit_linear_splice_diff(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     _old_children: &[usize],
     new_children: &[usize],
@@ -458,7 +484,7 @@ fn emit_linear_splice_diff(
         let mut delete_path = path.clone();
         delete_path.0.push(ix);
         out.push(Command::Delete {
-            index: ParseTreeQuery::Path(delete_path),
+            index: path_query(uri, &delete_path),
         });
     }
 
@@ -468,6 +494,7 @@ fn emit_linear_splice_diff(
         let insert_offset = child_offset_at(alloc, new_children, new_green_offset, ix);
         emit_insert_at_path(
             alloc,
+            uri,
             &insert_path,
             new_children[ix],
             insert_offset,
@@ -480,6 +507,7 @@ fn emit_linear_splice_diff(
 
 fn emit_replace_at_path(
     alloc: &TreeAllocRef,
+    uri: &URI,
     _old_green: usize,
     path: &NodePath,
     new_green: usize,
@@ -499,23 +527,24 @@ fn emit_replace_at_path(
 
     if path.0.is_empty() {
         out.push(Command::Delete {
-            index: ParseTreeQuery::Path(path.clone()),
+            index: path_query(uri, path),
         });
         out.push(Command::Insert {
-            index: ParseTreeQuery::Path(path.clone()),
+            index: path_query(uri, path),
             id: node_id,
         });
         return;
     }
 
     out.push(Command::Replace {
-        index: ParseTreeQuery::Path(path.clone()),
+        index: path_query(uri, path),
         id: node_id,
     });
 }
 
 fn emit_insert_at_path(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     new_green: usize,
     new_green_offset: usize,
@@ -532,13 +561,14 @@ fn emit_insert_at_path(
         next_node_id,
     );
     out.push(Command::Insert {
-        index: ParseTreeQuery::Path(path.clone()),
+        index: path_query(uri, path),
         id: node_id,
     });
 }
 
 fn try_emit_by_greedy_tag_match(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     old_children: &[usize],
     new_children: &[usize],
@@ -619,7 +649,7 @@ fn try_emit_by_greedy_tag_match(
                 let mut del_path = path.clone();
                 del_path.0.push(current_index);
                 buf.push(Command::Delete {
-                    index: ParseTreeQuery::Path(del_path),
+                    index: path_query(uri, &del_path),
                 });
                 // Deletion: live-tree index does NOT advance (next child shifts into this slot).
                 old_cursor += 1;
@@ -643,6 +673,7 @@ fn try_emit_by_greedy_tag_match(
             );
             emit_commands_for_delta(
                 alloc,
+                uri,
                 old_child,
                 new_child,
                 old_child_offset,
@@ -677,7 +708,7 @@ fn try_emit_by_greedy_tag_match(
             let mut insert_path = path.clone();
             insert_path.0.push(current_index);
             buf.push(Command::Insert {
-                index: ParseTreeQuery::Path(insert_path.clone()),
+                index: path_query(uri, &insert_path),
                 id: node_id,
             });
             current_index += 1;
@@ -689,7 +720,7 @@ fn try_emit_by_greedy_tag_match(
         let mut del_path = path.clone();
         del_path.0.push(current_index);
         buf.push(Command::Delete {
-            index: ParseTreeQuery::Path(del_path),
+            index: path_query(uri, &del_path),
         });
         old_cursor += 1;
     }
@@ -702,6 +733,7 @@ fn try_emit_by_greedy_tag_match(
 #[allow(clippy::too_many_arguments)]
 fn try_emit_insertions_as_subsequence_aligned(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     old_children: &[usize],
     new_children: &[usize],
@@ -751,6 +783,7 @@ fn try_emit_insertions_as_subsequence_aligned(
         );
         emit_insert_at_path(
             alloc,
+            uri,
             &insert_path,
             insert_child,
             insert_offset,
@@ -777,6 +810,7 @@ fn try_emit_insertions_as_subsequence_aligned(
         );
         emit_commands_for_delta(
             alloc,
+            uri,
             old_mid[old_rel],
             new_mid[new_rel],
             old_child_offset,
@@ -798,6 +832,7 @@ fn try_emit_insertions_as_subsequence_aligned(
 #[allow(clippy::too_many_arguments)]
 fn try_emit_deletions_as_subsequence_aligned(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     old_children: &[usize],
     new_children: &[usize],
@@ -842,6 +877,7 @@ fn try_emit_deletions_as_subsequence_aligned(
             );
             emit_commands_for_delta(
                 alloc,
+                uri,
                 old_child,
                 new_mid[new_ix],
                 old_child_offset,
@@ -861,7 +897,7 @@ fn try_emit_deletions_as_subsequence_aligned(
             let mut delete_path = path.clone();
             delete_path.0.push(current_index);
             buf.push(Command::Delete {
-                index: ParseTreeQuery::Path(delete_path),
+                index: path_query(uri, &delete_path),
             });
         }
     }
@@ -878,6 +914,7 @@ fn try_emit_deletions_as_subsequence_aligned(
 #[allow(clippy::too_many_arguments)]
 fn emit_lcs_diff(
     alloc: &TreeAllocRef,
+    uri: &URI,
     path: &NodePath,
     old_children: &[usize],
     new_children: &[usize],
@@ -938,7 +975,7 @@ fn emit_lcs_diff(
         let mut delete_path = path.clone();
         delete_path.0.push(old_mid_start + old_rel);
         out.push(Command::Delete {
-            index: ParseTreeQuery::Path(delete_path),
+            index: path_query(uri, &delete_path),
         });
     }
 
@@ -954,6 +991,7 @@ fn emit_lcs_diff(
         );
         emit_insert_at_path(
             alloc,
+            uri,
             &insert_path,
             new_mid[new_rel],
             insert_offset,
@@ -981,6 +1019,7 @@ fn emit_lcs_diff(
         );
         emit_commands_for_delta(
             alloc,
+            uri,
             old_mid[old_rel],
             new_mid[new_rel],
             old_child_offset,

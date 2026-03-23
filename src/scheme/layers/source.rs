@@ -1,16 +1,23 @@
 use rustc_hash::FxHashMap;
 
-use crate::scheme::{Command, IR, Transaction};
-use crate::utils::Span;
+use crate::scheme::{Command, DocumentSpan, IR, Span, Transaction, URI};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceTextError {
     /// The staged id was never created in this transaction.
     UnknownStagingId(usize),
     /// The span references a byte range that falls outside the current text.
-    InvalidSpan { span: Span, text_len: usize },
+    InvalidSpan {
+        span: Span,
+        text_len: usize,
+    },
+    InvalidURI {
+        uri: URI,
+    },
     /// An Insert target must have `start == end`.
-    NotAnInsertionPoint { span: Span },
+    NotAnInsertionPoint {
+        span: Span,
+    },
 }
 
 // ── Gap buffer ─────────────────────────────────────────────────────────────────
@@ -153,7 +160,7 @@ impl GapBuf {
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceText {
-    gap: GapBuf,
+    pub(crate) sources: FxHashMap<URI, GapBuf>,
     staging: FxHashMap<usize, String>,
 }
 
@@ -164,16 +171,22 @@ impl SourceText {
 
     /// Construct from an existing string (e.g. initial file contents).
     pub fn from_string(text: String) -> Self {
+        let mut hashmap = FxHashMap::default();
+        let sources = GapBuf::from_string(text);
+        hashmap.insert(URI::default(), sources);
         Self {
-            gap: GapBuf::from_string(text),
+            sources: hashmap,
             staging: FxHashMap::default(),
         }
     }
 
     /// Materialise the current text as a `String`. O(n) in text length;
     /// called at most once per transaction by the downstream `ParserPass`.
-    pub fn text(&self) -> String {
-        self.gap.as_string()
+    pub fn text(&self, url: &URI) -> String {
+        self.sources
+            .get(url)
+            .map(|gap| gap.as_string())
+            .unwrap_or_default()
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
@@ -185,39 +198,52 @@ impl SourceText {
             .ok_or(SourceTextError::UnknownStagingId(id))
     }
 
-    fn validate_span(&self, span: Span) -> Result<(), SourceTextError> {
-        let len = self.gap.len();
-        if span.start <= span.end && span.end <= len {
-            Ok(())
-        } else {
-            Err(SourceTextError::InvalidSpan {
-                span,
-                text_len: len,
-            })
-        }
+    fn gap_by_uri(&self, uri: &URI) -> Result<&GapBuf, SourceTextError> {
+        self.sources
+            .get(uri)
+            .ok_or(SourceTextError::InvalidURI { uri: uri.clone() })
     }
 
-    fn clamp_span(&self, span: Span) -> Span {
-        let len = self.gap.len();
-        let start = span.start.min(len);
-        let end = span.end.min(len);
-        Span::new(start.min(end), end)
+    fn gap_mut_by_uri_or_init(&mut self, uri: &URI) -> &mut GapBuf {
+        self.sources
+            .entry(uri.clone())
+            .or_insert_with(|| GapBuf::default())
+    }
+}
+
+// ── Helper functions for span validation and clamping ──────────────────────
+
+fn clamp_span(span: &Span, len: usize) -> Span {
+    let start = span.start.min(span.end).min(len);
+    let end = span.end.max(span.start).min(len);
+    Span { start, end }
+}
+
+fn validate_span(span: &Span, len: usize) -> Result<(), SourceTextError> {
+    if span.start <= span.end && span.end <= len {
+        Ok(())
+    } else {
+        Err(SourceTextError::InvalidSpan {
+            span: span.clone(),
+            text_len: len,
+        })
     }
 }
 
 // ── IR impl ──────────────────────────────────────────────────────────────────
 
 impl IR for SourceText {
-    type Ix = Span;
+    type Ix = DocumentSpan;
     /// A text fragment (either stored or staged).
     type Value = String;
     type Error = SourceTextError;
 
     /// Query a substring (the `Value` at `index`).
-    fn query(&self, index: Span) -> Result<String, Self::Error> {
-        let span = self.clamp_span(index);
-        self.validate_span(span)?;
-        Ok(self.gap.slice(span.start, span.end))
+    fn query(&self, index: DocumentSpan) -> Result<String, Self::Error> {
+        let gap = self.gap_by_uri(&index.uri)?;
+        let span = clamp_span(&index.span, gap.len());
+        validate_span(&span, gap.len())?;
+        Ok(gap.slice(span.start, span.end))
     }
 
     /// Clears staging table then applies the transaction directly.
@@ -229,23 +255,28 @@ impl IR for SourceText {
                     self.staging.insert(*id, value.clone());
                 }
                 Command::Insert { index, id } => {
-                    if index.start != index.end {
-                        return Err(SourceTextError::NotAnInsertionPoint { span: *index });
+                    if index.span.start != index.span.end {
+                        return Err(SourceTextError::NotAnInsertionPoint { span: index.span });
                     }
-                    let at = index.start.min(self.gap.len());
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.gap.insert_str(at, &fragment);
+                    let gap = self.gap_mut_by_uri_or_init(&index.uri);
+                    let at = index.span.start.min(gap.len());
+                    gap.insert_str(at, &fragment);
                 }
                 Command::Delete { index } => {
-                    let span = self.clamp_span(*index);
-                    self.validate_span(span)?;
-                    self.gap.drain(span.start, span.end);
+                    let gap = self.gap_mut_by_uri_or_init(&index.uri);
+                    let len = gap.len();
+                    let span = clamp_span(&index.span, len);
+                    validate_span(&span, len)?;
+                    gap.drain(span.start, span.end);
                 }
                 Command::Replace { index, id } => {
-                    let span = self.clamp_span(*index);
-                    self.validate_span(span)?;
                     let fragment = self.ensure_staged(*id)?.to_owned();
-                    self.gap.replace_range(span.start, span.end, &fragment);
+                    let gap = self.gap_mut_by_uri_or_init(&index.uri);
+                    let len = gap.len();
+                    let span = clamp_span(&index.span, len);
+                    validate_span(&span, len)?;
+                    gap.replace_range(span.start, span.end, &fragment);
                 }
             }
         }

@@ -1,14 +1,14 @@
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct URI {
-    pub scheme: String,
-    pub path: String,
+    pub scheme: internment::Intern<String>,
+    pub path: internment::Intern<String>,
 }
 
 impl URI {
-    pub fn new(scheme: impl Into<String>, path: impl Into<String>) -> Self {
+    pub fn new(scheme: impl AsRef<str>, path: impl AsRef<str>) -> Self {
         URI {
-            scheme: scheme.into(),
-            path: path.into(),
+            scheme: internment::Intern::from_ref(scheme.as_ref()),
+            path: internment::Intern::from_ref(path.as_ref()),
         }
     }
 }
@@ -16,8 +16,8 @@ impl URI {
 impl Default for URI {
     fn default() -> Self {
         URI {
-            scheme: "file".to_string(),
-            path: "undefined".to_string(),
+            scheme: internment::Intern::from_ref("file"),
+            path: internment::Intern::from_ref("undefined"),
         }
     }
 }
@@ -28,7 +28,24 @@ impl fmt::Display for URI {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+impl From<&str> for URI {
+    fn from(s: &str) -> Self {
+        let parts: Vec<&str> = s.splitn(2, "://").collect();
+        if parts.len() == 2 {
+            URI::new(parts[0], parts[1])
+        } else {
+            URI::new("file", s)
+        }
+    }
+}
+
+impl From<String> for URI {
+    fn from(s: String) -> Self {
+        URI::from(s.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct DocumentRange {
     pub uri: URI,
     pub range: Range,

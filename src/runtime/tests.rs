@@ -48,7 +48,7 @@ fn test_json() {
     );
 
     let compiler = CompilerBuilder::new()
-        .then(ParserPass::new(grammar), ParseTreeIR::default())
+        .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar))
         .then(IncrementalLowerer::new(grammar, ()), AstArena::default());
 
     let compiler = compiler.build_runtime::<BasicInterface<_>>(grammar);
@@ -72,7 +72,7 @@ fn test_tap_prints_cst_commands() {
     );
 
     let cst_tree: CstTree =
-        CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
+        CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar));
     let cst_obs: ObservedLayer<CstTree, Down<Here>> = cst_tree.observe::<Down<Here>>();
 
     let compiler = cst_tree.build_runtime::<BasicInterface<_>>(grammar);

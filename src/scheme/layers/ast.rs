@@ -736,7 +736,7 @@ impl<T> AstArena<T> {
     fn refresh_roots(&mut self) {
         let mut roots: FxHashMap<URI, DocumentNodePath> = FxHashMap::default();
         for path in self.storage.nodes.keys() {
-            let uri = path.0.clone();
+            let uri = path.0;
             let should_replace = match roots.get(&uri) {
                 None => true,
                 Some(existing) => {

@@ -16,7 +16,7 @@ const MAX_LCS_CELLS: usize = 4096;
 /// This is the boundary between in-tree path arithmetic and addressable IR commands.
 #[inline(always)]
 fn path_query(uri: &URI, path: &NodePath) -> ParseTreeQuery {
-    ParseTreeQuery::Path(DocumentNodePath(uri.clone(), path.0.clone()))
+    ParseTreeQuery::Path(DocumentNodePath(*uri, path.0.clone()))
 }
 
 type Command = crate::scheme::Command<ParseTreeIR>;

@@ -4,7 +4,7 @@ use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
     scheme::{
-        self, DocumentSpan, Span, URI,
+        self, Span, URI,
         layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText},
     },
 };
@@ -66,7 +66,9 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         if let Some((edit_uri, span, new_len)) = extract_edit(&txn) {
             debug_assert_eq!(edit_uri, uri);
             if downstream.roots.contains_key(&uri) {
-                let result = self.reparser.handle_edit(&uri, span, new_len, new_text, None);
+                let result = self
+                    .reparser
+                    .handle_edit(&uri, span, new_len, new_text, None);
                 if let Ok(edit_result) = result {
                     let cmds =
                         prepend_messages_command(&uri, &self.reparser.parser.messages, edit_result);
@@ -107,17 +109,17 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(URI, Span, usize
             }
             scheme::Command::Delete { index: ds } => {
                 edit_count += 1;
-                result = Some((ds.uri.clone(), ds.span, 0));
+                result = Some((ds.uri, ds.span, 0));
             }
             scheme::Command::Insert { index: ds, id } => {
                 let new_len = staged_len.get(id).copied().unwrap_or(0);
                 edit_count += 1;
-                result = Some((ds.uri.clone(), ds.span, new_len));
+                result = Some((ds.uri, ds.span, new_len));
             }
             scheme::Command::Replace { index: ds, id } => {
                 let new_len = staged_len.get(id).copied().unwrap_or(0);
                 edit_count += 1;
-                result = Some((ds.uri.clone(), ds.span, new_len));
+                result = Some((ds.uri, ds.span, new_len));
             }
         }
     }
@@ -129,9 +131,9 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(URI, Span, usize
 fn find_uri_in_txn(txn: &[scheme::Command<SourceText>]) -> Option<URI> {
     for cmd in txn {
         match cmd {
-            scheme::Command::Delete { index: ds } => return Some(ds.uri.clone()),
-            scheme::Command::Insert { index: ds, .. } => return Some(ds.uri.clone()),
-            scheme::Command::Replace { index: ds, .. } => return Some(ds.uri.clone()),
+            scheme::Command::Delete { index: ds } => return Some(ds.uri),
+            scheme::Command::Insert { index: ds, .. } => return Some(ds.uri),
+            scheme::Command::Replace { index: ds, .. } => return Some(ds.uri),
             scheme::Command::Create { .. } => {}
         }
     }
@@ -154,7 +156,7 @@ fn prepend_messages_command(
     cmds.push(scheme::Command::Create {
         id: 0,
         value: ParseTreeValue::Node(ParseNodeValue::Messages {
-            uri: uri.clone(),
+            uri: *uri,
             messages: messages.clone(),
         }),
     });

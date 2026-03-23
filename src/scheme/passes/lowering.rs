@@ -65,7 +65,7 @@ impl AstMapIntent {
     }
 
     pub fn with_anchor_node(mut self, uri: &URI, node: &NodeView) -> Self {
-        self.anchor = Some(DocumentNodePath(uri.clone(), node.path().0.clone()));
+        self.anchor = Some(DocumentNodePath(*uri, node.path().0.clone()));
         self
     }
 }
@@ -106,7 +106,7 @@ impl<'a> AstMapCtx<'a> {
 
     /// Produce a `Forward` intent to resolve at the given node's path.
     pub fn forward(&self, node: &NodeView) -> AstMapIntent {
-        AstMapIntent::forward(DocumentNodePath(self.uri.clone(), node.path().0.clone()))
+        AstMapIntent::forward(DocumentNodePath(*self.uri, node.path().0.clone()))
     }
 
     /// Produce a `Skip` intent.
@@ -118,7 +118,7 @@ impl<'a> AstMapCtx<'a> {
     pub fn try_forward_first(&self, node: &NodeView) -> Option<AstMapIntent> {
         let child = node.each().first()?;
         Some(AstMapIntent::forward(DocumentNodePath(
-            self.uri.clone(),
+            *self.uri,
             child.path().0.clone(),
         )))
     }
@@ -128,7 +128,7 @@ impl<'a> AstMapCtx<'a> {
         node.each()
             .first()
             .map(|child| AstMapIntent::forward(DocumentNodePath(
-                self.uri.clone(),
+                *self.uri,
                 child.path().0.clone(),
             )))
             .unwrap_or_else(AstMapIntent::skip)
@@ -150,7 +150,7 @@ impl<'a> AstMapCtx<'a> {
     /// .on_rule("item", |ctx, node| Some(ctx.emit(Expr::Item(...))))
     /// ```
     pub fn collect_vec<U>(&self, parent: &NodeView) -> AstVec<U> {
-        AstVec::new(DocumentNodePath(self.uri.clone(), parent.path().0.clone()))
+        AstVec::new(DocumentNodePath(*self.uri, parent.path().0.clone()))
     }
 
     /// All parser-level diagnostics for the current transaction.
@@ -373,7 +373,7 @@ impl IncrementalLowerer {
                         self.collect_upstream_anchors(
                             upstream,
                             uri,
-                            &DocumentNodePath::root(uri.clone()),
+                            &DocumentNodePath::root(*uri),
                             &memo,
                             &resolving,
                             &mut dirty_anchors,
@@ -571,7 +571,7 @@ impl IncrementalLowerer {
         }
 
         let resolve_ast_path = |child: &NodeView| {
-            let child_path = DocumentNodePath(uri.clone(), child.path().0.clone());
+            let child_path = DocumentNodePath(*uri, child.path().0.clone());
             self.resolve_ast_path(upstream, uri, &child_path, memo, resolving)
         };
         let ctx = AstMapCtx {
@@ -703,8 +703,8 @@ fn extract_uri_from_commands(commands: &[CstCommand]) -> Option<URI> {
             CstCommand::Create { .. } => return None,
         };
         match index {
-            ParseTreeQuery::Path(dnp) => Some(dnp.0.clone()),
-            ParseTreeQuery::Message(uri) => Some(uri.clone()),
+            ParseTreeQuery::Path(dnp) => Some(dnp.0),
+            ParseTreeQuery::Message(uri) => Some(*uri),
             ParseTreeQuery::Allocator => None,
         }
     })

@@ -418,6 +418,13 @@ impl NodeView {
 
 impl Display for NodeView {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // ParseTreeIR-backed views may not carry full source text; rebuild a
+        // local source slice from token_texts so token labels stay visible.
+        let source = if self.source.is_empty() {
+            self.text()
+        } else {
+            self.source.to_string()
+        };
         write!(
             f,
             "{}",
@@ -425,7 +432,7 @@ impl Display for NodeView {
                 self.grammar,
                 &RedNode::root(self.green),
                 &self.alloc,
-                &self.source,
+                &source,
             )
         )
     }

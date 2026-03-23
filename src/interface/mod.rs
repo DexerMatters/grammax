@@ -73,13 +73,7 @@ pub trait Interface<Tree: TypedTree> {
         Tree: ContainsPath<Here, Target = scheme::SourceText>,
         Self: Sized,
     {
-        self.query_layer::<Here>(
-            revision,
-            DocumentSpan {
-                uri: uri.clone(),
-                span,
-            },
-        )
+        self.query_layer::<Here>(revision, DocumentSpan { uri: *uri, span })
     }
 
     fn edit_source_text(
@@ -95,7 +89,7 @@ pub trait Interface<Tree: TypedTree> {
         match request(
             self,
             runtime::RuntimeRequest::ApplyTextEdit {
-                uri: uri.clone(),
+                uri: *uri,
                 span: Span::new(start, end),
                 text: text.to_string(),
             },
@@ -128,7 +122,7 @@ pub trait Interface<Tree: TypedTree> {
         match request(
             self,
             runtime::RuntimeRequest::ApplyAndFetch {
-                uri: uri.clone(),
+                uri: *uri,
                 span: Span::new(start, end),
                 text: text.to_string(),
                 layer_path: <Tree as ContainsPath<Path>>::runtime_path(),
@@ -169,6 +163,7 @@ fn request<Tree: TypedTree, I: Interface<Tree>>(
 
 pub struct BasicInterface<Tree: TypedTree> {
     ged: GlobalEventDispatcher,
+    current_uri: URI,
     _marker: PhantomData<fn() -> Tree>,
 }
 
@@ -179,6 +174,7 @@ where
     fn new(ged: GlobalEventDispatcher, _grammar: &'static grammar::Grammar) -> Self {
         Self {
             ged,
+            current_uri: URI::default(),
             _marker: PhantomData,
         }
     }
@@ -192,12 +188,20 @@ impl<Tree> BasicInterface<Tree>
 where
     Tree: TypedTree + ContainsPath<Here, Target = scheme::SourceText>,
 {
+    pub fn switch_uri(&mut self, uri: impl Into<URI>) {
+        self.current_uri = uri.into();
+    }
+
+    pub fn current_uri(&self) -> URI {
+        self.current_uri
+    }
+
     pub fn insert(&self, offset: usize, text: &str) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(&URI::default(), offset, offset, text)
+        self.edit_source_text(&self.current_uri, offset, offset, text)
     }
 
     pub fn delete(&self, start: usize, end: usize) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(&URI::default(), start, end, "")
+        self.edit_source_text(&self.current_uri, start, end, "")
     }
 
     pub fn replace(
@@ -206,6 +210,6 @@ where
         end: usize,
         text: &str,
     ) -> runtime::RuntimeResult<runtime::RevisionId> {
-        self.edit_source_text(&URI::default(), start, end, text)
+        self.edit_source_text(&self.current_uri, start, end, text)
     }
 }

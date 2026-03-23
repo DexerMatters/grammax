@@ -1,4 +1,8 @@
-use std::{marker::PhantomData, ops::Deref, thread};
+use std::{
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    thread,
+};
 
 use crossbeam::channel;
 
@@ -46,5 +50,11 @@ impl<Tree: TypedTree, Impl> Deref for RuntimeService<Tree, Impl> {
 
     fn deref(&self) -> &Self::Target {
         &self.api
+    }
+}
+
+impl<Tree: TypedTree, Impl> DerefMut for RuntimeService<Tree, Impl> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.api
     }
 }

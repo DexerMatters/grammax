@@ -30,7 +30,7 @@ pub enum SourceTextError {
 // costs O(distance) but is amortised O(1) for sequential (LSP-style) edits.
 
 #[derive(Debug, Clone)]
-struct GapBuf {
+pub(crate) struct GapBuf {
     buf: Vec<u8>,
     gap_start: usize,
     gap_end: usize,
@@ -201,12 +201,12 @@ impl SourceText {
     fn gap_by_uri(&self, uri: &URI) -> Result<&GapBuf, SourceTextError> {
         self.sources
             .get(uri)
-            .ok_or(SourceTextError::InvalidURI { uri: uri.clone() })
+            .ok_or(SourceTextError::InvalidURI { uri: *uri })
     }
 
     fn gap_mut_by_uri_or_init(&mut self, uri: &URI) -> &mut GapBuf {
         self.sources
-            .entry(uri.clone())
+            .entry(*uri)
             .or_insert_with(|| GapBuf::default())
     }
 }

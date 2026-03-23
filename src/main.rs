@@ -114,7 +114,8 @@ pub fn main() {
                 }
             };
             let tree: Then<SourceText, ParserPass, End<ParseTreeIR>> =
-                CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::default());
+                CompilerBuilder::new()
+                    .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar));
             let _observer: ObservedLayer<
                 Then<SourceText, ParserPass, End<ParseTreeIR>>,
                 grammax::runtime::Down<grammax::runtime::Here>,

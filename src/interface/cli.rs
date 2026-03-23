@@ -29,11 +29,6 @@ use crate::{
     },
 };
 
-/// The document URI used by the CLI (single stdin document).
-fn cli_document_uri() -> URI {
-    URI::new("cli", "stdin")
-}
-
 pub struct CliInterface<Tree: TypedTree> {
     ged: GlobalEventDispatcher,
     grammar: &'static grammar::Grammar,
@@ -96,6 +91,10 @@ where
         Ok(())
     }
 
+    pub fn uri(&self) -> URI {
+        URI::new("cli", "stdin")
+    }
+
     fn display_result(
         &self,
         source: &str,
@@ -103,34 +102,29 @@ where
     ) -> runtime::RuntimeResult<(String, String)> {
         let rev = Some(revision);
 
-        let messages = match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Message(cli_document_uri()))? {
-            ParseTreeValue::Messages(m) => m,
-            other => {
-                return Err(runtime::RuntimeError::UndefinedBehavior {
-                    message: format!("expected Messages, got {other:?}"),
-                });
-            }
-        };
-        let alloc = match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Allocator)? {
-            ParseTreeValue::Allocator(a) => a,
-            other => {
-                return Err(runtime::RuntimeError::UndefinedBehavior {
-                    message: format!("expected Allocator, got {other:?}"),
-                });
-            }
-        };
-        let root_id =
-            match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Path(DocumentNodePath::root(cli_document_uri())))? {
-                ParseTreeValue::GreenId(id) => id,
+        let messages =
+            match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Message(self.uri()))? {
+                ParseTreeValue::Messages(m) => m,
                 other => {
                     return Err(runtime::RuntimeError::UndefinedBehavior {
-                        message: format!("expected GreenId, got {other:?}"),
+                        message: format!("expected Messages, got {other:?}"),
                     });
                 }
             };
+        let root_view = match self.query_layer::<Down<Here>>(
+            rev,
+            ParseTreeQuery::Path(DocumentNodePath::root(self.uri())),
+        )? {
+            ParseTreeValue::View(view) => view,
+            _ => {
+                return Err(runtime::RuntimeError::UndefinedBehavior {
+                    message: "expected NodeView for root".to_string(),
+                });
+            }
+        };
 
         let message_text = format_messages_with_source(self.grammar, &messages, source);
-        let ast_text = format_ast(self.grammar, &RedNode::root(root_id), &alloc, source);
+        let ast_text = format!("{}", root_view);
         Ok((message_text, ast_text))
     }
 
@@ -149,8 +143,13 @@ where
 
                 if event.modifiers.contains(KeyModifiers::CONTROL) && c == 's' {
                     let source = state.buffer.clone();
-                    let settled =
-                        <Self as Interface<Tree>>::edit_source_text(self, &cli_document_uri(), 0, usize::MAX, &source);
+                    let settled = <Self as Interface<Tree>>::edit_source_text(
+                        self,
+                        &self.uri(),
+                        0,
+                        usize::MAX,
+                        &source,
+                    );
 
                     let num_lines = state.buffer.matches('\n').count() as u16 + 1;
                     move_to(stdout, 0, state.origin_row + num_lines)?;

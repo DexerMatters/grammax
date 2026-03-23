@@ -295,7 +295,7 @@ fn edit_to_txn(uri: URI, span: Span, text: String) -> scheme::Transaction<scheme
     if span.start == span.end && text.is_empty() {
         return Arc::new(Vec::new());
     }
-    let doc_span = DocumentSpan { uri: uri.clone(), span };
+    let doc_span = DocumentSpan { uri, span };
     if span.start == span.end {
         return Arc::new(vec![
             Command::Create { id: 0, value: text },

@@ -109,7 +109,17 @@ fn test_json() {
 
     println!("Grammar:\n{}", grammar.table);
 
-    let text = r#""""#;
+    let text = r#"{
+        "name": "John",
+        "age": 30,
+        "isStudent": false,
+        "courses": ["Math", "Science"],
+        "address": {
+            "street": "123 Main St",
+            "city": "Anytown"
+        },
+        "nullValue": null
+    }"#;
     let result = parser.parse_text(text);
 
     println!("AST:\n{}", result.format_ast());

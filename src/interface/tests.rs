@@ -5,10 +5,14 @@ use color_print::cprintln;
 use crate::{
     interface::{BasicInterface, webui::WebPreviewInterface},
     new_grammar,
+    parsec::{parser, view::NodeView},
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
         URI,
-        layers::{AstArena, AstCell, AstVec, DocumentNodePath, ParseTreeIR},
+        layers::{
+            AstArena, AstCell, AstVec, DocumentNodePath, ParseTreeIR, ParseTreeQuery,
+            ParseTreeValue,
+        },
         passes::{AstMapper, IncrementalLowerer},
     },
 };
@@ -93,7 +97,7 @@ fn test_tap_prints_cst_commands() {
     );
 
     let pass = CompilerBuilder::new()
-        .then(ParserPass::new(grammar), ParseTreeIR::default())
+        .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar))
         .then(
             IncrementalLowerer::new(grammar, mapper),
             AstArena::default(),
@@ -172,13 +176,28 @@ fn test_arith_commands() {
     );
 
     let pass = CompilerBuilder::new()
-        .then(ParserPass::new(grammar), ParseTreeIR::default())
+        .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar))
         .then(IncrementalLowerer::new(grammar, mapper), AstArena::new());
     let parser_observer = pass.observe::<Down<Here>>();
     let observer = pass.observe::<Down<Down<Here>>>();
 
     thread::spawn(move || {
         while let Some(transaction) = parser_observer.recv() {
+            let Ok(result) = parser_observer.query(ParseTreeQuery::Path(DocumentNodePath::root(
+                "file://preview",
+            ))) else {
+                continue;
+            };
+
+            match result {
+                ParseTreeValue::View(view) => {
+                    println!("=== Current CST ===");
+                    println!("{}", view);
+                }
+                other => {
+                    println!("=== Current CST query result: {:?} ===", other);
+                }
+            }
             println!("======Received CST transaction:");
             for cmd in transaction.iter() {
                 cprintln!("<yellow>CST Command: {:?}</>", cmd);
@@ -188,7 +207,7 @@ fn test_arith_commands() {
 
     thread::spawn(move || {
         while let Some(transaction) = observer.recv() {
-            let Ok(result) = observer.query(DocumentNodePath::root(URI::default())) else {
+            let Ok(result) = observer.query(DocumentNodePath::root("file://preview")) else {
                 continue;
             };
             println!("=== Current AST: {:?} ===", result);
@@ -199,9 +218,9 @@ fn test_arith_commands() {
         }
     });
 
-    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
+    let mut runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
 
-    runtime.insert(0, "1 + 2 * 3").unwrap();
-    runtime.replace(0, 1, "x").unwrap();
+    runtime.switch_uri("file://preview");
+    runtime.insert(0, "4 * (5 + 6)").unwrap();
     thread::sleep(std::time::Duration::from_millis(10));
 }

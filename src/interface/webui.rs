@@ -19,11 +19,6 @@ use crate::{
     },
 };
 
-/// The document URI used by the WebUI (single preview document).
-fn webui_document_uri() -> URI {
-    URI::new("webui", "preview")
-}
-
 #[derive(Embed)]
 #[folder = "frontend/dist/"]
 #[include = "**/*"]
@@ -102,6 +97,10 @@ where
         format!("{}:{}", self.host, self.port)
     }
 
+    pub fn uri(&self) -> URI {
+        URI::new("webui", "preview")
+    }
+
     pub fn run(&self) -> runtime::RuntimeResult<()> {
         let mut port = self.port;
         while !is_port_free(self.host, port) {
@@ -173,13 +172,18 @@ where
                 let body: WebAction = rouille::try_or_400!(rouille::input::json_input(request));
                 match body {
                     WebAction::ApplyTextEdit { span, text } => self
-                        .edit_source_text_till::<Down<Here>>(&webui_document_uri(), span.start, span.end, &text)
+                        .edit_source_text_till::<Down<Here>>(
+                            &self.uri(),
+                            span.start,
+                            span.end,
+                            &text,
+                        )
                         .map(|(_, transaction)| {
                             rouille::Response::json(&commands_to_web_json(&transaction))
                         })
                         .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
                     WebAction::GetSource => {
-                        match self.query_source_text(None, &webui_document_uri(), Span::new(0, usize::MAX)) {
+                        match self.query_source_text(None, &self.uri(), Span::new(0, usize::MAX)) {
                             Ok(source) => rouille::Response::json(&source),
                             Err(e) => rouille::Response::json(&e).with_status_code(500),
                         }
@@ -204,14 +208,18 @@ where
         &self,
         revision: Option<runtime::RevisionId>,
     ) -> runtime::RuntimeResult<serde_json::Value> {
-        let source =
-            <Self as Interface<Tree>>::query_source_text(self, revision, &webui_document_uri(), Span::new(0, usize::MAX))?;
+        let source = <Self as Interface<Tree>>::query_source_text(
+            self,
+            revision,
+            &self.uri(),
+            Span::new(0, usize::MAX),
+        )?;
 
         let mut parser = crate::parsec::Parser::new(self.grammar);
         let crate::parsec::Result { root, .. } = parser.parse_text(&source);
         let commands = crate::scheme::passes::delta::generate_commands_for_full_tree(
             &parser.alloc,
-            &webui_document_uri(),
+            &self.uri(),
             root.green,
             &source,
         );

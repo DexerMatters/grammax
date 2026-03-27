@@ -2,6 +2,7 @@ use crate::new_grammar_no_cache;
 use crate::parsec::msg::ErrorMessage;
 use crate::parsec::parser::Parser;
 use crate::parsec::view::ViewAction;
+use crate::scheme::Span;
 
 #[test]
 fn test_simple_whitespaces() {
@@ -88,6 +89,29 @@ fn test_simple_arithmetic_precedence() {
             ))
         )
     );
+}
+
+#[test]
+fn test_largest_that_covers_returns_deepest_covering_descendant() {
+    let grammar = new_grammar_no_cache!(
+        start where
+        start -> r!(expr) + tt(EndOfInput)
+        expr -> r!(add) | r!(mul) | r!(primary)
+        add  -> r!(expr) + tt("+") + r!(expr).drop(1)
+        mul  -> r!(expr).drop(1) + tt("*") + r!(expr).drop(2)
+        primary -> tt(NUMBER) | tt("(") + r!(expr) + tt(")")
+    );
+
+    let text = "1 + 2 * (3 + 4)";
+    let result = grammar.parse(text);
+    let view = result.view();
+
+    let three_start = text.find('3').expect("test text should contain '3'");
+    let target = view
+        .largest_that_covers(Span::new(three_start, three_start + 3))
+        .expect("root should cover span");
+
+    println!("\"{}\"", target.text());
 }
 
 #[test]

@@ -1,8 +1,12 @@
+use std::cell::RefCell;
+
 use rustc_hash::FxHashMap;
 
 use crate::scheme::{Command, DocumentSpan, IR, Span, Transaction, URI};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+pub type SourceAtom = internment::Intern<String>;
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum SourceTextError {
     /// The staged id was never created in this transaction.
     UnknownStagingId(usize),
@@ -161,7 +165,8 @@ impl GapBuf {
 #[derive(Debug, Clone, Default)]
 pub struct SourceText {
     pub(crate) sources: FxHashMap<URI, GapBuf>,
-    staging: FxHashMap<usize, String>,
+    staging: FxHashMap<usize, SourceAtom>,
+    full_text_cache: RefCell<FxHashMap<URI, SourceAtom>>,
 }
 
 impl SourceText {
@@ -172,29 +177,46 @@ impl SourceText {
     /// Construct from an existing string (e.g. initial file contents).
     pub fn from_string(text: String) -> Self {
         let mut hashmap = FxHashMap::default();
+        let mut cache = FxHashMap::default();
+        let atom: SourceAtom = text.clone().into();
         let sources = GapBuf::from_string(text);
-        hashmap.insert(URI::default(), sources);
+        let uri = URI::default();
+        hashmap.insert(uri, sources);
+        cache.insert(uri, atom);
         Self {
             sources: hashmap,
             staging: FxHashMap::default(),
+            full_text_cache: RefCell::new(cache),
         }
     }
 
     /// Materialise the current text as a `String`. O(n) in text length;
-    /// called at most once per transaction by the downstream `ParserPass`.
+    /// use [`text_atom`] to avoid cloning.
     pub fn text(&self, url: &URI) -> String {
-        self.sources
-            .get(url)
-            .map(|gap| gap.as_string())
-            .unwrap_or_default()
+        self.text_atom(url).as_ref().clone()
+    }
+
+    /// Return the full text as an interned snapshot.
+    ///
+    /// Repeated calls are O(1) until the document is edited.
+    pub fn text_atom(&self, url: &URI) -> SourceAtom {
+        if let Some(cached) = self.full_text_cache.borrow().get(url).copied() {
+            return cached;
+        }
+        let Some(gap) = self.sources.get(url) else {
+            return SourceAtom::from_ref("");
+        };
+        let atom: SourceAtom = gap.as_string().into();
+        self.full_text_cache.borrow_mut().insert(*url, atom);
+        atom
     }
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    fn ensure_staged(&self, id: usize) -> Result<&str, SourceTextError> {
+    fn staged_atom(&self, id: usize) -> Result<SourceAtom, SourceTextError> {
         self.staging
             .get(&id)
-            .map(|s| s.as_str())
+            .copied()
             .ok_or(SourceTextError::UnknownStagingId(id))
     }
 
@@ -208,6 +230,10 @@ impl SourceText {
         self.sources
             .entry(*uri)
             .or_insert_with(|| GapBuf::default())
+    }
+
+    fn invalidate_cached_text(&self, uri: &URI) {
+        self.full_text_cache.borrow_mut().remove(uri);
     }
 }
 
@@ -234,16 +260,27 @@ fn validate_span(span: &Span, len: usize) -> Result<(), SourceTextError> {
 
 impl IR for SourceText {
     type Ix = DocumentSpan;
-    /// A text fragment (either stored or staged).
-    type Value = String;
+    /// An interned text fragment (either stored or staged).
+    type Value = SourceAtom;
     type Error = SourceTextError;
 
     /// Query a substring (the `Value` at `index`).
-    fn query(&self, index: DocumentSpan) -> Result<String, Self::Error> {
+    fn query(&self, index: DocumentSpan) -> Result<SourceAtom, Self::Error> {
         let gap = self.gap_by_uri(&index.uri)?;
         let span = clamp_span(&index.span, gap.len());
+        if span.start == 0 && span.end == 0 {
+            return Ok(SourceAtom::from_ref("")); // No need to cache empty string.
+        }
         validate_span(&span, gap.len())?;
-        Ok(gap.slice(span.start, span.end))
+        if span.start == 0 && span.end == gap.len() {
+            if let Some(cached) = self.full_text_cache.borrow().get(&index.uri).copied() {
+                return Ok(cached);
+            }
+            let atom: SourceAtom = gap.as_string().into();
+            self.full_text_cache.borrow_mut().insert(index.uri, atom);
+            return Ok(atom);
+        }
+        Ok(gap.slice(span.start, span.end).into())
     }
 
     /// Clears staging table then applies the transaction directly.
@@ -252,16 +289,17 @@ impl IR for SourceText {
         for command in transaction.iter() {
             match command {
                 Command::Create { id, value } => {
-                    self.staging.insert(*id, value.clone());
+                    self.staging.insert(*id, *value);
                 }
                 Command::Insert { index, id } => {
                     if index.span.start != index.span.end {
                         return Err(SourceTextError::NotAnInsertionPoint { span: index.span });
                     }
-                    let fragment = self.ensure_staged(*id)?.to_owned();
+                    let fragment = self.staged_atom(*id)?;
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);
                     let at = index.span.start.min(gap.len());
-                    gap.insert_str(at, &fragment);
+                    gap.insert_str(at, fragment.as_ref().as_str());
+                    self.invalidate_cached_text(&index.uri);
                 }
                 Command::Delete { index } => {
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);
@@ -269,14 +307,16 @@ impl IR for SourceText {
                     let span = clamp_span(&index.span, len);
                     validate_span(&span, len)?;
                     gap.drain(span.start, span.end);
+                    self.invalidate_cached_text(&index.uri);
                 }
                 Command::Replace { index, id } => {
-                    let fragment = self.ensure_staged(*id)?.to_owned();
+                    let fragment = self.staged_atom(*id)?;
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);
                     let len = gap.len();
                     let span = clamp_span(&index.span, len);
                     validate_span(&span, len)?;
-                    gap.replace_range(span.start, span.end, &fragment);
+                    gap.replace_range(span.start, span.end, fragment.as_ref().as_str());
+                    self.invalidate_cached_text(&index.uri);
                 }
             }
         }

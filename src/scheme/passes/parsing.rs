@@ -59,8 +59,8 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
             return Ok(std::sync::Arc::new(Vec::new()));
         };
 
-        let new_text_owned = upstream.text(&uri);
-        let new_text = new_text_owned.as_str();
+        let new_text_atom = upstream.text_atom(&uri);
+        let new_text = new_text_atom.as_ref().as_str();
 
         // For single-edit transactions, attempt incremental re-parse.
         if let Some((edit_uri, span, new_len)) = extract_edit(&txn) {

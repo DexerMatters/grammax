@@ -127,10 +127,7 @@ impl<'a> AstMapCtx<'a> {
     pub fn forward_first(&self, node: &NodeView) -> AstMapIntent {
         node.each()
             .first()
-            .map(|child| AstMapIntent::forward(DocumentNodePath(
-                *self.uri,
-                child.path().0.clone(),
-            )))
+            .map(|child| AstMapIntent::forward(DocumentNodePath(*self.uri, child.path().0.clone())))
             .unwrap_or_else(AstMapIntent::skip)
     }
 
@@ -160,7 +157,11 @@ impl<'a> AstMapCtx<'a> {
 
     /// Returns `true` if the current transaction has any parser errors.
     pub fn has_errors(&self) -> bool {
-        !self.upstream.parser_messages(self.uri).unwrap_or_default().is_empty()
+        !self
+            .upstream
+            .parser_messages(self.uri)
+            .unwrap_or_default()
+            .is_empty()
     }
 }
 
@@ -380,13 +381,9 @@ impl IncrementalLowerer {
                         );
                     } else {
                         // Non-root insert (incremental mid-tree insert).
-                        if let Some(anchor) = self.resolve_anchor_or_ancestor(
-                            upstream,
-                            uri,
-                            path,
-                            &memo,
-                            &resolving,
-                        ) {
+                        if let Some(anchor) =
+                            self.resolve_anchor_or_ancestor(upstream, uri, path, &memo, &resolving)
+                        {
                             dirty_anchors.insert(anchor);
                         }
                     }
@@ -395,13 +392,9 @@ impl IncrementalLowerer {
                     let ParseTreeQuery::Path(path) = index else {
                         continue;
                     };
-                    if let Some(anchor) = self.resolve_anchor_or_ancestor(
-                        upstream,
-                        uri,
-                        path,
-                        &memo,
-                        &resolving,
-                    ) {
+                    if let Some(anchor) =
+                        self.resolve_anchor_or_ancestor(upstream, uri, path, &memo, &resolving)
+                    {
                         dirty_anchors.insert(anchor);
                     }
                 }

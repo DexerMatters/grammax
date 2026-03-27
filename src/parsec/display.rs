@@ -113,10 +113,10 @@ pub fn format_messages_with_source(
 fn format_error_context(
     out: &mut String,
     lines: &[&str],
-    start_line: usize,
-    end_line: usize,
-    start_col: usize,
-    end_col: usize,
+    start_line: u32,
+    end_line: u32,
+    start_col: u32,
+    end_col: u32,
     is_missing: bool,
 ) {
     if lines.is_empty() || start_line == 0 {
@@ -125,10 +125,14 @@ fn format_error_context(
 
     let line_idx = start_line - 1; // Convert to 0-indexed
     let context_before = if line_idx > 0 { 1 } else { 0 };
-    let context_after = if line_idx + 1 < lines.len() { 1 } else { 0 };
+    let context_after = if line_idx + 1 < lines.len() as u32 {
+        1
+    } else {
+        0
+    };
 
     let first_line = line_idx.saturating_sub(context_before);
-    let last_line = (line_idx + context_after).min(lines.len() - 1);
+    let last_line = (line_idx + context_after).min(lines.len() as u32 - 1);
     let gutter_width = format!("{}", last_line + 1).len().max(1);
 
     // Show lines before
@@ -137,7 +141,7 @@ fn format_error_context(
             out,
             "\n{:>width$} | {}",
             i + 1,
-            lines[i],
+            lines[i as usize],
             width = gutter_width
         );
     }
@@ -148,7 +152,7 @@ fn format_error_context(
         "\n{}{:>width$} | {}{}",
         RED,
         line_idx + 1,
-        lines[line_idx],
+        lines[line_idx as usize],
         RESET,
         width = gutter_width
     );
@@ -156,7 +160,7 @@ fn format_error_context(
     // Show underline/arrow
     let underline_indent = gutter_width + 3; // gutter + " | "
     let _ = write!(out, "\n{}", " ".repeat(underline_indent));
-    let _ = write!(out, "{}", " ".repeat(start_col));
+    let _ = write!(out, "{}", " ".repeat(start_col as usize));
 
     if is_missing {
         // For missing tokens, show single arrow
@@ -166,7 +170,7 @@ fn format_error_context(
         if start_line == end_line && start_col < end_col {
             let len = end_col - start_col;
             let _ = write!(out, "{}", RED);
-            let _ = write!(out, "{}", "~".repeat(len));
+            let _ = write!(out, "{}", "~".repeat(len as usize));
             let _ = write!(out, "{}", RESET);
         } else {
             let _ = write!(out, "{}", RED);
@@ -180,7 +184,7 @@ fn format_error_context(
             out,
             "\n{:>width$} | {}",
             i + 1,
-            lines[i],
+            lines[i as usize],
             width = gutter_width
         );
     }

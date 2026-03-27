@@ -15,7 +15,9 @@ pub use compiler::{
     LayerObserver, Observe, ObservePath, ObservedLayer, SeededTree, Then, TypedTree,
 };
 pub use protocol::{RevisionId, RuntimeError, RuntimePath};
-pub(crate) use protocol::{RuntimeEnvelope, RuntimeRequest, RuntimeResult, RuntimeSignal};
+pub(crate) use protocol::{
+    RuntimeEnvelope, RuntimeRequest, RuntimeResult, RuntimeSignal, RuntimeWireResult,
+};
 pub use service::RuntimeService;
 
 #[cfg(test)]

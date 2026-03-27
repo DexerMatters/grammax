@@ -722,10 +722,7 @@ impl<T> AstArena<T> {
         })
     }
 
-    fn resolve_path<'a>(
-        &'a self,
-        path: &'a DocumentNodePath,
-    ) -> Option<&'a DocumentNodePath> {
+    fn resolve_path<'a>(&'a self, path: &'a DocumentNodePath) -> Option<&'a DocumentNodePath> {
         if path.1.is_empty() {
             self.storage.roots.get(&path.0)
         } else {

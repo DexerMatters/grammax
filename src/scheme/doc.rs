@@ -59,8 +59,8 @@ pub struct DocumentSpan {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Range {
-    pub start: (usize, usize), // (line, column), 0-based
-    pub end: (usize, usize),
+    pub start: (u32, u32), // (line, column), 0-based
+    pub end: (u32, u32),
 }
 
 impl fmt::Display for Range {
@@ -77,8 +77,8 @@ impl fmt::Display for Range {
     }
 }
 
-impl From<ops::Range<(usize, usize)>> for Range {
-    fn from(r: ops::Range<(usize, usize)>) -> Self {
+impl From<ops::Range<(u32, u32)>> for Range {
+    fn from(r: ops::Range<(u32, u32)>) -> Self {
         Range {
             start: r.start,
             end: r.end,
@@ -86,8 +86,8 @@ impl From<ops::Range<(usize, usize)>> for Range {
     }
 }
 
-impl From<((usize, usize), (usize, usize))> for Range {
-    fn from(r: ((usize, usize), (usize, usize))) -> Self {
+impl From<((u32, u32), (u32, u32))> for Range {
+    fn from(r: ((u32, u32), (u32, u32))) -> Self {
         Range {
             start: r.0,
             end: r.1,
@@ -95,8 +95,8 @@ impl From<((usize, usize), (usize, usize))> for Range {
     }
 }
 
-impl From<(usize, usize)> for Range {
-    fn from(pos: (usize, usize)) -> Self {
+impl From<(u32, u32)> for Range {
+    fn from(pos: (u32, u32)) -> Self {
         Range {
             start: pos,
             end: pos,
@@ -105,7 +105,7 @@ impl From<(usize, usize)> for Range {
 }
 
 impl Range {
-    pub fn new(start: (usize, usize), end: (usize, usize)) -> Self {
+    pub fn new(start: (u32, u32), end: (u32, u32)) -> Self {
         Range { start, end }
     }
 
@@ -154,6 +154,14 @@ impl Span {
             start: self.start.into_line_col(text),
             end: self.end.into_line_col(text),
         }
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.start <= self.end
+    }
+
+    pub fn contains(&self, another: Span) -> bool {
+        self.start <= another.start && self.end >= another.end
     }
 }
 
@@ -222,7 +230,7 @@ fn build_line_index(text: &str) -> Vec<usize> {
     line_starts
 }
 
-fn convert_byte_to_line_col(byte_pos: usize, line_starts: &[usize], text: &str) -> (usize, usize) {
+fn convert_byte_to_line_col(byte_pos: usize, line_starts: &[usize], text: &str) -> (u32, u32) {
     let line_idx = line_starts
         .binary_search(&byte_pos)
         .unwrap_or_else(|next_idx| next_idx.saturating_sub(1));
@@ -241,15 +249,15 @@ fn convert_byte_to_line_col(byte_pos: usize, line_starts: &[usize], text: &str) 
         col += ch.len_utf16();
     }
 
-    (line_idx, col)
+    (line_idx as u32, col as u32)
 }
 
 pub trait IntoLineCol {
-    fn into_line_col(&self, text: &str) -> (usize, usize);
+    fn into_line_col(&self, text: &str) -> (u32, u32);
 }
 
 impl IntoLineCol for usize {
-    fn into_line_col(&self, text: &str) -> (usize, usize) {
+    fn into_line_col(&self, text: &str) -> (u32, u32) {
         let line_starts = get_or_create_line_index(text);
         convert_byte_to_line_col(*self, &line_starts, text)
     }
@@ -259,16 +267,16 @@ pub trait IntoByte {
     fn into_byte(&self, text: &str) -> usize;
 }
 
-impl IntoByte for (usize, usize) {
+impl IntoByte for (u32, u32) {
     fn into_byte(&self, text: &str) -> usize {
         let line_starts = get_or_create_line_index(text);
         let (line, col) = self;
-
-        if *line >= line_starts.len() {
+        let line = *line as usize;
+        if line >= line_starts.len() {
             return text.len();
         }
 
-        let line_start = line_starts[*line];
+        let line_start = line_starts[line];
         let line_end = line_starts.get(line + 1).copied().unwrap_or(text.len());
         let line_text = &text[line_start..line_end];
 
@@ -280,7 +288,7 @@ impl IntoByte for (usize, usize) {
             if utf16_col >= *col {
                 break;
             }
-            utf16_col += ch.len_utf16();
+            utf16_col += ch.len_utf16() as u32;
             byte_offset = offset;
         }
 

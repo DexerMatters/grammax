@@ -113,9 +113,8 @@ pub fn main() {
                     std::process::exit(1);
                 }
             };
-            let tree: Then<SourceText, ParserPass, End<ParseTreeIR>> =
-                CompilerBuilder::new()
-                    .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar));
+            let tree: Then<SourceText, ParserPass, End<ParseTreeIR>> = CompilerBuilder::new()
+                .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar));
             let _observer: ObservedLayer<
                 Then<SourceText, ParserPass, End<ParseTreeIR>>,
                 grammax::runtime::Down<grammax::runtime::Here>,

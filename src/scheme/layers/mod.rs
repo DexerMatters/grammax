@@ -18,4 +18,4 @@ pub use cst::{
     DocumentNodePath, NodePath, ParseNodeValue, ParseTreeError, ParseTreeIR, ParseTreeQuery,
     ParseTreeValue,
 };
-pub use source::SourceText;
+pub use source::{SourceAtom, SourceText};

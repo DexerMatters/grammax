@@ -1,7 +1,5 @@
 use rustc_hash::FxHashMap;
-use serde::{Deserialize, Serialize};
 use std::hash::Hash;
-use std::{fmt, ops};
 
 #[macro_export]
 macro_rules! impl_listener {

@@ -124,7 +124,7 @@ impl NodeView {
     /// Override the field name with a grammar-derived value.
     /// Used when the parent rule's production designates this child's position
     /// as a named field, even though `ParseTreeIR` stores no `Tag::Field` wrapper.
-    pub fn with_grammar_field_name(mut self, name: &'static str) -> Self {
+    pub(crate) fn with_grammar_field_name(mut self, name: &'static str) -> Self {
         self.grammar_field_name = Some(name);
         self
     }
@@ -409,6 +409,59 @@ impl NodeView {
                 self.name().unwrap_or("?")
             )
         })
+    }
+
+    pub fn largest_that_covers<'a>(&'a self, span: Span) -> Option<&'a NodeView> {
+        if !self.span().contains(span) {
+            return None;
+        }
+
+        let mut current = self;
+        loop {
+            let children = current.each();
+            if children.is_empty() {
+                return Some(current);
+            }
+
+            // Find the first child whose end offset is >= span.start.
+            let mut lo = 0usize;
+            let mut hi = children.len();
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                let (_, child_end) = children[mid].span_bytes();
+                if child_end < span.start {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+
+            // Among candidate children that can still cover `span.start`,
+            // pick the narrowest interval that fully covers `span`.
+            let mut next: Option<&NodeView> = None;
+            let mut next_width = usize::MAX;
+            let mut ix = lo;
+            while ix < children.len() {
+                let child = &children[ix];
+                let (child_start, child_end) = child.span_bytes();
+                if child_start > span.start {
+                    break;
+                }
+                if child_start <= span.start && child_end >= span.end {
+                    let width = child_end.saturating_sub(child_start);
+                    if width < next_width {
+                        next_width = width;
+                        next = Some(child);
+                    }
+                }
+                ix += 1;
+            }
+
+            match next {
+                Some(child) => current = child,
+                None => return Some(current),
+            }
+        }
     }
 
     pub fn view<T: 'static>(&self, viewer: &Viewer) -> T {

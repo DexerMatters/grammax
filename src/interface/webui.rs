@@ -181,7 +181,15 @@ where
                         .map(|(_, transaction)| {
                             rouille::Response::json(&commands_to_web_json(&transaction))
                         })
-                        .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
+                        .map_err(|e| {
+                            rouille::Response::json(
+                                &runtime::RuntimeError::<String>::UndefinedBehavior {
+                                    message: format!("{e:?}"),
+                                },
+                            )
+                            .with_status_code(500)
+                        })
+                        .unwrap_or_else(|resp| resp),
                     WebAction::GetSource => {
                         match self.query_source_text(None, &self.uri(), Span::new(0, usize::MAX)) {
                             Ok(source) => rouille::Response::json(&source),
@@ -213,15 +221,19 @@ where
             revision,
             &self.uri(),
             Span::new(0, usize::MAX),
-        )?;
+        )
+        .map_err(|e| runtime::RuntimeError::UndefinedBehavior {
+            message: format!("{e:?}"),
+        })?;
+        let source_ref = source.as_ref().as_str();
 
         let mut parser = crate::parsec::Parser::new(self.grammar);
-        let crate::parsec::Result { root, .. } = parser.parse_text(&source);
+        let crate::parsec::Result { root, .. } = parser.parse_text(source_ref);
         let commands = crate::scheme::passes::delta::generate_commands_for_full_tree(
             &parser.alloc,
             &self.uri(),
             root.green,
-            &source,
+            source_ref,
         );
 
         Ok(commands_to_web_json(&commands))

@@ -14,10 +14,7 @@ use crossterm::{
 use crate::{
     grammar,
     interface::Interface,
-    parsec::{
-        display::{format_ast, format_messages_with_source},
-        tree::RedNode,
-    },
+    parsec::display::format_messages_with_source,
     runtime::{
         self,
         compiler::{ContainsPath, Down, Here, TypedTree},
@@ -102,19 +99,26 @@ where
     ) -> runtime::RuntimeResult<(String, String)> {
         let rev = Some(revision);
 
-        let messages =
-            match self.query_layer::<Down<Here>>(rev, ParseTreeQuery::Message(self.uri()))? {
-                ParseTreeValue::Messages(m) => m,
-                other => {
-                    return Err(runtime::RuntimeError::UndefinedBehavior {
-                        message: format!("expected Messages, got {other:?}"),
-                    });
-                }
-            };
-        let root_view = match self.query_layer::<Down<Here>>(
-            rev,
-            ParseTreeQuery::Path(DocumentNodePath::root(self.uri())),
-        )? {
+        let messages = match self
+            .query_layer::<Down<Here>>(rev, ParseTreeQuery::Message(self.uri()))
+            .map_err(|e| runtime::RuntimeError::UndefinedBehavior {
+                message: format!("ParseTree query failed: {e:?}"),
+            })? {
+            ParseTreeValue::Messages(m) => m,
+            other => {
+                return Err(runtime::RuntimeError::UndefinedBehavior {
+                    message: format!("expected Messages, got {other:?}"),
+                });
+            }
+        };
+        let root_view = match self
+            .query_layer::<Down<Here>>(
+                rev,
+                ParseTreeQuery::Path(DocumentNodePath::root(self.uri())),
+            )
+            .map_err(|e| runtime::RuntimeError::UndefinedBehavior {
+                message: format!("ParseTree query failed: {e:?}"),
+            })? {
             ParseTreeValue::View(view) => view,
             _ => {
                 return Err(runtime::RuntimeError::UndefinedBehavior {
@@ -149,7 +153,10 @@ where
                         0,
                         usize::MAX,
                         &source,
-                    );
+                    )
+                    .map_err(|e| runtime::RuntimeError::UndefinedBehavior {
+                        message: format!("Failed to edit source: {e:?}"),
+                    });
 
                     let num_lines = state.buffer.matches('\n').count() as u16 + 1;
                     move_to(stdout, 0, state.origin_row + num_lines)?;

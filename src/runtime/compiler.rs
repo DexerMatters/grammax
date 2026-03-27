@@ -13,7 +13,9 @@ use crossbeam::channel;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use super::protocol::{RevisionId, RuntimeError, RuntimeEvent, RuntimePath, RuntimeResult};
+use super::protocol::{
+    RevisionId, RuntimeError, RuntimeEvent, RuntimePath, RuntimeResult, RuntimeWireResult,
+};
 use crate::{
     grammar,
     interface::Interface,
@@ -23,7 +25,7 @@ use crate::{
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
-type QueryFn = Arc<dyn Fn(utils::Payload) -> RuntimeResult<utils::Payload> + Send + Sync>;
+type QueryFn = Arc<dyn Fn(utils::Payload) -> RuntimeWireResult<utils::Payload> + Send + Sync>;
 type SubmitTopFn = Arc<dyn Fn(RevisionId, SourceTxn) -> RuntimeResult<()> + Send + Sync>;
 type ShutdownHook = Box<dyn FnOnce() + Send>;
 type SharedQueries = Arc<Mutex<HashMap<RuntimePath, QueryFn>>>;
@@ -591,7 +593,7 @@ trait InstallTree: TypedTree + Sized {
         Self::Current: Send + 'static,
         SourceText: Send + 'static,
         <Self::Current as IR>::Value: Clone + Send + Sync + 'static,
-        <Self::Current as IR>::Error: Send + fmt::Debug + 'static;
+        <Self::Current as IR>::Error: Send + Sync + fmt::Debug + 'static;
 }
 
 impl<U> InstallTree for End<U>
@@ -599,7 +601,7 @@ where
     U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + fmt::Debug + 'static,
+    U::Error: Send + Sync + fmt::Debug + 'static,
 {
     fn install(
         self,
@@ -648,12 +650,12 @@ where
     U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + fmt::Debug + 'static,
+    U::Error: Send + Sync + fmt::Debug + 'static,
     Left: InstallTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
     <Left::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
-    <Left::Current as IR>::Error: Send + fmt::Debug + 'static,
+    <Left::Current as IR>::Error: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, Left::Current> + Send + 'static,
     P::Error: Send + fmt::Debug + 'static,
 {
@@ -691,17 +693,17 @@ where
     U: IR + Clone + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + fmt::Debug + 'static,
+    U::Error: Send + Sync + fmt::Debug + 'static,
     Left: InstallTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
     <Left::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
-    <Left::Current as IR>::Error: Send + fmt::Debug + 'static,
+    <Left::Current as IR>::Error: Send + Sync + fmt::Debug + 'static,
     Right: InstallTree + SeededTree + TypedTree + 'static,
     Right::Current: IR + Clone + Send + 'static,
     <Right::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     <Right::Current as IR>::Value: Clone + Send + Sync + 'static,
-    <Right::Current as IR>::Error: Send + fmt::Debug + 'static,
+    <Right::Current as IR>::Error: Send + Sync + fmt::Debug + 'static,
     P1: scheme::Pass<U, Left::Current> + Send + 'static,
     P1::Error: Send + fmt::Debug + 'static,
     P2: scheme::Pass<U, Right::Current> + Send + 'static,
@@ -789,7 +791,7 @@ pub trait BuildTree: TypedTree + Sized {
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
         <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + fmt::Debug + 'static;
+        <SourceText as IR>::Error: Send + Sync + fmt::Debug + 'static;
 }
 
 impl<Tree> BuildTree for Tree
@@ -803,7 +805,7 @@ where
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
         <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + fmt::Debug + 'static,
+        <SourceText as IR>::Error: Send + Sync + fmt::Debug + 'static,
     {
         RuntimeService::<Self, I>::new(grammar, move |evt_tx| {
             ComposedCompiler::from_tree_with_events(self, evt_tx).into_inner()
@@ -829,11 +831,11 @@ where
     U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + fmt::Debug + 'static,
+    U::Error: Send + Sync + fmt::Debug + 'static,
     D: IR + Send + 'static,
     D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
     D::Value: Clone + Send + Sync + 'static,
-    D::Error: Send + fmt::Debug + 'static,
+    D::Error: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, D> + Send + 'static,
     P::Error: Send + fmt::Debug + 'static,
 {
@@ -965,7 +967,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         &self,
         layer_path: impl Into<RuntimePath>,
         index: utils::Payload,
-    ) -> RuntimeResult<utils::Payload> {
+    ) -> RuntimeWireResult<utils::Payload> {
         let layer_path = layer_path.into();
         let query = self
             .queries
@@ -1009,7 +1011,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         SourceText: Send + 'static,
         <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
         <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + fmt::Debug + 'static,
+        <SourceText as IR>::Error: Send + Sync + fmt::Debug + 'static,
     {
         let layer_path = RuntimePath::root();
         let pass_path = RuntimePath::root();
@@ -1072,20 +1074,21 @@ impl<Tree: TypedTree> Drop for ComposedCompiler<Tree> {
 fn query_handle_any<R>(
     handle: &QueryHandle<R>,
     index: utils::Payload,
-) -> RuntimeResult<utils::Payload>
+) -> RuntimeWireResult<utils::Payload>
 where
     R: IR,
     R::Ix: DeserializeOwned + Clone + 'static,
     R::Value: Send + Sync + 'static,
-    R::Error: fmt::Debug,
+    R::Error: Send + Sync + 'static,
 {
     let typed_index: R::Ix = if let Some(ix) = index.downcast_ref::<R::Ix>() {
         ix.clone()
     } else if let Some(json) = index.downcast_ref::<Value>() {
-        serde_json::from_value(json.clone())
-            .map_err(|err| runtime_invalid(format!("query index decode failed: {err}")))?
+        serde_json::from_value(json.clone()).map_err(|err| {
+            runtime_invalid::<utils::Payload>(format!("query index decode failed: {err}"))
+        })?
     } else {
-        return Err(runtime_invalid(
+        return Err(runtime_invalid::<utils::Payload>(
             "query index type mismatch (expected typed index or serde_json::Value)",
         ));
     };
@@ -1094,7 +1097,9 @@ where
         .query(typed_index)
         .ok_or(RuntimeError::ChannelClosed)?;
 
-    let value = result.map_err(|err| runtime_invalid(format!("query failed: {err:?}")))?;
+    let value = result.map_err(|err| RuntimeError::InvalidRequestFromTarget {
+        err: utils::Payload::new(err),
+    })?;
 
     Ok(utils::Payload::new(value))
 }
@@ -1213,7 +1218,7 @@ fn clamp_span(span: Span, len: usize) -> Span {
     Span::new(start.min(end), end)
 }
 
-fn runtime_invalid(message: impl Into<String>) -> RuntimeError {
+fn runtime_invalid<Err>(message: impl Into<String>) -> RuntimeError<Err> {
     RuntimeError::InvalidRequest {
         message: message.into(),
     }

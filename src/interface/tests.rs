@@ -3,12 +3,11 @@ use color_print::cprintln;
 
 #[cfg(feature = "webui")]
 use crate::{
-    interface::{BasicInterface, webui::WebPreviewInterface},
+    interface::{BasicInterface, Interface, webui::WebPreviewInterface},
     new_grammar,
-    parsec::{parser, view::NodeView},
     runtime::{BuildTree, CompilerBuilder, Down, Here, Observe, ParserPass},
     scheme::{
-        URI,
+        Span, URI,
         layers::{
             AstArena, AstCell, AstVec, DocumentNodePath, ParseTreeIR, ParseTreeQuery,
             ParseTreeValue,
@@ -218,9 +217,8 @@ fn test_arith_commands() {
         }
     });
 
-    let mut runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
+    let runtime = pass.build_runtime::<BasicInterface<_>>(grammar);
 
-    runtime.switch_uri("file://preview");
-    runtime.insert(0, "4 * (5 + 6)").unwrap();
+    let _ = runtime.query_source_text(None, &URI::default(), Span::new(0, usize::MAX));
     thread::sleep(std::time::Duration::from_millis(10));
 }

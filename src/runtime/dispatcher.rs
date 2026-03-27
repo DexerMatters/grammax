@@ -3,7 +3,7 @@ use std::{sync::Arc, thread};
 use crossbeam::channel;
 
 use crate::{
-    scheme::{self, DocumentSpan, Span, URI},
+    scheme::{self, DocumentSpan, SourceAtom, Span, URI},
     utils::{self},
 };
 
@@ -11,7 +11,7 @@ use super::{
     compiler::{ComposedCompiler, TypedTree},
     protocol::{
         RevisionId, RuntimeEnvelope, RuntimeError, RuntimeEvent, RuntimePath, RuntimeRequest,
-        RuntimeResult, RuntimeSignal,
+        RuntimeSignal, RuntimeWireResult,
     },
 };
 
@@ -21,7 +21,7 @@ struct PendingQuery {
     revision: RevisionId,
     layer_path: RuntimePath,
     index: utils::Payload,
-    reply: channel::Sender<RuntimeResult>,
+    reply: channel::Sender<RuntimeWireResult>,
 }
 
 /// Parked when `ApplyAndFetch` is received: waits for the pipeline to fire an
@@ -29,7 +29,7 @@ struct PendingQuery {
 struct PendingFetch {
     revision: RevisionId,
     layer_path: RuntimePath,
-    reply: channel::Sender<RuntimeResult>,
+    reply: channel::Sender<RuntimeWireResult>,
 }
 
 #[derive(Debug, Clone)]
@@ -91,7 +91,7 @@ fn ged_loop<Tree: TypedTree>(
                             &mut pending_fetches,
                             settled_revision,
                         ) {
-                            fail_all(&mut pending_queries, &mut pending_fetches, RuntimeError::ChannelClosed);
+                            fail_all(&mut pending_queries, &mut pending_fetches);
                             break;
                         }
                     }
@@ -102,7 +102,7 @@ fn ged_loop<Tree: TypedTree>(
             recv(evt_rx) -> msg => {
                 match msg {
                     Err(_) => {
-                        fail_all(&mut pending_queries, &mut pending_fetches, RuntimeError::ChannelClosed);
+                        fail_all(&mut pending_queries, &mut pending_fetches);
                         break;
                     }
                     Ok(event) => {
@@ -127,7 +127,7 @@ fn ged_loop<Tree: TypedTree>(
 /// Returns `false` if the loop should stop (Shutdown received).
 fn handle_request<Tree: TypedTree>(
     request: RuntimeRequest,
-    reply: channel::Sender<RuntimeResult>,
+    reply: channel::Sender<RuntimeWireResult>,
     compiler: &mut ComposedCompiler<Tree>,
     pending_queries: &mut Vec<PendingQuery>,
     pending_fetches: &mut Vec<PendingFetch>,
@@ -139,7 +139,8 @@ fn handle_request<Tree: TypedTree>(
             let txn = edit_to_txn(uri, span, text);
             let result = compiler
                 .submit_source(txn)
-                .map(|revision| RuntimeSignal::Accepted { revision });
+                .map(|revision| RuntimeSignal::Accepted { revision })
+                .map_err(to_wire_error);
             let _ = reply.send(result);
             true
         }
@@ -159,7 +160,7 @@ fn handle_request<Tree: TypedTree>(
                     reply,
                 }),
                 Err(e) => {
-                    let _ = reply.send(Err(e));
+                    let _ = reply.send(Err(to_wire_error(e)));
                 }
             }
             true
@@ -229,7 +230,7 @@ fn execute_query<Tree: TypedTree>(
     compiler: &mut ComposedCompiler<Tree>,
     layer_path: RuntimePath,
     index: utils::Payload,
-) -> RuntimeResult {
+) -> RuntimeWireResult {
     compiler
         .query(layer_path.clone(), index)
         .map(|value| RuntimeSignal::QueryResult { layer_path, value })
@@ -277,36 +278,65 @@ fn flush_pending_fetches(
     *pending_fetches = rest;
 }
 
-fn fail_all(
-    pending_queries: &mut Vec<PendingQuery>,
-    pending_fetches: &mut Vec<PendingFetch>,
-    err: RuntimeError,
-) {
+fn fail_all(pending_queries: &mut Vec<PendingQuery>, pending_fetches: &mut Vec<PendingFetch>) {
     for pq in pending_queries.drain(..) {
-        let _ = pq.reply.send(Err(err.clone()));
+        let _ = pq.reply.send(Err(RuntimeError::ChannelClosed));
     }
     for pf in pending_fetches.drain(..) {
-        let _ = pf.reply.send(Err(err.clone()));
+        let _ = pf.reply.send(Err(RuntimeError::ChannelClosed));
     }
 }
 
-fn edit_to_txn(uri: URI, span: Span, text: String) -> scheme::Transaction<scheme::layers::SourceText> {
+fn to_wire_error(err: RuntimeError) -> RuntimeError<utils::Payload> {
+    match err {
+        RuntimeError::QueueFull => RuntimeError::QueueFull,
+        RuntimeError::ChannelClosed => RuntimeError::ChannelClosed,
+        RuntimeError::InvalidQuery => RuntimeError::InvalidQuery,
+        RuntimeError::InvalidRequest { message } => RuntimeError::InvalidRequest { message },
+        RuntimeError::InvalidRequestFromTarget { err } => RuntimeError::InvalidRequestFromTarget {
+            err: utils::Payload::new_serializable(err),
+        },
+        RuntimeError::UnexpectedRequestType => RuntimeError::UnexpectedRequestType,
+        RuntimeError::UndefinedBehavior { message } => RuntimeError::UndefinedBehavior { message },
+    }
+}
+
+fn edit_to_txn(
+    uri: URI,
+    span: Span,
+    text: String,
+) -> scheme::Transaction<scheme::layers::SourceText> {
     use scheme::Command;
-    if span.start == span.end && text.is_empty() {
+    let is_empty = text.is_empty();
+    if span.start == span.end && is_empty {
         return Arc::new(Vec::new());
     }
     let doc_span = DocumentSpan { uri, span };
     if span.start == span.end {
+        let staged_text: SourceAtom = text.into();
         return Arc::new(vec![
-            Command::Create { id: 0, value: text },
-            Command::Insert { index: doc_span, id: 0 },
+            Command::Create {
+                id: 0,
+                value: staged_text,
+            },
+            Command::Insert {
+                index: doc_span,
+                id: 0,
+            },
         ]);
     }
-    if text.is_empty() {
+    if is_empty {
         return Arc::new(vec![Command::Delete { index: doc_span }]);
     }
+    let staged_text: SourceAtom = text.into();
     Arc::new(vec![
-        Command::Create { id: 0, value: text },
-        Command::Replace { index: doc_span, id: 0 },
+        Command::Create {
+            id: 0,
+            value: staged_text,
+        },
+        Command::Replace {
+            index: doc_span,
+            id: 0,
+        },
     ])
 }

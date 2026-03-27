@@ -2,7 +2,10 @@ use std::fmt::Display;
 
 use crossbeam::channel;
 
-use crate::{scheme::{Span, URI}, utils::Payload};
+use crate::{
+    scheme::{Span, URI},
+    utils::Payload,
+};
 
 pub type RevisionId = u64;
 
@@ -93,32 +96,37 @@ pub(crate) enum RuntimeRequest {
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-pub enum RuntimeError {
+pub enum RuntimeError<Err = String> {
     QueueFull,
     ChannelClosed,
     InvalidQuery,
     InvalidRequest { message: String },
+    InvalidRequestFromTarget { err: Err },
     UnexpectedRequestType,
     UndefinedBehavior { message: String },
 }
 
-impl Display for RuntimeError {
+impl<Err: Display> Display for RuntimeError<Err> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::QueueFull => write!(f, "Runtime queue is full"),
             Self::ChannelClosed => write!(f, "Runtime channel is closed"),
             Self::InvalidQuery => write!(f, "Invalid query"),
             Self::InvalidRequest { message } => write!(f, "Invalid request: {}", message),
+            Self::InvalidRequestFromTarget { err } => {
+                write!(f, "Invalid request from target: {}", err)
+            }
             Self::UnexpectedRequestType => write!(f, "Unexpected request type"),
             Self::UndefinedBehavior { message } => write!(f, "Undefined behavior: {}", message),
         }
     }
 }
 
-pub(crate) type RuntimeResult<T = RuntimeSignal> = Result<T, RuntimeError>;
+pub(crate) type RuntimeResult<T = RuntimeSignal, Err = String> = Result<T, RuntimeError<Err>>;
+pub(crate) type RuntimeWireResult<T = RuntimeSignal> = RuntimeResult<T, Payload>;
 
 #[derive(Debug)]
 pub(crate) struct RuntimeEnvelope {
     pub request: RuntimeRequest,
-    pub reply: channel::Sender<RuntimeResult>,
+    pub reply: channel::Sender<RuntimeWireResult>,
 }

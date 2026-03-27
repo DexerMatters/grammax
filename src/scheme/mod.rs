@@ -2,7 +2,7 @@ pub mod doc;
 pub mod layers;
 pub mod passes;
 pub use doc::*;
-pub use layers::SourceText;
+pub use layers::{SourceAtom, SourceText};
 
 use std::thread::{self, JoinHandle};
 use std::{fmt, marker::PhantomData};

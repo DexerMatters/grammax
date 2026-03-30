@@ -97,8 +97,8 @@ where
         format!("{}:{}", self.host, self.port)
     }
 
-    pub fn uri(&self) -> URI {
-        URI::new("webui", "preview")
+    pub fn uri() -> URI {
+        URI::new("file", "preview")
     }
 
     pub fn run(&self) -> runtime::RuntimeResult<()> {
@@ -173,7 +173,7 @@ where
                 match body {
                     WebAction::ApplyTextEdit { span, text } => self
                         .edit_source_text_till::<Down<Here>>(
-                            &self.uri(),
+                            &Self::uri(),
                             span.start,
                             span.end,
                             &text,
@@ -191,7 +191,7 @@ where
                         })
                         .unwrap_or_else(|resp| resp),
                     WebAction::GetSource => {
-                        match self.query_source_text(None, &self.uri(), Span::new(0, usize::MAX)) {
+                        match self.query_source_text(None, &Self::uri(), Span::new(0, usize::MAX)) {
                             Ok(source) => rouille::Response::json(&source),
                             Err(e) => rouille::Response::json(&e).with_status_code(500),
                         }
@@ -219,7 +219,7 @@ where
         let source = <Self as Interface<Tree>>::query_source_text(
             self,
             revision,
-            &self.uri(),
+            &Self::uri(),
             Span::new(0, usize::MAX),
         )
         .map_err(|e| runtime::RuntimeError::UndefinedBehavior {
@@ -231,7 +231,7 @@ where
         let crate::parsec::Result { root, .. } = parser.parse_text(source_ref);
         let commands = crate::scheme::passes::delta::generate_commands_for_full_tree(
             &parser.alloc,
-            &self.uri(),
+            &Self::uri(),
             root.green,
             source_ref,
         );

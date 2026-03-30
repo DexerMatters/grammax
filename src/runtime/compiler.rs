@@ -20,7 +20,7 @@ use crate::{
     grammar,
     interface::Interface,
     runtime::RuntimeService,
-    scheme::{self, IR, Pipeline, QueryHandle, Span, layers::SourceText},
+    scheme::{self, IR, Pipeline, QueryHandle, Span, layers::SourceText, passes::Identity},
     utils::{self},
 };
 
@@ -61,6 +61,7 @@ pub struct Fork<U: IR, P1, Left: TypedTree, P2, Right: TypedTree> {
 
 pub struct Down<Path>(PhantomData<fn() -> Path>);
 pub struct Another<Path>(PhantomData<fn() -> Path>);
+pub struct Here;
 
 pub trait TypedTree {
     type Current: IR;
@@ -85,13 +86,6 @@ where
     type Current = U;
 }
 
-fn prepend_path(branch: u32, path: RuntimePath) -> RuntimePath {
-    let mut segments = Vec::with_capacity(path.0.len() + 1);
-    segments.push(branch);
-    segments.extend(path.0);
-    RuntimePath(segments)
-}
-
 fn clone_listeners<U: IR>(listeners: &SharedListeners<U>) -> ListenerSet<U> {
     listeners
         .lock()
@@ -104,16 +98,20 @@ fn clone_listeners<U: IR>(listeners: &SharedListeners<U>) -> ListenerSet<U> {
         .unwrap_or_default()
 }
 
+fn prepend_path(branch: u32, path: RuntimePath) -> RuntimePath {
+    let mut segments = Vec::with_capacity(path.0.len() + 1);
+    segments.push(branch);
+    segments.extend(path.0);
+    RuntimePath(segments)
+}
+
 pub trait ContainsPath<Path>: TypedTree {
     type Target: IR;
 
     fn runtime_path() -> RuntimePath;
 }
 
-impl<Tree> ContainsPath<Here> for Tree
-where
-    Tree: TypedTree,
-{
+impl<Tree: TypedTree> ContainsPath<Here> for Tree {
     type Target = Tree::Current;
 
     fn runtime_path() -> RuntimePath {
@@ -156,30 +154,7 @@ where
     }
 }
 
-pub trait ContainsTree<Needle>: TypedTree {}
-
-impl<Hay, U: IR> ContainsTree<End<U>> for Hay where Hay: TypedTree<Current = U> {}
-
-impl<U: IR, P, Left, NeedleLeft> ContainsTree<Then<U, P, NeedleLeft>> for Then<U, P, Left>
-where
-    Left: ContainsTree<NeedleLeft> + TypedTree,
-    NeedleLeft: TypedTree,
-{
-}
-
-impl<U: IR, P1, Left, P2, Right, NeedleLeft, NeedleRight>
-    ContainsTree<Fork<U, P1, NeedleLeft, P2, NeedleRight>> for Fork<U, P1, Left, P2, Right>
-where
-    Left: ContainsTree<NeedleLeft> + TypedTree,
-    Right: ContainsTree<NeedleRight> + TypedTree,
-    NeedleLeft: TypedTree,
-    NeedleRight: TypedTree,
-{
-}
-
-pub struct Here;
-
-pub trait SeededTree: TypedTree {
+trait SeededTree: TypedTree {
     fn seed(&self) -> Self::Current
     where
         Self::Current: Clone;
@@ -215,157 +190,7 @@ where
     }
 }
 
-trait HasListeners: TypedTree {
-    fn listeners(&self) -> SharedListeners<Self::Current>;
-}
-
-impl<U: IR> HasListeners for End<U> {
-    fn listeners(&self) -> SharedListeners<Self::Current> {
-        Arc::clone(&self.listeners)
-    }
-}
-
-impl<U: IR, P, Left: TypedTree> HasListeners for Then<U, P, Left> {
-    fn listeners(&self) -> SharedListeners<Self::Current> {
-        Arc::clone(&self.listeners)
-    }
-}
-
-impl<U: IR, P1, Left: TypedTree, P2, Right: TypedTree> HasListeners
-    for Fork<U, P1, Left, P2, Right>
-{
-    fn listeners(&self) -> SharedListeners<Self::Current> {
-        Arc::clone(&self.listeners)
-    }
-}
-
-pub type ObservedLayer<Tree, Path> = LayerObserver<<Tree as ObservePath<Path>>::Observed>;
-
-pub trait ObservePath<Path>: TypedTree {
-    type Observed: IR;
-
-    fn observe_path(&self) -> LayerObserver<Self::Observed>;
-}
-
-pub trait Observe: TypedTree {
-    fn observe<Path>(&self) -> ObservedLayer<Self, Path>
-    where
-        Self: ObservePath<Path>;
-}
-
-impl<Tree: TypedTree> Observe for Tree {
-    fn observe<Path>(&self) -> ObservedLayer<Self, Path>
-    where
-        Self: ObservePath<Path>,
-    {
-        <Self as ObservePath<Path>>::observe_path(self)
-    }
-}
-
-impl<U> ObservePath<Here> for End<U>
-where
-    U: IR + Send + 'static,
-    U::Ix: Send + Sync + 'static,
-    U::Value: Send + Sync + 'static,
-{
-    type Observed = U;
-
-    fn observe_path(&self) -> LayerObserver<U> {
-        let (tx, rx) = channel::unbounded();
-        let lock = Arc::new(OnceLock::new());
-        if let Ok(mut listeners) = self.listeners().lock() {
-            listeners.push((tx, Arc::clone(&lock)));
-        }
-        LayerObserver {
-            updates: rx,
-            query: lock,
-        }
-    }
-}
-
-impl<U, P, Left> ObservePath<Here> for Then<U, P, Left>
-where
-    U: IR + Send + 'static,
-    U::Ix: Send + Sync + 'static,
-    U::Value: Send + Sync + 'static,
-    Left: TypedTree,
-{
-    type Observed = U;
-
-    fn observe_path(&self) -> LayerObserver<U> {
-        let (tx, rx) = channel::unbounded();
-        let lock = Arc::new(OnceLock::new());
-        if let Ok(mut listeners) = self.listeners().lock() {
-            listeners.push((tx, Arc::clone(&lock)));
-        }
-        LayerObserver {
-            updates: rx,
-            query: lock,
-        }
-    }
-}
-
-impl<U, P1, Left, P2, Right> ObservePath<Here> for Fork<U, P1, Left, P2, Right>
-where
-    U: IR + Send + 'static,
-    U::Ix: Send + Sync + 'static,
-    U::Value: Send + Sync + 'static,
-    Left: TypedTree,
-    Right: TypedTree,
-{
-    type Observed = U;
-
-    fn observe_path(&self) -> LayerObserver<U> {
-        let (tx, rx) = channel::unbounded();
-        let lock = Arc::new(OnceLock::new());
-        if let Ok(mut listeners) = self.listeners().lock() {
-            listeners.push((tx, Arc::clone(&lock)));
-        }
-        LayerObserver {
-            updates: rx,
-            query: lock,
-        }
-    }
-}
-
-impl<U, P, Left, Path> ObservePath<Down<Path>> for Then<U, P, Left>
-where
-    U: IR,
-    Left: ObservePath<Path> + TypedTree,
-{
-    type Observed = <Left as ObservePath<Path>>::Observed;
-
-    fn observe_path(&self) -> LayerObserver<Self::Observed> {
-        self.left.observe_path()
-    }
-}
-
-impl<U, P1, Left, P2, Right, Path> ObservePath<Down<Path>> for Fork<U, P1, Left, P2, Right>
-where
-    U: IR,
-    Left: ObservePath<Path> + TypedTree,
-    Right: TypedTree,
-{
-    type Observed = <Left as ObservePath<Path>>::Observed;
-
-    fn observe_path(&self) -> LayerObserver<Self::Observed> {
-        self.left.observe_path()
-    }
-}
-
-impl<U, P1, Left, P2, Right, Path> ObservePath<Another<Path>> for Fork<U, P1, Left, P2, Right>
-where
-    U: IR,
-    Left: TypedTree,
-    Right: ObservePath<Path> + TypedTree,
-{
-    type Observed = <Right as ObservePath<Path>>::Observed;
-
-    fn observe_path(&self) -> LayerObserver<Self::Observed> {
-        self.right.observe_path()
-    }
-}
-
+#[derive(Clone)]
 pub struct LayerObserver<U: IR> {
     pub updates: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
     pub query: Arc<OnceLock<QueryHandle<U>>>,
@@ -399,6 +224,304 @@ impl<U: IR> LayerObserver<U> {
                 },
             },
         }
+    }
+}
+
+fn make_observer<U>(listeners: &SharedListeners<U>) -> LayerObserver<U>
+where
+    U: IR + Send + 'static,
+    U::Ix: Send + Sync + 'static,
+    U::Value: Send + Sync + 'static,
+{
+    let (tx, rx) = channel::unbounded();
+    let lock = Arc::new(OnceLock::new());
+    if let Ok(mut ls) = listeners.lock() {
+        ls.push((tx, Arc::clone(&lock)));
+    }
+    LayerObserver {
+        updates: rx,
+        query: lock,
+    }
+}
+
+// An identity pass used by `fanout` — forwards transactions unchanged (U → U).
+// This lets each branch describe its full pipeline from the fork point rather
+// than requiring a split pass factory. `Arc` makes the clone O(1).
+
+// ---------------------------------------------------------------------------
+// Build<Tree> — CPS builder
+//
+// `.then(factory, seed, |b, obs| ...)` passes the new Build and its
+// LayerObserver into a continuation that returns R.  All previous observers
+// are already in the enclosing closure scope — no HList, no tuples.
+//
+// Usage:
+//   Build::new()
+//       .then(|| CstPass::new(), ParseTreeIR::new(), |b, cst_obs| {
+//           b.then(|| AstPass::new(), AstArena::new(), |b, ast_obs| {
+//               b.build_runtime(grammar)   // R = RuntimeService<...>
+//           })
+//       })
+// ---------------------------------------------------------------------------
+
+pub struct Build<Tree: TypedTree>(Tree);
+
+impl Build<End<SourceText>> {
+    pub fn new() -> Self {
+        Self(End::new(SourceText::default()))
+    }
+}
+
+impl<Tree: TypedTree> Build<Tree> {
+    pub fn finish(self) -> Tree {
+        self.0
+    }
+}
+
+#[allow(private_bounds)]
+impl<Tree: TypedTree + InstallTree + TypedTree<Current = SourceText> + Send + 'static> Build<Tree> {
+    pub fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Tree, I>
+    where
+        I: Interface<Tree>,
+    {
+        RuntimeService::<Tree, I>::new(grammar, move |evt_tx| {
+            ComposedCompiler::from_tree_with_events(self.0, evt_tx)
+        })
+    }
+}
+
+impl<U> Build<End<U>>
+where
+    U: IR + Clone + Send + 'static,
+    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Value: Clone + Send + Sync + 'static,
+    U::Error: Send + Sync + fmt::Debug + 'static,
+{
+    pub fn then<F, P, D, K, R>(self, factory: F, downstream: D, k: K) -> R
+    where
+        D: IR + Clone + Send + 'static,
+        D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D::Value: Clone + Send + Sync + 'static,
+        D::Error: Send + Sync + fmt::Debug + 'static,
+        P: scheme::Pass<U, D>,
+        F: FnOnce() -> P,
+        K: FnOnce(Build<Then<U, P, End<D>>>, LayerObserver<D>) -> R,
+    {
+        let downstream_end = End::new(downstream);
+        let obs = make_observer(&downstream_end.listeners);
+        let tree = Then {
+            seed: self.0.seed,
+            pass: factory(),
+            left: downstream_end,
+            listeners: self.0.listeners,
+        };
+        k(Build(tree), obs)
+    }
+
+    pub fn fork<F1, P1, D1, F2, P2, D2, KL, KR, LTree, RTree>(
+        self,
+        left_pass_factory: F1,
+        left_seed: D1,
+        right_pass_factory: F2,
+        right_seed: D2,
+        left_k: KL,
+        right_k: KR,
+    ) -> Build<Fork<U, P1, LTree, P2, RTree>>
+    where
+        D1: IR + Clone + Send + 'static,
+        D1::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D1::Value: Clone + Send + Sync + 'static,
+        D1::Error: Send + Sync + fmt::Debug + 'static,
+        D2: IR + Clone + Send + 'static,
+        D2::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D2::Value: Clone + Send + Sync + 'static,
+        D2::Error: Send + Sync + fmt::Debug + 'static,
+        LTree: TypedTree,
+        RTree: TypedTree,
+        P1: scheme::Pass<U, LTree::Current>,
+        P2: scheme::Pass<U, RTree::Current>,
+        F1: FnOnce() -> P1,
+        F2: FnOnce() -> P2,
+        KL: FnOnce(Build<End<D1>>) -> Build<LTree>,
+        KR: FnOnce(Build<End<D2>>) -> Build<RTree>,
+    {
+        let lb = left_k(Build(End::new(left_seed)));
+        let rb = right_k(Build(End::new(right_seed)));
+        Build(Fork {
+            seed: self.0.seed,
+            left_pass: left_pass_factory(),
+            left: lb.0,
+            right_pass: right_pass_factory(),
+            right: rb.0,
+            listeners: self.0.listeners,
+        })
+    }
+
+    /// Arrow-style fanout `(f &&& g)`: both branches independently describe
+    /// their full pipeline starting from the same `U`.
+    ///
+    /// This is strictly more monadic than `fork` — there are no split pass
+    /// factories; each branch is a self-contained pipeline description.
+    /// Requires `U: Clone` (already imposed by `Fork`'s runtime).
+    ///
+    /// ```
+    /// b.fanout(
+    ///     |b| b.then(|| pass_AB, seedB, |b, _| b.then(|| pass_BD, seedD, |b, _| b)),
+    ///     |b| b.then(|| pass_AC, seedC, |b, _| b.then(|| pass_CE, seedE, |b, _| b)),
+    /// )
+    /// ```
+    #[allow(private_interfaces)]
+    pub fn fanout<KL, KR, LTree, RTree>(
+        self,
+        left_k: KL,
+        right_k: KR,
+    ) -> Build<Fork<U, Identity, LTree, Identity, RTree>>
+    where
+        U: Clone,
+        LTree: TypedTree<Current = U>,
+        RTree: TypedTree<Current = U>,
+        KL: FnOnce(Build<End<U>>) -> Build<LTree>,
+        KR: FnOnce(Build<End<U>>) -> Build<RTree>,
+    {
+        let seed = self.0.seed;
+        let lb = left_k(Build(End::new(seed.clone())));
+        let rb = right_k(Build(End::new(seed.clone())));
+        Build(Fork {
+            seed,
+            left_pass: Identity,
+            left: lb.0,
+            right_pass: Identity,
+            right: rb.0,
+            listeners: self.0.listeners,
+        })
+    }
+}
+
+impl<U, P, D> Build<Then<U, P, End<D>>>
+where
+    U: IR + Clone + Send + 'static,
+    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Value: Clone + Send + Sync + 'static,
+    U::Error: Send + Sync + fmt::Debug + 'static,
+    D: IR + Clone + Send + 'static,
+    D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    D::Value: Clone + Send + Sync + 'static,
+    D::Error: Send + Sync + fmt::Debug + 'static,
+    P: scheme::Pass<U, D>,
+{
+    pub fn then<F, NewP, NewD, K, R>(self, factory: F, downstream: NewD, k: K) -> R
+    where
+        NewD: IR + Clone + Send + 'static,
+        NewD::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        NewD::Value: Clone + Send + Sync + 'static,
+        NewD::Error: Send + Sync + fmt::Debug + 'static,
+        NewP: scheme::Pass<D, NewD>,
+        F: FnOnce() -> NewP,
+        K: FnOnce(Build<Then<U, P, Then<D, NewP, End<NewD>>>>, LayerObserver<NewD>) -> R,
+    {
+        let downstream_end = End::new(downstream);
+        let obs = make_observer(&downstream_end.listeners);
+        let new_left = Then {
+            seed: self.0.left.seed,
+            pass: factory(),
+            left: downstream_end,
+            listeners: self.0.left.listeners,
+        };
+        let tree = Then {
+            seed: self.0.seed,
+            pass: self.0.pass,
+            left: new_left,
+            listeners: self.0.listeners,
+        };
+        k(Build(tree), obs)
+    }
+
+    /// Fork the downstream end of this chain into two independent branches.
+    ///
+    /// ```
+    /// O → (pass A) → A   ← this Build<Then<O, A, End<D>>>
+    ///                 |  |
+    ///               B    C   ← left_pass_factory / right_pass_factory
+    ///               |    |
+    ///             ...   ...  ← continued by left_k / right_k
+    /// ```
+    pub fn fork<F1, P1, D1, F2, P2, D2, KL, KR, LTree, RTree>(
+        self,
+        left_pass_factory: F1,
+        left_seed: D1,
+        right_pass_factory: F2,
+        right_seed: D2,
+        left_k: KL,
+        right_k: KR,
+    ) -> Build<Then<U, P, Fork<D, P1, LTree, P2, RTree>>>
+    where
+        D1: IR + Clone + Send + 'static,
+        D1::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D1::Value: Clone + Send + Sync + 'static,
+        D1::Error: Send + Sync + fmt::Debug + 'static,
+        D2: IR + Clone + Send + 'static,
+        D2::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D2::Value: Clone + Send + Sync + 'static,
+        D2::Error: Send + Sync + fmt::Debug + 'static,
+        LTree: TypedTree,
+        RTree: TypedTree,
+        P1: scheme::Pass<D, LTree::Current>,
+        P2: scheme::Pass<D, RTree::Current>,
+        F1: FnOnce() -> P1,
+        F2: FnOnce() -> P2,
+        KL: FnOnce(Build<End<D1>>) -> Build<LTree>,
+        KR: FnOnce(Build<End<D2>>) -> Build<RTree>,
+    {
+        let lb = left_k(Build(End::new(left_seed)));
+        let rb = right_k(Build(End::new(right_seed)));
+        let fork = Fork {
+            seed: self.0.left.seed,
+            left_pass: left_pass_factory(),
+            left: lb.0,
+            right_pass: right_pass_factory(),
+            right: rb.0,
+            listeners: self.0.left.listeners,
+        };
+        Build(Then {
+            seed: self.0.seed,
+            pass: self.0.pass,
+            left: fork,
+            listeners: self.0.listeners,
+        })
+    }
+
+    /// Arrow-style fanout `(f &&& g)` on the downstream end of this chain.
+    /// Both branches independently describe their full pipeline from `D`.
+    /// Requires `D: Clone` (already imposed by `Fork`'s runtime).
+    pub fn fanout<KL, KR, LTree, RTree>(
+        self,
+        left_k: KL,
+        right_k: KR,
+    ) -> Build<Then<U, P, Fork<D, Identity, LTree, Identity, RTree>>>
+    where
+        D: Clone,
+        LTree: TypedTree<Current = D>,
+        RTree: TypedTree<Current = D>,
+        KL: FnOnce(Build<End<D>>) -> Build<LTree>,
+        KR: FnOnce(Build<End<D>>) -> Build<RTree>,
+    {
+        let seed = self.0.left.seed;
+        let lb = left_k(Build(End::new(seed.clone())));
+        let rb = right_k(Build(End::new(seed.clone())));
+        let fork = Fork {
+            seed,
+            left_pass: Identity,
+            left: lb.0,
+            right_pass: Identity,
+            right: rb.0,
+            listeners: self.0.left.listeners,
+        };
+        Build(Then {
+            seed: self.0.seed,
+            pass: self.0.pass,
+            left: fork,
+            listeners: self.0.listeners,
+        })
     }
 }
 
@@ -458,126 +581,11 @@ impl BuilderCore {
     }
 }
 
-pub struct CompilerBuilder;
-
-impl CompilerBuilder {
-    pub fn new() -> End<SourceText> {
-        End::new(SourceText::default())
-    }
-}
-
 impl<U: IR> End<U> {
-    pub fn new(seed: U) -> Self {
+    fn new(seed: U) -> Self {
         Self {
             seed,
             listeners: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub fn then<P, D: IR>(self, pass: P, downstream: D) -> Then<U, P, End<D>>
-    where
-        P: scheme::Pass<U, D>,
-    {
-        Then {
-            seed: self.seed,
-            pass,
-            left: End::new(downstream),
-            listeners: self.listeners,
-        }
-    }
-
-    pub fn fork<P1, D1: IR, P2, D2: IR>(
-        self,
-        left_pass: P1,
-        left: D1,
-        right_pass: P2,
-        right: D2,
-    ) -> Fork<U, P1, End<D1>, P2, End<D2>>
-    where
-        P1: scheme::Pass<U, D1>,
-        P2: scheme::Pass<U, D2>,
-    {
-        Fork {
-            seed: self.seed,
-            left_pass,
-            left: End::new(left),
-            right_pass,
-            right: End::new(right),
-            listeners: self.listeners,
-        }
-    }
-}
-
-impl<U: IR, P, Left: TypedTree> Then<U, P, Left> {
-    pub fn new(seed: U, pass: P, left: Left) -> Self {
-        Self {
-            seed,
-            pass,
-            left,
-            listeners: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub fn map_left<Next: TypedTree>(self, f: impl FnOnce(Left) -> Next) -> Then<U, P, Next> {
-        Then {
-            seed: self.seed,
-            pass: self.pass,
-            left: f(self.left),
-            listeners: self.listeners,
-        }
-    }
-}
-
-impl<U: IR, P, D: IR> Then<U, P, End<D>> {
-    pub fn then<NewP, NewD: IR>(
-        self,
-        pass: NewP,
-        downstream: NewD,
-    ) -> Then<U, P, Then<D, NewP, End<NewD>>>
-    where
-        NewP: scheme::Pass<D, NewD>,
-    {
-        self.map_left(|left| left.then(pass, downstream))
-    }
-}
-
-impl<U: IR, P1, Left: TypedTree, P2, Right: TypedTree> Fork<U, P1, Left, P2, Right> {
-    pub fn new(seed: U, left_pass: P1, left: Left, right_pass: P2, right: Right) -> Self {
-        Self {
-            seed,
-            left_pass,
-            left,
-            right_pass,
-            right,
-            listeners: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    pub fn map_left<Next: TypedTree>(
-        self,
-        f: impl FnOnce(Left) -> Next,
-    ) -> Fork<U, P1, Next, P2, Right> {
-        Fork {
-            seed: self.seed,
-            left_pass: self.left_pass,
-            left: f(self.left),
-            right_pass: self.right_pass,
-            right: self.right,
-            listeners: self.listeners,
-        }
-    }
-
-    pub fn map_right<Next: TypedTree>(
-        self,
-        f: impl FnOnce(Right) -> Next,
-    ) -> Fork<U, P1, Left, P2, Next> {
-        Fork {
-            seed: self.seed,
-            left_pass: self.left_pass,
-            left: self.left,
-            right_pass: self.right_pass,
-            right: f(self.right),
-            listeners: self.listeners,
         }
     }
 }
@@ -783,36 +791,6 @@ where
     }
 }
 
-pub trait BuildTree: TypedTree + Sized {
-    fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Self, I>
-    where
-        I: Interface<Self>,
-        Self: TypedTree<Current = SourceText> + Send + 'static,
-        SourceText: Send + 'static,
-        <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + Sync + fmt::Debug + 'static;
-}
-
-impl<Tree> BuildTree for Tree
-where
-    Tree: TypedTree + InstallTree,
-{
-    fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Self, I>
-    where
-        I: Interface<Self>,
-        Self: TypedTree<Current = SourceText> + Send + 'static,
-        SourceText: Send + 'static,
-        <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + Sync + fmt::Debug + 'static,
-    {
-        RuntimeService::<Self, I>::new(grammar, move |evt_tx| {
-            ComposedCompiler::from_tree_with_events(self, evt_tx).into_inner()
-        })
-    }
-}
-
 fn connect_stage<U, D, P>(
     core: &BuilderCore,
     input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
@@ -998,10 +976,6 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         // The sender will be dropped naturally when ComposedCompiler is dropped
     }
 
-    fn into_inner(self) -> RawComposedCompiler<Tree> {
-        self
-    }
-
     fn from_tree_with_events(
         spec: Tree,
         event_sender: Option<channel::Sender<RuntimeEvent>>,
@@ -1062,8 +1036,6 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         }
     }
 }
-
-type RawComposedCompiler<Tree> = ComposedCompiler<Tree>;
 
 impl<Tree: TypedTree> Drop for ComposedCompiler<Tree> {
     fn drop(&mut self) {

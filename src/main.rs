@@ -5,7 +5,7 @@ use color_print::cprintln;
 use grammax::{
     grammar::{Grammar, display::format_grammar_error},
     interface::cli::CliInterface,
-    runtime::{BuildTree, CompilerBuilder, End, Observe, ObservedLayer, ParserPass, Then},
+    runtime::{Build, ParserPass},
     scheme::layers::{ParseTreeIR, SourceText},
 };
 
@@ -113,12 +113,11 @@ pub fn main() {
                     std::process::exit(1);
                 }
             };
-            let tree: Then<SourceText, ParserPass, End<ParseTreeIR>> = CompilerBuilder::new()
-                .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar));
-            let _observer: ObservedLayer<
-                Then<SourceText, ParserPass, End<ParseTreeIR>>,
-                grammax::runtime::Down<grammax::runtime::Here>,
-            > = tree.observe::<grammax::runtime::Down<grammax::runtime::Here>>();
+            let tree = Build::new().then(
+                || ParserPass::new(grammar),
+                ParseTreeIR::with_grammar(grammar),
+                |b, _| b,
+            );
             #[cfg(feature = "webui")]
             if interactive_mode.webui {
                 start_webui(tree, grammar);
@@ -132,9 +131,11 @@ pub fn main() {
     }
 }
 
+use grammax::runtime::{End, Then};
+
 type ParseTreePass = Then<SourceText, ParserPass, End<ParseTreeIR>>;
 
-fn start_cli(tree: ParseTreePass, grammar: &'static Grammar) {
+fn start_cli(tree: Build<ParseTreePass>, grammar: &'static Grammar) {
     tree.build_runtime::<CliInterface<ParseTreePass>>(grammar)
         .run()
         .unwrap_or_else(|e| {
@@ -144,7 +145,7 @@ fn start_cli(tree: ParseTreePass, grammar: &'static Grammar) {
 }
 
 #[cfg(feature = "webui")]
-fn start_webui(tree: ParseTreePass, grammar: &'static Grammar) {
+fn start_webui(tree: Build<ParseTreePass>, grammar: &'static Grammar) {
     tree.build_runtime::<WebPreviewInterface<ParseTreePass>>(grammar)
         .run()
         .unwrap_or_else(|e| {

@@ -4,14 +4,12 @@ use crate::{
     interface::BasicInterface,
     new_grammar, new_grammar_no_cache,
     parsec::Parser,
-    runtime::{BuildTree, CompilerBuilder, Down, End, Here, Observe, ObservedLayer, Then},
+    runtime::Build,
     scheme::{
-        layers::{AstArena, ParseTreeIR, SourceText},
+        layers::{AstArena, ParseTreeIR},
         passes::{IncrementalLowerer, ParserPass, reparser::Reparser},
     },
 };
-
-type CstTree = Then<SourceText, ParserPass, End<ParseTreeIR>>;
 
 #[test]
 fn test_arith_reparser() {
@@ -47,11 +45,17 @@ fn test_json() {
         null    -> tt("null")
     );
 
-    let compiler = CompilerBuilder::new()
-        .then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar))
-        .then(IncrementalLowerer::new(grammar, ()), AstArena::default());
-
-    let compiler = compiler.build_runtime::<BasicInterface<_>>(grammar);
+    let compiler = Build::new().then(
+        || ParserPass::new(grammar),
+        ParseTreeIR::with_grammar(grammar),
+        |b, _cst_obs| {
+            b.then(
+                || IncrementalLowerer::new(grammar, ()),
+                AstArena::default(),
+                |b, _ast_obs| b.build_runtime::<BasicInterface<_>>(grammar),
+            )
+        },
+    );
 
     compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
     compiler.replace(10, 14, "Doe").expect("update");
@@ -71,11 +75,12 @@ fn test_tap_prints_cst_commands() {
         null    -> tt("null")
     );
 
-    let cst_tree: CstTree =
-        CompilerBuilder::new().then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar));
-    let cst_obs: ObservedLayer<CstTree, Down<Here>> = cst_tree.observe::<Down<Here>>();
+    let (compiler, cst_obs) = Build::new().then(
+        || ParserPass::new(grammar),
+        ParseTreeIR::with_grammar(grammar),
+        |b, obs| (b.build_runtime::<BasicInterface<_>>(grammar), obs),
+    );
 
-    let compiler = cst_tree.build_runtime::<BasicInterface<_>>(grammar);
     compiler.insert(0, r#"{"name": "John"}"#).expect("submit");
 
     // The observer receives one update per submitted transaction.

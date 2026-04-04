@@ -17,6 +17,9 @@ Incremental design is adopted by more and more frameworks. Instead of computing 
 - **Command-based pipeline**
 Besides the traditional way of incremental design by reusing cache, the runtime are stratified in a pipeline and communicates with commands, which contain the deltas from every update, propagating from top to bottom. This achieves the real *full increment* for Grammax.
 
+- **First-class Laziness**
+Laziness is a powerful tool for incremental design, but it is often an afterthought. Grammax makes it a first-class citizen: every layer can lazily populate missing entries on demand, and every pass can lazily react to missing downstream entries. This allows Grammax to handle large projects without sacrificing responsiveness.
+
 - **Modularization**
 Grammax has designed a series of friendly interfaces, allowing users to develop modules (such like IRs and passes) naturally within the principles.
 

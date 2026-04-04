@@ -6,16 +6,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     grammar::Grammar,
-    parsec::{
-        msg::ParserMessages,
-        tree::{Tag, TreeAllocRefExt},
-        view::NodeView,
-    },
+    parsec::{msg::ParserMessages, view::NodeView},
     scheme::{
-        self, URI,
+        self, PullOutcome, LayerObserver, ObserveError, URI,
         layers::{
-            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, DocumentNodePath, ParseTreeIR,
-            ParseTreeQuery, ast::AstMapAny,
+            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, DocumentNodePath,
+            ParseTreeIR, ParseTreeQuery, ParseTreeValue, ast::AstMapAny,
         },
     },
 };
@@ -72,8 +68,82 @@ impl AstMapIntent {
 
 pub type AstNode = NodeView;
 
+struct QueriedParseTree<'a> {
+    observer: &'a LayerObserver<ParseTreeIR>,
+    views: RefCell<FxHashMap<DocumentNodePath, Option<NodeView>>>,
+    messages: RefCell<FxHashMap<URI, ParserMessages>>,
+    /// `Some(true)` = resolvable (retry), `Some(false)` = permanent, `None` = no failure.
+    failure: RefCell<Option<bool>>,
+}
+
+impl<'a> QueriedParseTree<'a> {
+    fn new(observer: &'a LayerObserver<ParseTreeIR>) -> Self {
+        Self {
+            observer,
+            views: RefCell::new(FxHashMap::default()),
+            messages: RefCell::new(FxHashMap::default()),
+            failure: RefCell::new(None),
+        }
+    }
+
+    fn note_failure(&self, is_resolvable: bool) {
+        let mut slot = self.failure.borrow_mut();
+        // Never upgrade from permanent (`false`) to resolvable (`true`).
+        if *slot != Some(false) {
+            *slot = Some(is_resolvable);
+        }
+    }
+
+    fn take_failure(&self) -> Option<bool> {
+        self.failure.borrow_mut().take()
+    }
+
+    fn view(&self, path: &DocumentNodePath) -> Option<NodeView> {
+        if let Some(cached) = self.views.borrow().get(path).cloned() {
+            return cached;
+        }
+
+        let view = if path.1.is_empty() {
+            match self.observer.query(ParseTreeQuery::Path(path.clone())) {
+                Ok(ParseTreeValue::View(view)) => Some(view),
+                Ok(_) => None,
+                Err(ObserveError::Absent) => None,
+                Err(err) => {
+                    self.note_failure(err.is_resolvable());
+                    None
+                }
+            }
+        } else {
+            let parent = path.parent()?;
+            let child_ix = *path.1.last()?;
+            self.view(&parent)?.try_nth(child_ix).cloned()
+        };
+
+        self.views.borrow_mut().insert(path.clone(), view.clone());
+        view
+    }
+
+    fn parser_messages(&self, uri: &URI) -> ParserMessages {
+        if let Some(messages) = self.messages.borrow().get(uri).cloned() {
+            return messages;
+        }
+
+        let messages = match self.observer.query(ParseTreeQuery::Message(*uri)) {
+            Ok(ParseTreeValue::Messages(messages)) => messages,
+            Err(ObserveError::Absent) => ParserMessages::default(),
+            Err(err) => {
+                self.note_failure(err.is_resolvable());
+                ParserMessages::default()
+            }
+            Ok(_) => ParserMessages::default(),
+        };
+        self.messages.borrow_mut().insert(*uri, messages.clone());
+        messages
+    }
+}
+
 pub struct AstMapCtx<'a> {
-    pub upstream: &'a ParseTreeIR,
+    upstream: &'a QueriedParseTree<'a>,
     pub uri: &'a URI,
     resolve_ast_path: &'a dyn Fn(&NodeView) -> Option<DocumentNodePath>,
 }
@@ -152,16 +222,12 @@ impl<'a> AstMapCtx<'a> {
 
     /// All parser-level diagnostics for the current transaction.
     pub fn parser_messages(&self) -> ParserMessages {
-        self.upstream.parser_messages(self.uri).unwrap_or_default()
+        self.upstream.parser_messages(self.uri)
     }
 
     /// Returns `true` if the current transaction has any parser errors.
     pub fn has_errors(&self) -> bool {
-        !self
-            .upstream
-            .parser_messages(self.uri)
-            .unwrap_or_default()
-            .is_empty()
+        !self.upstream.parser_messages(self.uri).is_empty()
     }
 }
 
@@ -333,21 +399,19 @@ impl AstMapper {
 }
 
 pub struct IncrementalLowerer {
-    grammar: &'static Grammar,
     mapper: AstMapper,
 }
 
 impl IncrementalLowerer {
-    pub fn new(grammar: &'static Grammar, mapper: impl Into<AstMapper>) -> Self {
+    pub fn new(_grammar: &'static Grammar, mapper: impl Into<AstMapper>) -> Self {
         Self {
-            grammar,
             mapper: mapper.into(),
         }
     }
 
-    fn apply_from_ir(
+    fn apply_from_queries(
         &mut self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
         downstream: &AstArena<AstMapAny>,
         commands: &[CstCommand],
@@ -371,14 +435,16 @@ impl IncrementalLowerer {
                     };
                     if path.1.is_empty() {
                         // Root insert: this is a full parse — DFS the whole tree.
-                        self.collect_upstream_anchors(
-                            upstream,
-                            uri,
-                            &DocumentNodePath::root(*uri),
-                            &memo,
-                            &resolving,
-                            &mut dirty_anchors,
-                        );
+                        if let Some(root) = upstream.view(&DocumentNodePath::root(*uri)) {
+                            self.collect_upstream_anchors(
+                                upstream,
+                                uri,
+                                &root,
+                                &memo,
+                                &resolving,
+                                &mut dirty_anchors,
+                            );
+                        }
                     } else {
                         // Non-root insert (incremental mid-tree insert).
                         if let Some(anchor) =
@@ -411,7 +477,7 @@ impl IncrementalLowerer {
             .nodes
             .keys()
             .filter(|p| p.0 == *uri)
-            .filter(|p| upstream.green_at_path(p).is_none())
+            .filter(|p| upstream.view(p).is_none())
             .cloned()
             .collect();
         for p in stale {
@@ -437,7 +503,7 @@ impl IncrementalLowerer {
                     .iter()
                     .any(|dirty| dirty.is_prefix_of(existing_path))
             })
-            .filter(|existing_path| upstream.green_at_path(existing_path).is_some())
+            .filter(|existing_path| upstream.view(existing_path).is_some())
             .filter(|existing_path| {
                 self.resolve_anchor_path(upstream, uri, existing_path, &memo, &resolving)
                     .as_ref()
@@ -471,7 +537,7 @@ impl IncrementalLowerer {
 
     fn relower_anchor(
         &mut self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
         downstream: &AstArena<AstMapAny>,
         anchor_path: &DocumentNodePath,
@@ -513,7 +579,7 @@ impl IncrementalLowerer {
 
     fn resolve_intent(
         &self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
         cst_path: &DocumentNodePath,
         memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
@@ -523,42 +589,7 @@ impl IncrementalLowerer {
             return Some(cached);
         }
 
-        let green = upstream.green_at_path(cst_path)?;
-        let offset = upstream.offset_at_path(cst_path)?;
-        let mut node = upstream
-            .viewer(self.grammar)
-            .node(green, offset)
-            .with_path(cst_path.1.clone().into());
-
-        // Attach grammar-derived field name from parent context.
-        // `ParseTreeIR` uses `Tag::Rule` for everything (field wrappers are
-        // transparent in the protocol), so the only way to know a child is at a
-        // named field position is to look at the parent production's field_positions.
-        if let Some(child_ix) = cst_path.1.last().copied() {
-            if let Some(parent_path) = cst_path.parent() {
-                if let Some(parent_green) = upstream.green_at_path(&parent_path) {
-                    let parent_node = upstream.alloc.node(parent_green);
-                    if let Tag::Rule {
-                        rule_ix: parent_rule_ix,
-                        ..
-                    } = &parent_node.tag
-                    {
-                        let n_siblings = parent_node.children.len();
-                        'field_lookup: for prod in &self.grammar.table.productions {
-                            if prod.lhs == *parent_rule_ix && prod.rhs.len() == n_siblings {
-                                for &(pos, name) in &prod.field_positions {
-                                    if pos == child_ix {
-                                        node = node.with_grammar_field_name(name);
-                                        break 'field_lookup;
-                                    }
-                                }
-                                break 'field_lookup;
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        let node = upstream.view(cst_path)?;
         if !resolving.borrow_mut().insert(cst_path.clone()) {
             return Some(AstMapIntent::skip());
         }
@@ -581,7 +612,7 @@ impl IncrementalLowerer {
 
     fn resolve_ast_path(
         &self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
         cst_path: &DocumentNodePath,
         memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
@@ -599,35 +630,31 @@ impl IncrementalLowerer {
 
     fn collect_upstream_anchors(
         &self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
-        root_path: &DocumentNodePath,
+        root: &NodeView,
         memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
         resolving: &RefCell<FxHashSet<DocumentNodePath>>,
         dirty_anchors: &mut FxHashSet<DocumentNodePath>,
     ) {
         // Iterative DFS to avoid stack overflow on deep trees.
-        let mut stack: Vec<DocumentNodePath> = vec![root_path.clone()];
-        while let Some(path) = stack.pop() {
+        let mut stack: Vec<NodeView> = vec![root.clone()];
+        while let Some(node) = stack.pop() {
+            let path = DocumentNodePath(*uri, node.path().0.clone());
             if let Some(anchor) = self.resolve_anchor_path(upstream, uri, &path, memo, resolving) {
                 dirty_anchors.insert(anchor);
                 // Still recurse: children may be independent mapped anchors
                 // (e.g. `primary` and `mul` are both inside `add`'s subtree).
             }
-            if let Some(green) = upstream.green_at_path(&path) {
-                let node = upstream.alloc.node(green);
-                let n_children = node.children.len();
-                drop(node);
-                for ix in 0..n_children {
-                    stack.push(path.child(ix));
-                }
+            for child in node.each().iter().rev() {
+                stack.push(child.clone());
             }
         }
     }
 
     fn resolve_anchor_or_ancestor(
         &self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
         cst_path: &DocumentNodePath,
         memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
@@ -649,7 +676,7 @@ impl IncrementalLowerer {
 
     fn resolve_anchor_path(
         &self,
-        upstream: &ParseTreeIR,
+        upstream: &QueriedParseTree<'_>,
         uri: &URI,
         cst_path: &DocumentNodePath,
         memo: &RefCell<FxHashMap<DocumentNodePath, AstMapIntent>>,
@@ -667,22 +694,51 @@ impl IncrementalLowerer {
 }
 
 impl scheme::Pass<ParseTreeIR, AstArena<AstMapAny>> for IncrementalLowerer {
-    type Error = std::convert::Infallible;
-
-    fn transform(
+    fn push(
         &mut self,
-        upstream: &ParseTreeIR,
+        upstream: &LayerObserver<ParseTreeIR>,
         downstream: &AstArena<AstMapAny>,
-        txn: scheme::Transaction<ParseTreeIR>,
-    ) -> Result<scheme::Transaction<AstArena<AstMapAny>>, Self::Error> {
-        // Every CST transaction must carry at least one path command that
-        // identifies which document changed. No URI → nothing to do.
-        let Some(uri) = extract_uri_from_commands(&txn) else {
-            return Ok(std::sync::Arc::new(Vec::new()));
+        txn: &[scheme::Command<ParseTreeIR>],
+    ) -> Vec<scheme::Command<AstArena<AstMapAny>>> {
+        let upstream = QueriedParseTree::new(upstream);
+        let Some(uri) = extract_uri_from_commands(txn) else {
+            return Vec::new();
         };
-        Ok(std::sync::Arc::new(
-            self.apply_from_ir(upstream, &uri, downstream, &txn),
-        ))
+        let commands = self.apply_from_queries(&upstream, &uri, downstream, txn);
+        if upstream.take_failure().is_some() {
+            return Vec::new();
+        }
+        commands
+    }
+
+    fn pull(
+        &mut self,
+        upstream: &LayerObserver<ParseTreeIR>,
+        downstream: &AstArena<AstMapAny>,
+        path: DocumentNodePath,
+    ) -> PullOutcome<AstArena<AstMapAny>> {
+        let upstream = QueriedParseTree::new(upstream);
+        let uri = path.0;
+        let root = upstream.view(&DocumentNodePath::root(uri));
+        match upstream.take_failure() {
+            Some(false) => return PullOutcome::Dead,
+            Some(true) => return PullOutcome::Pending,
+            None => {}
+        }
+
+        if root.is_none() {
+            return PullOutcome::Pending;
+        }
+        let synthetic: Vec<CstCommand> = vec![scheme::Command::Insert {
+            index: ParseTreeQuery::Path(DocumentNodePath::root(uri)),
+            id: 0,
+        }];
+        let commands = self.apply_from_queries(&upstream, &uri, downstream, &synthetic);
+        match upstream.take_failure() {
+            Some(false) => PullOutcome::Dead,
+            Some(true) => PullOutcome::Pending,
+            None => PullOutcome::Ready(commands),
+        }
     }
 }
 

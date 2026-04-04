@@ -1,66 +1,57 @@
 # Interactive
 
-We say a compiler is **interactive** when it can continuously handle updates from the world outside and output what we want by observing it.
+A Grammax compiler becomes **interactive** when a built tree is wrapped in a runtime service and exposed through an interface. The runtime drives the event loop. The interface decides what requests the outside world may make.
 
-In this chapter, we will introduce how to make your compiler interactive. We will analyze the existing interfaces defined in Grammax (`BasicInterface`, `WebPreviewInterface`, and `CliInterface`) and learn how to implement an interface for your own frontend. After understanding the interactive design, you will be able to make your compiler interactive and build your own interface for it.
+This separation is important:
 
-## Runtime service
+- the tree describes the compiler;
+- the runtime hosts the compiler;
+- the interface describes the public control surface.
 
-**Runtime service** is a wrapper around the compiler that continuously observes the world outside, receives updates from it, feeds them into the compiler, and outputs the results back to the caller. 
+## Runtime Service
 
-```rust
-let tree = CompilerBuilder::new()
-    .then(ParserPass::new(grammar), ParseTreeIR::default());
-
-let runtime = tree.build_runtime::<WebPreviewInterface<_>>(grammar);
-
-runtime.run().expect("Runtime failed unexpectedly");
-```
-
-The compiler is built first as a typed tree. Then `build_runtime::<InterfaceType>(grammar)` wraps that tree into a `RuntimeService<Tree, InterfaceType>`. The interface type is generic over the concrete tree type, so `WebPreviewInterface<_>` means “build a web preview interface for this exact tree”.
-
-`RuntimeService` owns the background event loop and dereferences to the chosen interface implementation, so you call interface methods directly on the runtime value.
-
-Different interfaces provide different APIs through the service. For example,
+You build a runtime from a fully composed tree:
 
 ```rust
-let tree = CompilerBuilder::new()
-    .then(ParserPass::new(grammar), ParseTreeIR::default());
+use grammax::interface::BasicInterface;
+use grammax::runtime::compiler::Build;
+use grammax::scheme::layers::ParseTreeIR;
+use grammax::scheme::passes::ParserPass;
 
-let runtime = tree.build_runtime::<BasicInterface<_>>(grammar);
-
-runtime.insert(0, "1 + 2 * 3").unwrap();
-runtime.replace(0, 1, "4").unwrap();
+let runtime = Build::new().then(
+    ParserPass::new(grammar),
+    ParseTreeIR::default(),
+    |build, _cst_observer| build.build_runtime::<BasicInterface<_>>(grammar),
+);
 ```
 
-Here we use `BasicInterface<Tree>`, which provides simple APIs for inserting and updating the source text. We can call `insert()` and `replace()` on the runtime service to send updates to the compiler, which will then process them and output the results back to the caller.
+`build_runtime::<I>(grammar)` wraps the typed tree into `RuntimeService<Tree, I>`, where `I` is your chosen interface. The service owns the runtime dispatcher and exposes the interface methods directly.
 
-## Custom Interface
+Predefined interfaces include:
 
-**Interface** is a trait that offers necessary methods for developers to implement their own interfaces. It defines how the compiler interacts with the outside world and what APIs it provides to the caller.
+- `BasicInterface<Tree>` for direct source-text editing and simple queries;
+- `CliInterface<Tree>` for terminal-oriented inspection of parse results;
+- `WebPreviewInterface<Tree>` for browser-facing CST previews.
+
+## The `Interface` Trait
+
+Custom interfaces implement `Interface<Tree>`:
 
 ```rust
 pub trait Interface<Tree: TypedTree> {
     fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self
     where
         Self: Sized;
+
     fn ged(&self) -> &GlobalEventDispatcher;
 
-    ...
+    // helper methods omitted
 }
 ```
 
-To implement an interface, your struct usually needs to hold a `GlobalEventDispatcher` and any other frontend state you need, such as a static reference to the grammar. You are not allowed to instantiate a global event dispatcher directly. `new()` is usually called by `RuntimeService`, which provides the dispatcher to the interface.
+The `GlobalEventDispatcher` is the runtime-owned request channel. Interfaces do not construct it themselves. They receive it from `RuntimeService` and use the helper methods on `Interface<Tree>` to issue typed requests safely.
 
-There are multiple defined methods in the `Interface` trait to assist you to interact with the compiler. For example, the method `edit_source_text` allows you to send updates to the compiler by specifying the range of the source text to be updated and the new text. The method `query_layer` allows you to query the current state of a layer in the pipeline by sending a query and receiving a response.
-
-Since locating the layer is statically determined by the type-level path, the interface has to be parameterized by the tree type to specify what layers it can accessThe predefined interfaces in Grammax are also tree-parameterized:
-
-- `BasicInterface<Tree>` only requires that `Tree` contains `SourceText` at `Here`;
-- `CliInterface<Tree>` requires `SourceText` at `Here` and `ParseTreeIR` at `Down<Here>`;
-- `WebPreviewInterface<Tree>` has the same requirement as `CliInterface<Tree>`.
-
-Taking `WebPreviewInterface<Tree>` as an example, the implementation of `Interface<Tree>` for it looks like this:
+Because the tree shape is part of the type system, interfaces can declare exactly which layers they require. For example:
 
 ```rust
 impl<Tree: TypedTree> Interface<Tree> for WebPreviewInterface<Tree>
@@ -69,78 +60,91 @@ where
         + ContainsPath<Down<Here>, Target = ParseTreeIR>,
 ```
 
-Here `ContainsPath<Here, Target = SourceText>` means that the tree must contain a layer of `SourceText` at `Here`, and `ContainsPath<Down<Here>, Target = ParseTreeIR>` means that the tree must contain a layer of `ParseTreeIR` at `Down<Here>`. This design lets each interface declare exactly which layers it needs from the compiler tree to radically avoid runtime errors caused by missing layers. 
+This means the interface will only compile for trees that contain `SourceText` at `Here` and `ParseTreeIR` one step below it.
 
-This design lets each interface declare exactly which layers it needs from the compiler tree.
+## Querying a Layer
 
-### Querying the pipeline
-
-The code below is adapted from the implementation of `CliInterface<Tree>` to show how to use `query_layer()` to query the current state of a layer in the pipeline.
+The central helper is `query_layer::<Path>(revision, index)`.
 
 ```rust
 let messages = match self.query_layer::<Down<Here>>(
-        Some(rev),
-        ParseTreeQuery::Message,
-    )? {
-        ParseTreeValue::Messages(m) => m,
-        other => {
-            return Err(runtime::RuntimeError::UndefinedBehavior {
-                message: format!("expected Messages, got {other:?}"),
-            });
-        }
-    };
+    Some(rev),
+    ParseTreeQuery::Message(self.uri()),
+)? {
+    ParseTreeValue::Messages(messages) => messages,
+    other => {
+        return Err(runtime::RuntimeError::UndefinedBehavior {
+            message: format!("expected Messages, got {other:?}"),
+        });
+    }
+};
 
 let alloc = match self.query_layer::<Down<Here>>(
-        Some(rev),
-        ParseTreeQuery::Allocator,
-    )? {
-        ParseTreeValue::Allocator(a) => a,
-        other => {
-            return Err(runtime::RuntimeError::UndefinedBehavior {
-                message: format!("expected Allocator, got {other:?}"),
-            });
-        }
-    };
+    Some(rev),
+    ParseTreeQuery::Allocator,
+)? {
+    ParseTreeValue::Allocator(alloc) => alloc,
+    other => {
+        return Err(runtime::RuntimeError::UndefinedBehavior {
+            message: format!("expected Allocator, got {other:?}"),
+        });
+    }
+};
 
-let root_id = match self.query_layer::<Down<Here>>(
-        Some(rev),
-        ParseTreeQuery::Path(NodePath::root()),
-    )? {
-        ParseTreeValue::GreenId(id) => id,
-        other => {
-            return Err(runtime::RuntimeError::UndefinedBehavior {
-                message: format!("expected GreenId, got {other:?}"),
-            });
-        }
-    };
+let root_view = match self.query_layer::<Down<Here>>(
+    Some(rev),
+    ParseTreeQuery::Path(DocumentNodePath::root(self.uri())),
+)? {
+    ParseTreeValue::View(view) => view,
+    other => {
+        return Err(runtime::RuntimeError::UndefinedBehavior {
+            message: format!("expected View, got {other:?}"),
+        });
+    }
+};
 ```
 
-`query_layer::<Path>(...)` requires you to specify a type-level path to the layer you want to query, an index of the layer and an optional revision ID. The path is the same as the one used in `observe::<Path>()`.
+This example shows the exact current CST query surface:
 
-In the standard interactive tree, `Here` is the source text and `Down<Here>` is the parse tree layer, so `query_layer::<Down<Here>>(...)` means “query `ParseTreeIR`”.
+- parser messages are queried as `ParseTreeQuery::Message(uri)`;
+- the allocator is queried as `ParseTreeQuery::Allocator`;
+- tree structure is queried as `ParseTreeQuery::Path(DocumentNodePath)` and returned as `ParseTreeValue::View`.
 
-- `query_layer::<Here>(...)` queries the source text layer;
-- `query_layer::<Down<Here>>(...)` queries the layer directly below the source text;
-- `query_layer::<Down<Down<Here>>>(...)` queries the next layer below that.
+The optional revision parameter lets the interface query a specific accepted revision instead of the latest available state.
 
-**Revision** is a concept related to the state of the layer. Each update of the source text will trigger a new revision. The revision ID is a monotonically increasing number that represents the order of the revisions. By specifying a revision ID, you can query the state of the layer after a specific update.
+## Editing Source Text
 
-### Editing the source text
+For source editing, the two most important helpers are:
 
-There are two methods for editing the source text: `edit_source_text(...)` and `edit_source_text_till::<Path>(...)`. They both send updates to the compiler and return a revision ID, but the latter also returns the transaction emitted by a chosen layer after the update. This is useful when your frontend wants the updated layer output immediately.
+- `edit_source_text(uri, start, end, text)`;
+- `edit_source_text_till::<Path>(uri, start, end, text)`.
 
-The code below is adapted from `WebPreviewInterface<Tree>`:
+The first sends an edit and returns the accepted revision. The second also waits for the chosen downstream layer to emit its transaction for that revision.
+
+This is especially useful in request/response frontends:
 
 ```rust
 match body {
-    WebAction::ApplyTextEdit { span, text } => this
-        .edit_source_text_till::<Down<Here>>(span.start, span.end, &text)
+    WebAction::ApplyTextEdit { span, text } => self
+        .edit_source_text_till::<Down<Here>>(&uri, span.start, span.end, &text)
         .map(|(_, transaction)| {
             rouille::Response::json(&commands_to_web_json(&transaction))
         })
-        .unwrap_or_else(|e| rouille::Response::json(&e).with_status_code(500)),
-    ...
+        .unwrap_or_else(|err| rouille::Response::json(&err).with_status_code(500)),
+    _ => todo!(),
 }
 ```
 
-Here `Down<Here>` means that the web frontend wants the transaction emitted by the parse tree layer after the text edit, which consists of commands that update the parse tree according to the new source text. The returned transaction is then converted to JSON and sent back to the caller.
+Here `Down<Here>` means: apply the text edit at the source layer, then wait until the parse-tree layer emits the corresponding CST transaction.
+
+## Writing a Good Custom Interface
+
+The cleanest interfaces in Grammax usually follow a simple pattern:
+
+- keep only frontend-facing state in the interface struct;
+- express layer requirements through `ContainsPath` bounds;
+- use `query_layer()` for typed reads;
+- use `edit_source_text()` or `edit_source_text_till()` for writes;
+- translate runtime errors into the protocol your frontend actually speaks.
+
+If your frontend needs raw layer streaming rather than request/response access, keep the `LayerObserver`s produced during tree composition and run them beside the runtime service. The runtime and the observers are meant to coexist.

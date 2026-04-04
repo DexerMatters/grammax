@@ -3,7 +3,7 @@ use color_print::cprintln;
 
 #[cfg(feature = "webui")]
 use crate::{
-    interface::webui::WebPreviewInterface,
+    interface::{BasicInterface, webui::WebPreviewInterface},
     new_grammar,
     runtime::{Build, ParserPass},
     scheme::{
@@ -96,15 +96,15 @@ fn test_tap_prints_cst_commands() {
     );
 
     let (pass_runtime, cst_observer, ast_observer) = Build::new().then(
-        || ParserPass::new(grammar),
+        ParserPass::new(grammar),
         ParseTreeIR::with_grammar(grammar),
         |b, cst_obs| {
             b.then(
-                || IncrementalLowerer::new(grammar, mapper),
+                IncrementalLowerer::new(grammar, mapper),
                 AstArena::default(),
                 |b, ast_obs| {
                     (
-                        b.build_runtime::<WebPreviewInterface<_>>(grammar),
+                        b.build_runtime::<BasicInterface<_>>(grammar),
                         cst_obs,
                         ast_obs,
                     )
@@ -123,7 +123,7 @@ fn test_tap_prints_cst_commands() {
 
     thread::spawn(move || {
         while let Some(transaction) = ast_observer.recv() {
-            if let Ok(root) = ast_observer.query(DocumentNodePath::root("file://preview")) {
+            if let Ok(root) = ast_observer.query(DocumentNodePath::root("file://undefined")) {
                 println!("=== Current JSON AST ===");
                 cprintln!("<cyan>{:#?}</>", root);
             }
@@ -134,7 +134,10 @@ fn test_tap_prints_cst_commands() {
         }
     });
 
-    pass_runtime.run().unwrap();
+    pass_runtime
+        .insert(0, r#"{"name": "John", "age": 30, "is_student": false}"#)
+        .expect("submit");
+    thread::sleep(std::time::Duration::from_millis(100));
 }
 
 #[cfg(feature = "webui")]
@@ -183,11 +186,11 @@ fn test_arith_commands() {
     );
 
     let (pass_runtime, parser_observer, observer) = Build::new().then(
-        || ParserPass::new(grammar),
+        ParserPass::new(grammar),
         ParseTreeIR::with_grammar(grammar),
         |b, parser_obs| {
             b.then(
-                || IncrementalLowerer::new(grammar, mapper),
+                IncrementalLowerer::new(grammar, mapper),
                 AstArena::new(),
                 |b, obs| {
                     (

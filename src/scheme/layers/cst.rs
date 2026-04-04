@@ -8,7 +8,7 @@ use crate::{
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
         view::{NodeView, Viewer},
     },
-    scheme::{self, IR, Span, URI},
+    scheme::{self, IR, LazyResult, Span, URI},
 };
 
 /// Internal path within a single document's parse tree.
@@ -158,10 +158,10 @@ pub enum ParseNodeValue {
     },
 }
 
+/// Permanent domain errors for `ParseTreeIR`. Absence (unknown URI or invalid
+/// path) is represented as `LazyResult::Absent`, not as a variant here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ParseTreeError {
-    InvalidPath(DocumentNodePath),
-    UnknownURI(URI),
+pub enum ParseTreeFault {
     MissingGrammar,
 }
 
@@ -628,41 +628,26 @@ impl ParseTreeIR {
 impl IR for ParseTreeIR {
     type Ix = ParseTreeQuery;
     type Value = ParseTreeValue;
-    type Error = ParseTreeError;
+    type Fault = ParseTreeFault;
 
-    fn query(&self, index: ParseTreeQuery) -> Result<ParseTreeValue, Self::Error> {
+    fn query(&self, index: ParseTreeQuery) -> LazyResult<ParseTreeValue, ParseTreeFault> {
+        use LazyResult::*;
         match index {
             ParseTreeQuery::Message(uri) => {
-                // Strict: error if this URI has never been seen.
                 if !self.roots.contains_key(&uri) && !self.messages_cache.contains_key(&uri) {
-                    return Err(ParseTreeError::UnknownURI(uri));
+                    return Absent;
                 }
-                Ok(ParseTreeValue::Messages(
-                    self.messages_cache.get(&uri).cloned().unwrap_or_default(),
-                ))
+                Present(ParseTreeValue::Messages(self.messages_cache.get(&uri).cloned().unwrap_or_default()))
             }
-            ParseTreeQuery::Allocator => Ok(ParseTreeValue::Allocator(self.alloc.clone())),
+            ParseTreeQuery::Allocator => Present(ParseTreeValue::Allocator(self.alloc.clone())),
             ParseTreeQuery::Path(path) => {
-                // Strict: error if this URI has never been initialised.
-                if !self.roots.contains_key(&path.0) {
-                    return Err(ParseTreeError::UnknownURI(path.0));
-                }
-                match self.green_at_path(&path) {
-                    Some(green) => {
-                        let Some(grammar) = self.grammar else {
-                            return Err(ParseTreeError::MissingGrammar);
-                        };
-                        let Some(offset) = self.offset_at_path(&path) else {
-                            return Err(ParseTreeError::InvalidPath(path));
-                        };
-                        let view = self
-                            .viewer(grammar)
-                            .node(green, offset)
-                            .with_path(path.1.clone().into());
-                        Ok(ParseTreeValue::View(view))
-                    }
-                    None => Err(ParseTreeError::InvalidPath(path)),
-                }
+                if !self.roots.contains_key(&path.0) { return Absent; }
+                let Some(green) = self.green_at_path(&path) else { return Absent; };
+                let Some(grammar) = self.grammar else { return Fault(ParseTreeFault::MissingGrammar); };
+                let Some(offset) = self.offset_at_path(&path) else { return Absent; };
+                Present(ParseTreeValue::View(
+                    self.viewer(grammar).node(green, offset).with_path(path.1.clone().into())
+                ))
             }
         }
     }
@@ -670,7 +655,7 @@ impl IR for ParseTreeIR {
     fn apply_transaction(
         &mut self,
         transaction: scheme::Transaction<Self>,
-    ) -> Result<(), Self::Error> {
+    ) -> Result<(), ParseTreeFault> {
         // Flush a batch of child edits for the current (URI, parent_path) pair.
         let flush_pending =
             |this: &mut Self,

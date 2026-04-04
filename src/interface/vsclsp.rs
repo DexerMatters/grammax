@@ -65,12 +65,12 @@ where
             runtime::RevisionId,
             scheme::Transaction<<Tree as ContainsPath<Path>>::Target>,
         )>,
-        runtime::RuntimeError<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error>,
+        runtime::RuntimeError<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault>,
     >
     where
         Tree: ContainsPath<Path>,
         <Tree as ContainsPath<Path>>::Target: scheme::IR + 'static,
-        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error: std::fmt::Debug,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault: std::fmt::Debug,
         Self: Sized,
     {
         let mut results = Vec::new();

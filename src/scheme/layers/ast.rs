@@ -18,7 +18,7 @@ use std::{
 use rustc_hash::FxHashMap;
 
 use crate::scheme;
-use crate::scheme::{URI, layers::DocumentNodePath};
+use crate::scheme::{LazyResult, URI, layers::DocumentNodePath};
 
 thread_local! {
     static AST_CELL_CLONE_ARENA: Cell<Option<NonNull<()>>> = const { Cell::new(None) };
@@ -444,11 +444,10 @@ where
     }
 }
 
+/// Permanent domain errors for `AstArena`. Absence (path not yet populated)
+/// is represented as `LazyResult::Absent`, not as a variant here.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AstArenaError {
-    MissingPath {
-        path: DocumentNodePath,
-    },
+pub enum AstArenaFault {
     TypeMismatch {
         path: DocumentNodePath,
         expected: &'static str,
@@ -769,53 +768,27 @@ impl<T> AstArena<T> {
 impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena<T> {
     type Ix = DocumentNodePath;
     type Value = T;
-    type Error = AstArenaError;
+    type Fault = AstArenaFault;
 
-    fn query(&self, index: DocumentNodePath) -> Result<T, Self::Error> {
-        let query_path = index;
-        let Some(path) = self.resolve_path(&query_path) else {
-            return Err(AstArenaError::MissingPath { path: query_path });
-        };
-
-        let Some(node) = self.get_erased(path) else {
-            return Err(AstArenaError::MissingPath { path: query_path });
-        };
-
-        // Special case: when T == AstMapAny, wrap the stored ErasedAstNode
-        // instead of trying to downcast the concrete stored type to AstMapAny.
-        if TypeId::of::<T>() == TypeId::of::<AstMapAny>() {
-            return AST_CELL_CLONE_ARENA.with(|slot| {
-                let prev = slot.replace(Some(self.storage_ptr()));
-                let map_any = AstMapAny(node.clone());
-                let boxed: Box<dyn Any> = Box::new(map_any);
-                let result =
-                    boxed
-                        .downcast::<T>()
-                        .map(|b| *b)
-                        .map_err(|_| AstArenaError::TypeMismatch {
-                            path: query_path,
-                            expected: type_name::<T>(),
-                        });
-                slot.set(prev);
-                result
-            });
-        }
-
+    fn query(&self, index: DocumentNodePath) -> LazyResult<T, AstArenaFault> {
+        use LazyResult::*;
+        let Some(path) = self.resolve_path(&index) else { return Absent };
+        let Some(node) = self.get_erased(path) else { return Absent };
+        let type_mismatch = AstArenaFault::TypeMismatch { path: index.clone(), expected: type_name::<T>() };
         AST_CELL_CLONE_ARENA.with(|slot| {
             let prev = slot.replace(Some(self.storage_ptr()));
-            let result = node
-                .downcast_ref::<T>()
-                .cloned()
-                .ok_or(AstArenaError::TypeMismatch {
-                    path: query_path,
-                    expected: type_name::<T>(),
-                });
+            let result = if TypeId::of::<T>() == TypeId::of::<AstMapAny>() {
+                let boxed: Box<dyn Any> = Box::new(AstMapAny(node.clone()));
+                boxed.downcast::<T>().map(|b| Present(*b)).unwrap_or(Fault(type_mismatch))
+            } else {
+                node.downcast_ref::<T>().cloned().map(Present).unwrap_or(Fault(type_mismatch))
+            };
             slot.set(prev);
             result
         })
     }
 
-    fn apply_transaction(&mut self, txn: scheme::Transaction<Self>) -> Result<(), Self::Error> {
+    fn apply_transaction(&mut self, txn: scheme::Transaction<Self>) -> Result<(), AstArenaFault> {
         use std::collections::HashMap;
 
         // Is T == AstMapAny?  If so we must *unwrap* the inner ErasedAstNode

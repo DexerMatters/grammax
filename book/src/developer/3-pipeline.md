@@ -1,153 +1,224 @@
 # Pipeline
 
-> *Pipelining is a commonly used concept in everyday life. For example, in the assembly line of a car factory, each specific task—such as installing the engine, installing the hood, and installing the wheels—is often done by a separate work station. The stations carry out their tasks in parallel, each on a different car. Once a car has had one task performed, it moves to the next station. Variations in the time needed to complete the tasks can be accommodated by "buffering" (holding one or more cars in a space between the stations) and/or by "stalling" (temporarily halting the upstream stations), until the next station becomes available.*
->
-> *Suppose that assembling one car requires three tasks that take 20, 10, and 15 minutes, respectively. Then, if all three tasks were performed by a single station, the factory would output one car every 45 minutes. By using a pipeline of three stations, the factory would output the first car in 45 minutes, and then a new one every 20 minutes.*
->
-> *As this example shows, pipelining does not decrease the latency, that is, the total time for one item to go through the whole system. It does however increase the system's throughput, that is, the rate at which new items are processed after the first one.*  -- Wikipedia
+Grammax executes each stage of a compiler as a concurrent pipeline node. Each node owns one downstream layer, receives upstream transactions, applies its pass, and serves queries against its current state.
 
-In Grammax, we adopt a command-based pipeline design. Each layer of the compiler is connected through passes that transform commands from one layer to another. Whenever source code is updated, compilation doesn't wait for the previous code to finish compiling before processing current code. Instead, it continuously reads updates and outputs compiled code in a steady stream. In practice, however, compilers using this technique are rare. Most compilers typically apply this technique to the front-end only—code parsing, semantic analysis, macro expansion, etc.—while rarely using it in the back-end (optimization and machine code generation).
+That concurrency is intentionally hidden behind typed builders and observers. As a developer, you compose a tree, store or move the observers you care about, and then hand the final tree to the runtime.
 
-In this chapter, we will introduce the design of the command-based pipeline in Grammax, including how to compose a compiler with the pipeline and how to observe the commands flowing through the pipeline. After understanding the pipeline, you will be able to build your own compiler pipeline using Grammax's scheme and observe its internal workings in real time.
+## Building a Linear Pipeline
 
-## A composed compiler
+The public builder is `Build::new()`. It starts from a root `SourceText` layer and extends the tree one stage at a time.
 
-Pipelines are transparent to developers. You don't need to worry about how to design your compiler in a pipelined way. 
+The API is continuation-based, but the most useful way to *think* about it is monadic: each composition step takes the current typed tree, attaches one more stage, and passes the enriched tree to the next step.
 
-You can normally instance your compiler with `CompilerBuilder` like this:
+In other words, `then(...)` behaves like a typed bind:
+
+- it consumes the current builder;
+- it produces a larger builder;
+- it also yields the observer for the newly created layer;
+- the continuation decides what to do next with that enriched context.
+
+The surface syntax is Rust closures, but the semantic model is close to a monadic pipeline construction where every step receives the accumulated structure and continues from there.
+
+The core shape is:
 
 ```rust
-let tree = CompilerBuilder::new()
-    .then(ParserPass::new(grammar), ParseTreeIR::default())
-    .then(IncrementalLowerer::new(grammar, mapper), AstArena::default());
+Build::new().then(pass, seed, |build, observer| {
+    // `build` is the extended tree
+    // `observer` watches the newly added downstream layer
+})
 ```
 
-`CompilerBuilder::new()` creates a tree whose current layer is the source text. Each call to `then(pass, ir)` adds one more stage below the current leaf and returns a new typed tree. In the example above, the resulting pipeline is:
+This shape is deliberate. Every time you add a stage, Grammax gives you two things immediately:
+
+- the new typed builder;
+- a `LayerObserver` for the layer you just created.
+
+That means observation is part of composition, not an afterthought. In monadic terms, the observer is extra context returned together with the new pipeline state.
+
+For example:
 
 ```text
 SourceText
   |
-ParseTreeIR
-  |
-AstArena
-```
-
-This means the source text is still the root of the tree, `ParseTreeIR` is one step below it, and `AstArena` is one step below `ParseTreeIR`.
-
-## Composing larger trees
-
-Sequential pipelines are the most common case, but the builder is not limited to a single chain. You can also fork the tree and keep composing on one branch.
-
-For example, the following code builds this shape:
-
-```text
-SourceText
-  |
-IR1
-  |
-IR2
- / \
-IR3 IR4
- |
-IR5
+  +--P1--> A
+            |
+            +--P2--> B
+                      |
+                      +--P3--> C
 ```
 
 ```rust
-let tree = CompilerBuilder::new()
-    .then(Pass1::new(), IR1::default())
-    .then(Pass2::new(), IR2::default())
-    .map_left(|ir1_branch| {
-        ir1_branch.map_left(|ir2_leaf| {
-            ir2_leaf.fork(
-                Pass3::new(),
-                IR3::default(),
-                Pass4::new(),
-                IR4::default(),
-            )
+pipeline = Build::new()
+    .then(P1, A, |pipeline, a| {
+        // Observer `a` is introduced at the same step that creates `A`.
+        pipeline.then(P2, B, |pipeline, b| {
+            // The next step can use both the accumulated pipeline and observer `b`.
+            pipeline.then(P3, C, |pipeline, c| {
+                // At this point `a`, `b`, and `c` can be stored, moved into tasks,
+                // or passed into the runtime setup.
+                pipeline
+            })
         })
     })
-    .map_left(|ir1_branch| {
-        ir1_branch.map_left(|ir2_branch| {
-            ir2_branch.map_left(|ir3_leaf| ir3_leaf.then(Pass5::new(), IR5::default()))
-        })
-    });
 ```
 
-The key idea is that `.then()` only extends a plain leaf, while `.map_left()` and `.map_right()` let you reopen an existing branch and keep composing inside it.
+Here `P1`, `P2`, and `P3` are passes, while `A`, `B`, and `C` are the downstream layers they create.
 
-As a rule of thumb:
+Read it as a sequence of dependent steps:
 
-- use `then(pass, ir)` to extend a linear pipeline;
-- use `fork(left_pass, left_ir, right_pass, right_ir)` to split one leaf into two branches;
-- use `map_left()` or `map_right()` to keep composing inside an already-built branch.
+1. start from the source layer;
+2. bind `P1` to create layer `A` and obtain observer `a`;
+3. bind `P2` to create layer `B` and obtain observer `b`;
+4. bind `P3` to create layer `C` and obtain observer `c`;
+5. return the final pipeline.
 
-## Observing the pipeline
+The important part is that each step can see what earlier steps produced. You do not separately build a tree and later rediscover its handles. The handles are introduced exactly where the stage is introduced.
 
-You can observe any layer in the tree by calling `observe::<Path>()`. The path is a type-level description of how to walk from the root layer to the layer you want:
-
-- `Here` means the current layer;
-- `Down<P>` means go to the left child, then continue with `P`;
-- `Another<P>` means go to the right child, then continue with `P`.
-
-For the sequential compiler shown above, observation looks like this:
+A typical frontend pipeline looks like this:
 
 ```rust
-let tree = CompilerBuilder::new()
-    .then(ParserPass::new(grammar), ParseTreeIR::default())
-    .then(IncrementalLowerer::new(grammar, mapper), AstArena::default());
-
-let source_observer = tree.observe::<Here>();
-let parse_tree_observer = tree.observe::<Down<Here>>();
-let ast_observer = tree.observe::<Down<Down<Here>>>();
+Build::new().then(ParserPass::new(grammar), ParseTreeIR::default(), |build, cst_observer| {
+    build.then(
+        IncrementalLowerer::new(grammar, mapper),
+        AstArena::<AstMapAny>::default(),
+        |build, ast_observer| {
+            let _ = cst_observer;
+            let _ = ast_observer;
+            build
+        },
+    )
+})
 ```
 
-The returned value is a `LayerObserver`. You can use it to receive transactions and to query the current state of that layer.
+The resulting tree is still rooted at `SourceText`, but now contains two derived layers beneath it.
 
-For example, you can print out the commands from `ParseTreeIR` in real time like this:
+## Branching a Pipeline
+
+The branching API is `fanout(...)`.
+
+Conceptually, `fanout(...)` duplicates the current layer into two independent builder continuations. Each continuation describes a complete branch starting from the same upstream state.
+
+In that sense, a branched pipeline is still built monadically, but the bound value is copied into two branch-local continuations instead of being threaded into just one.
+
+The exact generic type becomes large quickly, which is normal. The important part is conceptual:
+
+- each branch is typed independently;
+- each branch receives its own observer;
+- path types such as `Down<P>` and `Another<P>` describe how runtime code reaches those branches later.
+
+For example:
+
+```text
+SourceText
+  |
+  +--P1--> A
+            |
+            +--P2--> B
+            |         |
+            |         +--P4--> D
+            |
+            +--P3--> C
+```
 
 ```rust
-let parse_tree_observer = tree.observe::<Down<Here>>();
+pipeline = Build::new()
+    .then(P1, A, |pipeline, a| {
+        pipeline.fanout(
+            |left_branch| {
+                left_branch.then(P2, B, |left_branch, b| {
+                // This continuation can only extend the left branch.
+                    left_branch.then(P4, D, |left_branch, d| {
+                        // `a`, `b`, and `d` are available on the left path.
+                        left_branch
+                    })
+                })
+            },
+            |right_branch| {
+                right_branch.then(P3, C, |right_branch, c| {
+                    // The right branch receives `c` and cannot accidentally extend the left side.
+                    right_branch
+                })
+            },
+        )
+    })
+```
 
-thread::spawn(move || {
-    while let Some(transaction) = parse_tree_observer.recv() {
-        println!("======Received transaction======");
+This should be read as:
+
+1. build the common prefix once with `P1` producing `A`;
+2. split that prefix into two typed branches with `fanout(...)`;
+3. build the left branch as `P2 -> B -> P4 -> D`;
+4. build the right branch as `P3 -> C`;
+5. store or route the observers that matter to your interface or tooling.
+
+The builder API may look unusual at first, but this is exactly why it scales: each closure receives only the branch it is allowed to extend, so impossible compositions become unrepresentable.
+
+## Layer Observation
+
+`LayerObserver<Repr>` is the public handle for a live layer in a built tree. You usually obtain it from the builder continuation and move it into whichever task needs to watch that layer.
+
+An observer does two jobs:
+
+- receive transactions emitted by the layer;
+- query the current state of the layer.
+
+Printing every CST transaction is straightforward:
+
+```rust
+std::thread::spawn(move || {
+    while let Some((revision, transaction)) = cst_observer.recv_update() {
+        println!("revision = {revision}");
         for cmd in transaction.iter() {
-             println!("{:?}", cmd);
+            println!("{cmd:?}");
         }
     }
 });
 ```
 
-By using `recv()`, the observer acts like a receiver of a channel, waiting for transactions to arrive and printing them out in real time. You can also query the current state of the layer by using `query()`:
+If you do not care about revisions, `recv()` and `try_recv()` strip the revision number and return only the transaction.
+
+## Querying Through an Observer
+
+Observers can also query their layer directly:
 
 ```rust
-let parse_tree_observer = tree.observe::<Down<Here>>();
-
-let result = parse_tree_observer.query(ParseTreeQuery::Path(NodePath::root()));
+let result = cst_observer.query(ParseTreeQuery::Path(DocumentNodePath::root(uri)));
 match result {
-    Ok(ParseTreeValue::GreenId(id)) => {
-        println!("GreenId at root: {:?}", id);
+    Ok(ParseTreeValue::View(view)) => {
+        println!("root node = {view}");
     }
     Ok(other) => {
-        panic!("expected GreenId, got {other:?}");
+        panic!("expected ParseTreeValue::View, got {other:?}");
     }
     Err(err) => {
-        panic!("Runtime query failed: {err:?}");
+        panic!("query failed: {err:?}");
     }
 }
 ```
 
-The `query()` method returns a nested `Result` so that runtime failures and IR-specific failures are both preserved. This is intentionally verbose: querying a live pipeline can fail because the runtime is unavailable, because the query handle is not installed yet, or because the query itself is invalid for that IR.
+Two query modes are available:
 
-For the branched example above, some useful paths are:
+- `query(index)` performs normal lazy resolution. If the layer reports `Absent`, the pipeline may call `pull()` on the pass and retry.
+- `query_strict(index)` skips that extra demand step and reports `ObserveError::Absent` immediately when the entry is missing.
 
-- `Here`: `SourceText`
-- `Down<Here>`: `IR1`
-- `Down<Down<Here>>`: `IR2`
-- `Down<Down<Down<Here>>>`: `IR3`
-- `Down<Down<Another<Here>>>`: `IR4`
-- `Down<Down<Down<Down<Here>>>>`: `IR5`
+This is the practical meaning of lazy resources in Grammax: the observer asks for a value, the layer answers if it already has it, and the pass gets exactly one chance to materialize it on demand.
 
-Once you are comfortable reading these path types, the whole compiler tree becomes statically navigable at compile time.
+## Path Types in Runtime Code
+
+When a tree is later wrapped by the runtime, paths are described with the same type-level vocabulary used by `ContainsPath`:
+
+- `Here` means the current layer;
+- `Down<P>` means descend into the left child and continue with `P`;
+- `Another<P>` means descend into the right child and continue with `P`.
+
+For a linear pipeline `SourceText -> ParseTreeIR -> AstArena`, the useful paths are:
+
+- `Here` for `SourceText`;
+- `Down<Here>` for `ParseTreeIR`;
+- `Down<Down<Here>>` for `AstArena`.
+
+For a forked tree, `Another<P>` addresses the right branch.
+
+These paths are more than documentation. They are the static proof that a runtime interface is querying a layer that actually exists.
 
 

@@ -114,7 +114,7 @@ pub fn main() {
                 }
             };
             let tree = Build::new().then(
-                || ParserPass::new(grammar),
+                ParserPass::new(grammar),
                 ParseTreeIR::with_grammar(grammar),
                 |b, _| b,
             );

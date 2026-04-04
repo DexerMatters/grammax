@@ -2,26 +2,17 @@ use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
-use crate::scheme::{Command, DocumentSpan, IR, Span, Transaction, URI};
+use crate::scheme::{Command, DocumentSpan, IR, LazyResult, Span, Transaction, URI};
 
 pub type SourceAtom = internment::Intern<String>;
 
+/// Permanent domain errors for `SourceText`. Absence (unknown URI) is
+/// represented as `LazyResult::Absent`, not as a variant here.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub enum SourceTextError {
-    /// The staged id was never created in this transaction.
+pub enum SourceFault {
     UnknownStagingId(usize),
-    /// The span references a byte range that falls outside the current text.
-    InvalidSpan {
-        span: Span,
-        text_len: usize,
-    },
-    InvalidURI {
-        uri: URI,
-    },
-    /// An Insert target must have `start == end`.
-    NotAnInsertionPoint {
-        span: Span,
-    },
+    InvalidSpan { span: Span, text_len: usize },
+    NotAnInsertionPoint { span: Span },
 }
 
 // ── Gap buffer ─────────────────────────────────────────────────────────────────
@@ -213,17 +204,15 @@ impl SourceText {
 
     // ── helpers ────────────────────────────────────────────────────────────
 
-    fn staged_atom(&self, id: usize) -> Result<SourceAtom, SourceTextError> {
+    fn staged_atom(&self, id: usize) -> Result<SourceAtom, SourceFault> {
         self.staging
             .get(&id)
             .copied()
-            .ok_or(SourceTextError::UnknownStagingId(id))
+            .ok_or(SourceFault::UnknownStagingId(id))
     }
 
-    fn gap_by_uri(&self, uri: &URI) -> Result<&GapBuf, SourceTextError> {
-        self.sources
-            .get(uri)
-            .ok_or(SourceTextError::InvalidURI { uri: *uri })
+    fn gap_by_uri(&self, uri: &URI) -> Option<&GapBuf> {
+        self.sources.get(uri)
     }
 
     fn gap_mut_by_uri_or_init(&mut self, uri: &URI) -> &mut GapBuf {
@@ -245,11 +234,11 @@ fn clamp_span(span: &Span, len: usize) -> Span {
     Span { start, end }
 }
 
-fn validate_span(span: &Span, len: usize) -> Result<(), SourceTextError> {
+fn validate_span(span: &Span, len: usize) -> Result<(), SourceFault> {
     if span.start <= span.end && span.end <= len {
         Ok(())
     } else {
-        Err(SourceTextError::InvalidSpan {
+        Err(SourceFault::InvalidSpan {
             span: span.clone(),
             text_len: len,
         })
@@ -262,29 +251,27 @@ impl IR for SourceText {
     type Ix = DocumentSpan;
     /// An interned text fragment (either stored or staged).
     type Value = SourceAtom;
-    type Error = SourceTextError;
+    type Fault = SourceFault;
 
-    /// Query a substring (the `Value` at `index`).
-    fn query(&self, index: DocumentSpan) -> Result<SourceAtom, Self::Error> {
-        let gap = self.gap_by_uri(&index.uri)?;
+    fn query(&self, index: DocumentSpan) -> LazyResult<SourceAtom, SourceFault> {
+        use LazyResult::*;
+        let Some(gap) = self.gap_by_uri(&index.uri) else { return Absent };
         let span = clamp_span(&index.span, gap.len());
-        if span.start == 0 && span.end == 0 {
-            return Ok(SourceAtom::from_ref("")); // No need to cache empty string.
-        }
-        validate_span(&span, gap.len())?;
+        if span.start == 0 && span.end == 0 { return Present(SourceAtom::from_ref("")); }
+        if let Err(f) = validate_span(&span, gap.len()) { return Fault(f); }
         if span.start == 0 && span.end == gap.len() {
             if let Some(cached) = self.full_text_cache.borrow().get(&index.uri).copied() {
-                return Ok(cached);
+                return Present(cached);
             }
             let atom: SourceAtom = gap.as_string().into();
             self.full_text_cache.borrow_mut().insert(index.uri, atom);
-            return Ok(atom);
+            return Present(atom);
         }
-        Ok(gap.slice(span.start, span.end).into())
+        Present(gap.slice(span.start, span.end).into())
     }
 
     /// Clears staging table then applies the transaction directly.
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Error> {
+    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), SourceFault> {
         self.staging.clear();
         for command in transaction.iter() {
             match command {
@@ -293,7 +280,7 @@ impl IR for SourceText {
                 }
                 Command::Insert { index, id } => {
                     if index.span.start != index.span.end {
-                        return Err(SourceTextError::NotAnInsertionPoint { span: index.span });
+                        return Err(SourceFault::NotAnInsertionPoint { span: index.span });
                     }
                     let fragment = self.staged_atom(*id)?;
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);

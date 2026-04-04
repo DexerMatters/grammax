@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-use crossbeam::channel;
-
 use crate::{
     scheme::{Span, URI},
     utils::Payload,
@@ -102,6 +100,8 @@ pub enum RuntimeError<Err = String> {
     InvalidQuery,
     InvalidRequest { message: String },
     InvalidRequestFromTarget { err: Err },
+    /// The queried resource does not yet exist; demand may resolve it.
+    ResourceAbsent,
     UnexpectedRequestType,
     UndefinedBehavior { message: String },
 }
@@ -116,6 +116,7 @@ impl<Err: Display> Display for RuntimeError<Err> {
             Self::InvalidRequestFromTarget { err } => {
                 write!(f, "Invalid request from target: {}", err)
             }
+            Self::ResourceAbsent => write!(f, "Resource is absent"),
             Self::UnexpectedRequestType => write!(f, "Unexpected request type"),
             Self::UndefinedBehavior { message } => write!(f, "Undefined behavior: {}", message),
         }
@@ -124,9 +125,3 @@ impl<Err: Display> Display for RuntimeError<Err> {
 
 pub(crate) type RuntimeResult<T = RuntimeSignal, Err = String> = Result<T, RuntimeError<Err>>;
 pub(crate) type RuntimeWireResult<T = RuntimeSignal> = RuntimeResult<T, Payload>;
-
-#[derive(Debug)]
-pub(crate) struct RuntimeEnvelope {
-    pub request: RuntimeRequest,
-    pub reply: channel::Sender<RuntimeWireResult>,
-}

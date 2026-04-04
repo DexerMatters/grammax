@@ -1,7 +1,6 @@
 use std::{
     marker::PhantomData,
     ops::{Deref, DerefMut},
-    thread,
 };
 
 use crossbeam::channel;
@@ -19,7 +18,6 @@ use super::{
 
 pub struct RuntimeService<Tree: TypedTree, Impl = BasicInterface<Tree>> {
     api: Impl,
-    _handle: thread::JoinHandle<()>,
     _marker: PhantomData<fn() -> Tree>,
 }
 
@@ -35,11 +33,10 @@ where
     {
         let (evt_tx, evt_rx) = channel::unbounded::<RuntimeEvent>();
         let compiler = f(Some(evt_tx));
-        let (ged, handle) = GlobalEventDispatcher::start(compiler, evt_rx);
+        let ged = GlobalEventDispatcher::start(compiler, evt_rx);
         let api = Impl::new(ged, grammar);
         Self {
             api,
-            _handle: handle,
             _marker: PhantomData,
         }
     }

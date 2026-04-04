@@ -1,4 +1,3 @@
-use crossbeam::channel;
 use serde::Serialize;
 use std::{any::type_name, marker::PhantomData};
 
@@ -9,7 +8,7 @@ use crate::{
         compiler::{ContainsPath, Here, TypedTree},
         dispatcher::GlobalEventDispatcher,
     },
-    scheme::{self, URI, layers::source::SourceTextError},
+    scheme::{self, URI},
     utils,
 };
 
@@ -25,7 +24,7 @@ mod tests;
 /// Type-safe result alias that preserves the error type for a tree path.
 /// References the error type directly from the IR, no need for extra witness traits.
 pub type LayerResult<Tree, Path, T> =
-    Result<T, runtime::RuntimeError<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error>>;
+    Result<T, runtime::RuntimeError<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault>>;
 
 pub trait Interface<Tree: TypedTree> {
     fn new(ged: GlobalEventDispatcher, grammar: &'static grammar::Grammar) -> Self
@@ -41,7 +40,7 @@ pub trait Interface<Tree: TypedTree> {
         request(self, runtime::RuntimeRequest::Shutdown)
             .map_err(|err| {
                 map_runtime_error_payload::<
-                    <<Tree as ContainsPath<Here>>::Target as scheme::IR>::Error,
+                    <<Tree as ContainsPath<Here>>::Target as scheme::IR>::Fault,
                 >(err)
             })
             .map(|_| ())
@@ -55,7 +54,7 @@ pub trait Interface<Tree: TypedTree> {
     where
         Tree: ContainsPath<Path>,
         <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value: Send + Sync + 'static,
-        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error: 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault: 'static,
         <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
         Self: Sized,
     {
@@ -68,7 +67,7 @@ pub trait Interface<Tree: TypedTree> {
             },
         )
         .map_err(|err| {
-            map_runtime_error_payload::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error>(err)
+            map_runtime_error_payload::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault>(err)
         })?
         {
             runtime::RuntimeSignal::QueryResult { value, .. } => value
@@ -108,9 +107,7 @@ pub trait Interface<Tree: TypedTree> {
     {
         match self.query_source_text(None, uri, scheme::Span::new(0, 0)) {
             Ok(_) => Ok(true),
-            Err(runtime::RuntimeError::InvalidRequestFromTarget {
-                err: SourceTextError::InvalidURI { .. },
-            }) => Ok(false),
+            Err(runtime::RuntimeError::ResourceAbsent) => Ok(false),
             Err(err) => Err(err),
         }
     }
@@ -135,7 +132,7 @@ pub trait Interface<Tree: TypedTree> {
             },
         )
         .map_err(|err| {
-            map_runtime_error_payload::<<<Tree as ContainsPath<Here>>::Target as scheme::IR>::Error>(err)
+            map_runtime_error_payload::<<<Tree as ContainsPath<Here>>::Target as scheme::IR>::Fault>(err)
         })?
         {
             runtime::RuntimeSignal::Accepted { revision } => Ok(revision),
@@ -156,7 +153,7 @@ pub trait Interface<Tree: TypedTree> {
             runtime::RevisionId,
             scheme::Transaction<<Tree as ContainsPath<Path>>::Target>,
         ),
-        runtime::RuntimeError<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error>,
+        runtime::RuntimeError<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault>,
     >
     where
         Tree: ContainsPath<Path>,
@@ -173,7 +170,7 @@ pub trait Interface<Tree: TypedTree> {
             },
         )
         .map_err(|err| {
-            map_runtime_error_payload::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Error>(err)
+            map_runtime_error_payload::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault>(err)
         })?
         {
             runtime::RuntimeSignal::EditResult {
@@ -195,18 +192,7 @@ fn request<Tree: TypedTree, I: Interface<Tree>>(
     this: &I,
     request: runtime::RuntimeRequest,
 ) -> runtime::RuntimeWireResult {
-    let (reply_tx, reply_rx) = channel::bounded(1);
-    let envelope = runtime::RuntimeEnvelope {
-        request,
-        reply: reply_tx,
-    };
-    match this.ged().envelope_tx().try_send(envelope) {
-        Ok(()) => reply_rx
-            .recv()
-            .map_err(|_| runtime::RuntimeError::ChannelClosed)?,
-        Err(channel::TrySendError::Full(_)) => Err(runtime::RuntimeError::QueueFull),
-        Err(channel::TrySendError::Disconnected(_)) => Err(runtime::RuntimeError::ChannelClosed),
-    }
+    this.ged().request(request)
 }
 
 /// Map a wire-level error (with Payload) to a typed error.
@@ -233,6 +219,7 @@ fn map_runtime_error_payload<Err: 'static>(
                 },
             }
         }
+        runtime::RuntimeError::ResourceAbsent => runtime::RuntimeError::ResourceAbsent,
         runtime::RuntimeError::UnexpectedRequestType => {
             runtime::RuntimeError::UnexpectedRequestType
         }

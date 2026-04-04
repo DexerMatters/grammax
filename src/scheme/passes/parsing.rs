@@ -4,8 +4,11 @@ use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
     scheme::{
-        self, Span, URI,
-        layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText},
+        self, PullOutcome, DocumentSpan, LayerObserver, ObserveError, Span, URI,
+        layers::{
+            ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText,
+            source::SourceFault,
+        },
     },
 };
 
@@ -45,25 +48,30 @@ impl ParserPass {
 }
 
 impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
-    type Error = std::convert::Infallible;
-
-    fn transform(
+    fn push(
         &mut self,
-        upstream: &SourceText,
+        upstream: &LayerObserver<SourceText>,
         downstream: &ParseTreeIR,
-        txn: scheme::Transaction<SourceText>,
-    ) -> Result<scheme::Transaction<ParseTreeIR>, Self::Error> {
+        txn: &[scheme::Command<SourceText>],
+    ) -> Vec<scheme::Command<ParseTreeIR>> {
         // Every SourceText transaction must carry at least one edit command that
-        // identifies which document changed.  No URI → nothing to do.
-        let Some(uri) = find_uri_in_txn(&txn) else {
-            return Ok(std::sync::Arc::new(Vec::new()));
+        // identifies which document changed. No URI -> nothing to do.
+        let Some(uri) = find_uri_in_txn(txn) else {
+            return Vec::new();
         };
 
-        let new_text_atom = upstream.text_atom(&uri);
+        let new_text_atom = match full_source_text(upstream, &uri) {
+            Ok(atom) => atom,
+            Err(err) if err.is_resolvable() => return Vec::new(),
+            Err(err) => {
+                eprintln!("[ParserPass::transform] Permanent error for uri {uri:?}: {err:?}");
+                return Vec::new();
+            }
+        };
         let new_text = new_text_atom.as_ref().as_str();
 
         // For single-edit transactions, attempt incremental re-parse.
-        if let Some((edit_uri, span, new_len)) = extract_edit(&txn) {
+        if let Some((edit_uri, span, new_len)) = extract_edit(txn) {
             debug_assert_eq!(edit_uri, uri);
             if downstream.roots.contains_key(&uri) {
                 let result = self
@@ -72,27 +80,66 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
                 if let Ok(edit_result) = result {
                     let cmds =
                         prepend_messages_command(&uri, &self.reparser.parser.messages, edit_result);
-                    return Ok(std::sync::Arc::new(cmds));
+                    return cmds;
                 }
                 // Incremental re-parse failed; fall through to full re-parse.
             }
         }
 
-        // Full re-parse.
-        let crate::parsec::Result { root, .. } = { self.reparser.parser.parse_text(new_text) };
-        self.reparser.current = std::rc::Rc::new(root.clone());
-        let tree_cmds = {
-            delta::generate_commands_for_full_tree(
-                &self.reparser.parser.alloc,
-                &uri,
-                root.green,
-                new_text,
-            )
-        };
-        let cmds = prepend_messages_command(&uri, &self.reparser.parser.messages, tree_cmds);
-
-        Ok(std::sync::Arc::new(cmds))
+        full_parse_transaction(self, &uri, new_text)
     }
+
+    fn pull(
+        &mut self,
+        upstream: &LayerObserver<SourceText>,
+        _downstream: &ParseTreeIR,
+        index: ParseTreeQuery,
+    ) -> PullOutcome<ParseTreeIR> {
+        let Some(uri) = extract_uri_from_demand(&index) else {
+            return PullOutcome::Dead;
+        };
+        let new_text_atom = match full_source_text(upstream, &uri) {
+            Ok(atom) => atom,
+            Err(err) if err.is_resolvable() => return PullOutcome::Pending,
+            Err(_) => return PullOutcome::Dead,
+        };
+        let new_text = new_text_atom.as_ref().as_str();
+        PullOutcome::Ready(full_parse_transaction(self, &uri, new_text))
+    }
+}
+
+fn full_source_text(
+    upstream: &LayerObserver<SourceText>,
+    uri: &URI,
+) -> Result<crate::scheme::SourceAtom, ObserveError<SourceFault>> {
+    upstream.query(DocumentSpan {
+        uri: *uri,
+        span: Span::new(0, usize::MAX),
+    })
+}
+
+fn extract_uri_from_demand(index: &ParseTreeQuery) -> Option<URI> {
+    match index {
+        ParseTreeQuery::Path(path) => Some(path.0),
+        ParseTreeQuery::Message(uri) => Some(*uri),
+        ParseTreeQuery::Allocator => None,
+    }
+}
+
+fn full_parse_transaction(
+    pass: &mut ParserPass,
+    uri: &URI,
+    new_text: &str,
+) -> Vec<scheme::Command<ParseTreeIR>> {
+    let crate::parsec::Result { root, .. } = pass.reparser.parser.parse_text(new_text);
+    pass.reparser.current = std::rc::Rc::new(root.clone());
+    let tree_cmds = delta::generate_commands_for_full_tree(
+        &pass.reparser.parser.alloc,
+        uri,
+        root.green,
+        new_text,
+    );
+    prepend_messages_command(uri, &pass.reparser.parser.messages, tree_cmds)
 }
 
 /// Extract the single edit (URI, Span, new_len) from a SourceText transaction.

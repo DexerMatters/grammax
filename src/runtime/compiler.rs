@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt,
+    fmt, fs,
     marker::PhantomData,
     sync::{
         Arc, Mutex, OnceLock,
@@ -20,7 +20,12 @@ use crate::{
     grammar,
     interface::Interface,
     runtime::RuntimeService,
-    scheme::{self, IR, Pipeline, QueryHandle, Span, layers::SourceText, passes::Identity},
+    scheme::{
+        self, IR, LayerObserver, LazyResult, ObserveError, Pipeline, QueryHandle, QueryMsg,
+        SourceAtom, Span, URI,
+        layers::{SourceText, source::SourceFault},
+        passes::Identity,
+    },
     utils::{self},
 };
 
@@ -160,12 +165,22 @@ trait SeededTree: TypedTree {
         Self::Current: Clone;
 }
 
+trait ListenerTree: TypedTree {
+    fn listeners(&self) -> SharedListeners<Self::Current>;
+}
+
 impl<U> SeededTree for End<U>
 where
     U: IR + Clone,
 {
     fn seed(&self) -> Self::Current {
         self.seed.clone()
+    }
+}
+
+impl<U: IR> ListenerTree for End<U> {
+    fn listeners(&self) -> SharedListeners<Self::Current> {
+        Arc::clone(&self.listeners)
     }
 }
 
@@ -176,6 +191,12 @@ where
 {
     fn seed(&self) -> Self::Current {
         self.seed.clone()
+    }
+}
+
+impl<U: IR, P, Left: TypedTree> ListenerTree for Then<U, P, Left> {
+    fn listeners(&self) -> SharedListeners<Self::Current> {
+        Arc::clone(&self.listeners)
     }
 }
 
@@ -190,40 +211,11 @@ where
     }
 }
 
-#[derive(Clone)]
-pub struct LayerObserver<U: IR> {
-    pub updates: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
-    pub query: Arc<OnceLock<QueryHandle<U>>>,
-}
-
-impl<U: IR> LayerObserver<U> {
-    pub fn recv_update(&self) -> Option<(RevisionId, scheme::Transaction<U>)> {
-        self.updates.recv().ok()
-    }
-
-    pub fn recv(&self) -> Option<scheme::Transaction<U>> {
-        self.recv_update().map(|(_, txn)| txn)
-    }
-
-    pub fn try_recv_update(&self) -> Option<(RevisionId, scheme::Transaction<U>)> {
-        self.updates.try_recv().ok()
-    }
-
-    pub fn try_recv(&self) -> Option<scheme::Transaction<U>> {
-        self.try_recv_update().map(|(_, txn)| txn)
-    }
-
-    pub fn query(&self, index: U::Ix) -> Result<U::Value, Result<U::Error, RuntimeError>> {
-        match self.query.get() {
-            None => Err(Err(runtime_invalid("query handle not set".to_string()))),
-            Some(handle) => match handle.query(index) {
-                None => Err(Err(runtime_invalid("query failed".to_string()))),
-                Some(result) => match result {
-                    Ok(value) => Ok(value),
-                    Err(err) => Err(Ok(err)),
-                },
-            },
-        }
+impl<U: IR, P1, Left: TypedTree, P2, Right: TypedTree> ListenerTree
+    for Fork<U, P1, Left, P2, Right>
+{
+    fn listeners(&self) -> SharedListeners<Self::Current> {
+        Arc::clone(&self.listeners)
     }
 }
 
@@ -238,27 +230,24 @@ where
     if let Ok(mut ls) = listeners.lock() {
         ls.push((tx, Arc::clone(&lock)));
     }
-    LayerObserver {
-        updates: rx,
-        query: lock,
-    }
+    LayerObserver::new(rx, lock)
 }
 
 // An identity pass used by `fanout` — forwards transactions unchanged (U → U).
 // This lets each branch describe its full pipeline from the fork point rather
-// than requiring a split pass factory. `Arc` makes the clone O(1).
+// than requiring a special split pass. `Arc` makes the clone O(1).
 
 // ---------------------------------------------------------------------------
 // Build<Tree> — CPS builder
 //
-// `.then(factory, seed, |b, obs| ...)` passes the new Build and its
+// `.then(pass, seed, |b, obs| ...)` passes the new Build and its
 // LayerObserver into a continuation that returns R.  All previous observers
 // are already in the enclosing closure scope — no HList, no tuples.
 //
 // Usage:
 //   Build::new()
-//       .then(|| CstPass::new(), ParseTreeIR::new(), |b, cst_obs| {
-//           b.then(|| AstPass::new(), AstArena::new(), |b, ast_obs| {
+//       .then(CstPass::new(), ParseTreeIR::new(), |b, cst_obs| {
+//           b.then(AstPass::new(), AstArena::new(), |b, ast_obs| {
 //               b.build_runtime(grammar)   // R = RuntimeService<...>
 //           })
 //       })
@@ -279,7 +268,16 @@ impl<Tree: TypedTree> Build<Tree> {
 }
 
 #[allow(private_bounds)]
-impl<Tree: TypedTree + InstallTree + TypedTree<Current = SourceText> + Send + 'static> Build<Tree> {
+impl<
+    Tree: TypedTree
+        + InstallTree
+        + ListenerTree
+        + SeededTree
+        + TypedTree<Current = SourceText>
+        + Send
+        + 'static,
+> Build<Tree>
+{
     pub fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Tree, I>
     where
         I: Interface<Tree>,
@@ -293,81 +291,41 @@ impl<Tree: TypedTree + InstallTree + TypedTree<Current = SourceText> + Send + 's
 impl<U> Build<End<U>>
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + Sync + fmt::Debug + 'static,
+    U::Fault: Send + Sync + fmt::Debug + 'static,
 {
-    pub fn then<F, P, D, K, R>(self, factory: F, downstream: D, k: K) -> R
+    pub fn then<P, D, K, R>(self, pass: P, downstream: D, k: K) -> R
     where
         D: IR + Clone + Send + 'static,
-        D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
         D::Value: Clone + Send + Sync + 'static,
-        D::Error: Send + Sync + fmt::Debug + 'static,
+        D::Fault: Send + Sync + fmt::Debug + 'static,
         P: scheme::Pass<U, D>,
-        F: FnOnce() -> P,
         K: FnOnce(Build<Then<U, P, End<D>>>, LayerObserver<D>) -> R,
     {
         let downstream_end = End::new(downstream);
         let obs = make_observer(&downstream_end.listeners);
         let tree = Then {
             seed: self.0.seed,
-            pass: factory(),
+            pass,
             left: downstream_end,
             listeners: self.0.listeners,
         };
         k(Build(tree), obs)
     }
 
-    pub fn fork<F1, P1, D1, F2, P2, D2, KL, KR, LTree, RTree>(
-        self,
-        left_pass_factory: F1,
-        left_seed: D1,
-        right_pass_factory: F2,
-        right_seed: D2,
-        left_k: KL,
-        right_k: KR,
-    ) -> Build<Fork<U, P1, LTree, P2, RTree>>
-    where
-        D1: IR + Clone + Send + 'static,
-        D1::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        D1::Value: Clone + Send + Sync + 'static,
-        D1::Error: Send + Sync + fmt::Debug + 'static,
-        D2: IR + Clone + Send + 'static,
-        D2::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        D2::Value: Clone + Send + Sync + 'static,
-        D2::Error: Send + Sync + fmt::Debug + 'static,
-        LTree: TypedTree,
-        RTree: TypedTree,
-        P1: scheme::Pass<U, LTree::Current>,
-        P2: scheme::Pass<U, RTree::Current>,
-        F1: FnOnce() -> P1,
-        F2: FnOnce() -> P2,
-        KL: FnOnce(Build<End<D1>>) -> Build<LTree>,
-        KR: FnOnce(Build<End<D2>>) -> Build<RTree>,
-    {
-        let lb = left_k(Build(End::new(left_seed)));
-        let rb = right_k(Build(End::new(right_seed)));
-        Build(Fork {
-            seed: self.0.seed,
-            left_pass: left_pass_factory(),
-            left: lb.0,
-            right_pass: right_pass_factory(),
-            right: rb.0,
-            listeners: self.0.listeners,
-        })
-    }
-
     /// Arrow-style fanout `(f &&& g)`: both branches independently describe
     /// their full pipeline starting from the same `U`.
     ///
     /// This is strictly more monadic than `fork` — there are no split pass
-    /// factories; each branch is a self-contained pipeline description.
+    /// arguments; each branch is a self-contained pipeline description.
     /// Requires `U: Clone` (already imposed by `Fork`'s runtime).
     ///
     /// ```
     /// b.fanout(
-    ///     |b| b.then(|| pass_AB, seedB, |b, _| b.then(|| pass_BD, seedD, |b, _| b)),
-    ///     |b| b.then(|| pass_AC, seedC, |b, _| b.then(|| pass_CE, seedE, |b, _| b)),
+    ///     |b| b.then(pass_AB, seedB, |b, _| b.then(pass_BD, seedD, |b, _| b)),
+    ///     |b| b.then(pass_AC, seedC, |b, _| b.then(pass_CE, seedE, |b, _| b)),
     /// )
     /// ```
     #[allow(private_interfaces)]
@@ -400,30 +358,29 @@ where
 impl<U, P, D> Build<Then<U, P, End<D>>>
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + Sync + fmt::Debug + 'static,
+    U::Fault: Send + Sync + fmt::Debug + 'static,
     D: IR + Clone + Send + 'static,
-    D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    D::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     D::Value: Clone + Send + Sync + 'static,
-    D::Error: Send + Sync + fmt::Debug + 'static,
+    D::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, D>,
 {
-    pub fn then<F, NewP, NewD, K, R>(self, factory: F, downstream: NewD, k: K) -> R
+    pub fn then<NewP, NewD, K, R>(self, pass: NewP, downstream: NewD, k: K) -> R
     where
         NewD: IR + Clone + Send + 'static,
-        NewD::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        NewD::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
         NewD::Value: Clone + Send + Sync + 'static,
-        NewD::Error: Send + Sync + fmt::Debug + 'static,
+        NewD::Fault: Send + Sync + fmt::Debug + 'static,
         NewP: scheme::Pass<D, NewD>,
-        F: FnOnce() -> NewP,
         K: FnOnce(Build<Then<U, P, Then<D, NewP, End<NewD>>>>, LayerObserver<NewD>) -> R,
     {
         let downstream_end = End::new(downstream);
         let obs = make_observer(&downstream_end.listeners);
         let new_left = Then {
             seed: self.0.left.seed,
-            pass: factory(),
+            pass,
             left: downstream_end,
             listeners: self.0.left.listeners,
         };
@@ -434,60 +391,6 @@ where
             listeners: self.0.listeners,
         };
         k(Build(tree), obs)
-    }
-
-    /// Fork the downstream end of this chain into two independent branches.
-    ///
-    /// ```
-    /// O → (pass A) → A   ← this Build<Then<O, A, End<D>>>
-    ///                 |  |
-    ///               B    C   ← left_pass_factory / right_pass_factory
-    ///               |    |
-    ///             ...   ...  ← continued by left_k / right_k
-    /// ```
-    pub fn fork<F1, P1, D1, F2, P2, D2, KL, KR, LTree, RTree>(
-        self,
-        left_pass_factory: F1,
-        left_seed: D1,
-        right_pass_factory: F2,
-        right_seed: D2,
-        left_k: KL,
-        right_k: KR,
-    ) -> Build<Then<U, P, Fork<D, P1, LTree, P2, RTree>>>
-    where
-        D1: IR + Clone + Send + 'static,
-        D1::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        D1::Value: Clone + Send + Sync + 'static,
-        D1::Error: Send + Sync + fmt::Debug + 'static,
-        D2: IR + Clone + Send + 'static,
-        D2::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
-        D2::Value: Clone + Send + Sync + 'static,
-        D2::Error: Send + Sync + fmt::Debug + 'static,
-        LTree: TypedTree,
-        RTree: TypedTree,
-        P1: scheme::Pass<D, LTree::Current>,
-        P2: scheme::Pass<D, RTree::Current>,
-        F1: FnOnce() -> P1,
-        F2: FnOnce() -> P2,
-        KL: FnOnce(Build<End<D1>>) -> Build<LTree>,
-        KR: FnOnce(Build<End<D2>>) -> Build<RTree>,
-    {
-        let lb = left_k(Build(End::new(left_seed)));
-        let rb = right_k(Build(End::new(right_seed)));
-        let fork = Fork {
-            seed: self.0.left.seed,
-            left_pass: left_pass_factory(),
-            left: lb.0,
-            right_pass: right_pass_factory(),
-            right: rb.0,
-            listeners: self.0.left.listeners,
-        };
-        Build(Then {
-            seed: self.0.seed,
-            pass: self.0.pass,
-            left: fork,
-            listeners: self.0.listeners,
-        })
     }
 
     /// Arrow-style fanout `(f &&& g)` on the downstream end of this chain.
@@ -601,20 +504,20 @@ trait InstallTree: TypedTree + Sized {
         Self::Current: Send + 'static,
         SourceText: Send + 'static,
         <Self::Current as IR>::Value: Clone + Send + Sync + 'static,
-        <Self::Current as IR>::Error: Send + Sync + fmt::Debug + 'static;
+        <Self::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static;
 }
 
 impl<U> InstallTree for End<U>
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + Sync + fmt::Debug + 'static,
+    U::Fault: Send + Sync + fmt::Debug + 'static,
 {
     fn install(
         self,
         core: &BuilderCore,
-        input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
+        _input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
         layer_path: RuntimePath,
         current_query: Option<QueryHandle<U>>,
     ) {
@@ -624,31 +527,6 @@ where
             }
         }
 
-        let listeners = clone_listeners(&self.listeners);
-        if !listeners.is_empty() {
-            let (stop_tx, stop_rx) = channel::unbounded::<()>();
-            let handle = thread::spawn(move || {
-                loop {
-                    crossbeam::select! {
-                        recv(stop_rx) -> _ => break,
-                        recv(input_rx) -> msg => match msg {
-                            Ok((revision, txn)) => {
-                                for (tx, _) in &listeners {
-                                    let _ = tx.send((revision, Arc::clone(&txn)));
-                                }
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                }
-            });
-
-            core.push_shutdown_hook(Box::new(move || {
-                let _ = stop_tx.send(());
-                let _ = handle.join();
-            }));
-        }
-
         core.push_layer(layer_path);
     }
 }
@@ -656,36 +534,40 @@ where
 impl<U, P, Left> InstallTree for Then<U, P, Left>
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + Sync + fmt::Debug + 'static,
-    Left: InstallTree + SeededTree + TypedTree + 'static,
+    U::Fault: Send + Sync + fmt::Debug + 'static,
+    Left: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
-    <Left::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    <Left::Current as IR>::Ix:
+        Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
-    <Left::Current as IR>::Error: Send + Sync + fmt::Debug + 'static,
+    <Left::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, Left::Current> + Send + 'static,
-    P::Error: Send + fmt::Debug + 'static,
 {
     fn install(
         self,
         core: &BuilderCore,
         input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
         layer_path: RuntimePath,
-        _current_query: Option<QueryHandle<U>>,
+        current_query: Option<QueryHandle<U>>,
     ) {
+        let Some(upstream_query) = current_query else {
+            return;
+        };
         let downstream_layer_path = layer_path.child(0);
         let downstream_seed = self.left.seed();
+        let downstream_listeners = self.left.listeners();
         let (output_rx, downstream_query) = connect_stage::<U, Left::Current, P>(
             core,
             input_rx,
-            self.seed,
             layer_path,
             downstream_layer_path.clone(),
             downstream_layer_path.clone(),
+            upstream_query,
             self.pass,
             downstream_seed,
-            self.listeners,
+            downstream_listeners,
         );
         self.left.install(
             core,
@@ -699,23 +581,23 @@ where
 impl<U, P1, Left, P2, Right> InstallTree for Fork<U, P1, Left, P2, Right>
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + Sync + fmt::Debug + 'static,
-    Left: InstallTree + SeededTree + TypedTree + 'static,
+    U::Fault: Send + Sync + fmt::Debug + 'static,
+    Left: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
-    <Left::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    <Left::Current as IR>::Ix:
+        Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
-    <Left::Current as IR>::Error: Send + Sync + fmt::Debug + 'static,
-    Right: InstallTree + SeededTree + TypedTree + 'static,
+    <Left::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
+    Right: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Right::Current: IR + Clone + Send + 'static,
-    <Right::Current as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    <Right::Current as IR>::Ix:
+        Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     <Right::Current as IR>::Value: Clone + Send + Sync + 'static,
-    <Right::Current as IR>::Error: Send + Sync + fmt::Debug + 'static,
+    <Right::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     P1: scheme::Pass<U, Left::Current> + Send + 'static,
-    P1::Error: Send + fmt::Debug + 'static,
     P2: scheme::Pass<U, Right::Current> + Send + 'static,
-    P2::Error: Send + fmt::Debug + 'static,
 {
     fn install(
         self,
@@ -732,7 +614,6 @@ where
 
         let (tx1, rx1) = channel::unbounded::<(RevisionId, scheme::Transaction<U>)>();
         let (tx2, rx2) = channel::unbounded::<(RevisionId, scheme::Transaction<U>)>();
-        let listeners = clone_listeners(&self.listeners);
         let (fanout_stop_tx, fanout_stop_rx) = channel::unbounded::<()>();
         let fanout_handle = thread::spawn(move || {
             loop {
@@ -740,9 +621,6 @@ where
                     recv(fanout_stop_rx) -> _ => break,
                     recv(input_rx) -> msg => match msg {
                         Ok((revision, txn)) => {
-                            for (tx, _) in &listeners {
-                                let _ = tx.send((revision, Arc::clone(&txn)));
-                            }
                             let _ = tx1.send((revision, Arc::clone(&txn)));
                             let _ = tx2.send((revision, txn));
                         }
@@ -758,33 +636,38 @@ where
 
         let left_layer_path = layer_path.child(0);
         let right_layer_path = layer_path.child(1);
+        let Some(upstream_query) = current_query else {
+            return;
+        };
 
         let left_seed = self.left.seed();
+        let left_listeners = self.left.listeners();
         let (left_rx, left_query) = connect_stage::<U, Left::Current, P1>(
             core,
             rx1,
-            self.seed.clone(),
             layer_path.clone(),
             left_layer_path.clone(),
             left_layer_path.clone(),
+            upstream_query.clone(),
             self.left_pass,
             left_seed,
-            Arc::new(Mutex::new(Vec::new())),
+            left_listeners,
         );
         self.left
             .install(core, left_rx, left_layer_path, Some(left_query));
 
         let right_seed = self.right.seed();
+        let right_listeners = self.right.listeners();
         let (right_rx, right_query) = connect_stage::<U, Right::Current, P2>(
             core,
             rx2,
-            self.seed,
             layer_path,
             right_layer_path.clone(),
             right_layer_path.clone(),
+            upstream_query,
             self.right_pass,
             right_seed,
-            Arc::new(Mutex::new(Vec::new())),
+            right_listeners,
         );
         self.right
             .install(core, right_rx, right_layer_path, Some(right_query));
@@ -794,49 +677,41 @@ where
 fn connect_stage<U, D, P>(
     core: &BuilderCore,
     input_rx: channel::Receiver<(RevisionId, scheme::Transaction<U>)>,
-    upstream_seed: U,
-    upstream_layer_path: RuntimePath,
+    _upstream_layer_path: RuntimePath,
     downstream_layer_path: RuntimePath,
     pass_path: RuntimePath,
+    upstream_query: QueryHandle<U>,
     pass: P,
     downstream: D,
-    upstream_listeners: SharedListeners<U>,
+    downstream_listeners: SharedListeners<D>,
 ) -> (
     channel::Receiver<(RevisionId, scheme::Transaction<D>)>,
     QueryHandle<D>,
 )
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     U::Value: Clone + Send + Sync + 'static,
-    U::Error: Send + Sync + fmt::Debug + 'static,
-    D: IR + Send + 'static,
-    D::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Fault: Send + Sync + fmt::Debug + 'static,
+    D: IR + Clone + Send + 'static,
+    D::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
     D::Value: Clone + Send + Sync + 'static,
-    D::Error: Send + Sync + fmt::Debug + 'static,
+    D::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, D> + Send + 'static,
-    P::Error: Send + fmt::Debug + 'static,
 {
     let (tap_tx, tap_rx) = channel::unbounded::<scheme::Transaction<D>>();
 
     let pipeline = Pipeline::connect_with_tap(
-        move || upstream_seed,
+        LayerObserver::from_handle(upstream_query),
         move || pass,
         downstream,
         Some(tap_tx),
     );
 
-    // Populate query handles for all upstream observers now that the IR is live.
-    let upstream_query = pipeline.upstream_query_handle();
-    for (_, lock) in &clone_listeners(&upstream_listeners) {
-        let _ = lock.set(upstream_query.clone());
-    }
-    core.insert_query(
-        upstream_layer_path,
-        Arc::new(move |index| query_handle_any::<U>(&upstream_query, index)),
-    );
-
     let downstream_query = pipeline.downstream_query_handle();
+    for (_, lock) in &clone_listeners(&downstream_listeners) {
+        let _ = lock.set(downstream_query.clone());
+    }
     core.insert_query(
         downstream_layer_path.clone(),
         Arc::new({
@@ -882,9 +757,8 @@ where
                 Err(_) => break,
             };
 
-            // Deliver to upstream-layer observers.
-            for (tx, _) in &clone_listeners(&upstream_listeners) {
-                let _ = tx.send((revision, Arc::clone(&txn)));
+            for (tx, _) in &clone_listeners(&downstream_listeners) {
+                let _ = tx.send((revision, Arc::clone(&downstream_txn)));
             }
 
             send_layer_event::<D>(
@@ -896,9 +770,7 @@ where
                 &downstream_txn,
             );
 
-            if next_output_tx.send((revision, downstream_txn)).is_err() {
-                break;
-            }
+            let _ = next_output_tx.send((revision, downstream_txn));
         }
     });
 
@@ -914,13 +786,127 @@ where
     (next_output_rx, downstream_query)
 }
 
+fn source_replace_txn(uri: URI, text: String) -> SourceTxn {
+    let staged_text: SourceAtom = text.into();
+    let index = scheme::DocumentSpan {
+        uri,
+        span: Span::new(0, 0),
+    };
+    Arc::new(vec![
+        scheme::Command::Create {
+            id: 0,
+            value: staged_text,
+        },
+        scheme::Command::Insert { index, id: 0 },
+    ])
+}
+
+fn load_source_from_uri(uri: URI) -> Result<SourceTxn, ObserveError<SourceFault>> {
+    if uri.scheme.as_ref().as_str() != "file" {
+        return Err(ObserveError::Exhausted);
+    }
+
+    let path = uri.path.as_ref().as_str();
+    let text = fs::read_to_string(path).map_err(|_err| ObserveError::Exhausted)?;
+    Ok(source_replace_txn(uri, text))
+}
+
+fn resolve_source_query(
+    source: &mut SourceText,
+    index: scheme::DocumentSpan,
+    strict: bool,
+) -> Result<scheme::SourceAtom, ObserveError<SourceFault>> {
+    match source.query(index.clone()) {
+        LazyResult::Present(value) => Ok(value),
+        LazyResult::Absent if !strict => {
+            let txn = load_source_from_uri(index.uri)?;
+            source.apply_transaction(txn).map_err(ObserveError::Fault)?;
+            match source.query(index) {
+                LazyResult::Present(value) => Ok(value),
+                LazyResult::Absent => Err(ObserveError::Absent),
+                LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+            }
+        }
+        LazyResult::Absent => Err(ObserveError::Absent),
+        LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+    }
+}
+
+fn start_source_root(
+    input_rx: channel::Receiver<(RevisionId, SourceTxn)>,
+    seed: SourceText,
+    listeners: SharedListeners<SourceText>,
+    event_sender: SharedEventSender,
+    layer_path: RuntimePath,
+    pass_path: RuntimePath,
+) -> (
+    channel::Receiver<(RevisionId, SourceTxn)>,
+    QueryHandle<SourceText>,
+    ShutdownHook,
+) {
+    let (output_tx, output_rx) = channel::unbounded::<(RevisionId, SourceTxn)>();
+    let (query_sender, query_rx) = channel::unbounded::<QueryMsg<SourceText>>();
+    let query_handle = QueryHandle::from_sender(query_sender);
+    for (_, lock) in &clone_listeners(&listeners) {
+        let _ = lock.set(query_handle.clone());
+    }
+
+    let (stop_tx, stop_rx) = channel::unbounded::<()>();
+    let handle = thread::spawn(move || {
+        let mut source = seed;
+        loop {
+            crossbeam::select! {
+                recv(stop_rx) -> _ => break,
+                recv(input_rx) -> msg => match msg {
+                    Ok((revision, txn)) => {
+                        if source.apply_transaction(Arc::clone(&txn)).is_err() {
+                            continue;
+                        }
+
+                        for (tx, _) in &clone_listeners(&listeners) {
+                            let _ = tx.send((revision, Arc::clone(&txn)));
+                        }
+
+                        send_layer_event::<SourceText>(
+                            &event_sender,
+                            revision,
+                            layer_path.clone(),
+                            pass_path.clone(),
+                            false,
+                            &txn,
+                        );
+
+                        if output_tx.send((revision, txn)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                },
+                recv(query_rx) -> msg => match msg {
+                    Ok(QueryMsg { index, strict, reply }) => {
+                        let _ = reply.send(resolve_source_query(&mut source, index, strict));
+                    }
+                    Err(_) => {}
+                },
+            }
+        }
+    });
+
+    let shutdown = Box::new(move || {
+        let _ = stop_tx.send(());
+        let _ = handle.join();
+    });
+
+    (output_rx, query_handle, shutdown)
+}
+
 pub(crate) struct ComposedCompiler<Tree: TypedTree> {
     submit_top: SubmitTopFn,
     queries: SharedQueries,
     settled_layer_path: RuntimePath,
     settled_pass_path: RuntimePath,
     next_revision: AtomicU64,
-    source_len: usize,
+    source_lens: HashMap<URI, usize>,
     shutdown_hooks: SharedShutdownHooks,
     event_sender: SharedEventSender,
     _marker: PhantomData<fn() -> Tree>,
@@ -928,7 +914,7 @@ pub(crate) struct ComposedCompiler<Tree: TypedTree> {
 
 impl<Tree: TypedTree> ComposedCompiler<Tree> {
     pub fn submit_source(&mut self, txn: SourceTxn) -> RuntimeResult<RevisionId> {
-        let next_len = validate_source_txn_len(self.source_len, &txn)?;
+        let next_lens = validate_source_txn_lens(&self.source_lens, &txn)?;
         let revision = self.next_revision.fetch_add(1, Ordering::Relaxed);
 
         if let Err(err) = (self.submit_top)(revision, txn) {
@@ -936,7 +922,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
             return Err(err);
         }
 
-        self.source_len = next_len;
+        self.source_lens = next_lens;
         Ok(revision)
     }
 
@@ -981,35 +967,24 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         event_sender: Option<channel::Sender<RuntimeEvent>>,
     ) -> Self
     where
-        Tree: InstallTree + TypedTree<Current = SourceText> + 'static,
+        Tree: InstallTree + ListenerTree + SeededTree + TypedTree<Current = SourceText> + 'static,
         SourceText: Send + 'static,
-        <SourceText as IR>::Ix: Clone + Send + Sync + Serialize + DeserializeOwned + 'static,
+        <SourceText as IR>::Ix:
+            Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
         <SourceText as IR>::Value: Clone + Send + Sync + 'static,
-        <SourceText as IR>::Error: Send + Sync + fmt::Debug + 'static,
+        <SourceText as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     {
         let layer_path = RuntimePath::root();
         let pass_path = RuntimePath::root();
-        let submit_layer_path = layer_path.clone();
-        let submit_pass_path = pass_path.clone();
 
         let shared_event_sender: SharedEventSender = Arc::new(OnceLock::new());
         if let Some(sender) = event_sender {
             let _ = shared_event_sender.set(sender);
         }
-        let submit_event_sender = Arc::clone(&shared_event_sender);
 
-        let (output_tx, output_rx) = channel::unbounded::<(RevisionId, SourceTxn)>();
+        let (input_tx, input_rx) = channel::unbounded::<(RevisionId, SourceTxn)>();
         let submit_top: SubmitTopFn = Arc::new(move |revision, txn| {
-            send_layer_event::<SourceText>(
-                &submit_event_sender,
-                revision,
-                submit_layer_path.clone(),
-                submit_pass_path.clone(),
-                false,
-                &txn,
-            );
-
-            output_tx
+            input_tx
                 .send((revision, txn))
                 .map_err(|_| RuntimeError::ChannelClosed)
         });
@@ -1020,7 +995,23 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
             pass_path,
             shared_event_sender,
         );
-        spec.install(&core, output_rx, layer_path, None);
+        let (root_output_rx, root_query, root_shutdown) = start_source_root(
+            input_rx,
+            spec.seed(),
+            spec.listeners(),
+            Arc::clone(&core.event_sender),
+            layer_path.clone(),
+            RuntimePath::root(),
+        );
+        core.push_shutdown_hook(root_shutdown);
+        core.insert_query(
+            layer_path.clone(),
+            Arc::new({
+                let qh = root_query.clone();
+                move |index| query_handle_any::<SourceText>(&qh, index)
+            }),
+        );
+        spec.install(&core, root_output_rx, layer_path, Some(root_query));
         let (settled_layer_path, settled_pass_path) = core.settled_snapshot();
 
         ComposedCompiler {
@@ -1029,7 +1020,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
             settled_layer_path,
             settled_pass_path,
             next_revision: AtomicU64::new(1),
-            source_len: 0,
+            source_lens: HashMap::new(),
             shutdown_hooks: core.shutdown_hooks,
             event_sender: core.event_sender,
             _marker: PhantomData,
@@ -1051,7 +1042,7 @@ where
     R: IR,
     R::Ix: DeserializeOwned + Clone + 'static,
     R::Value: Send + Sync + 'static,
-    R::Error: Send + Sync + 'static,
+    R::Fault: Send + Sync + 'static,
 {
     let typed_index: R::Ix = if let Some(ix) = index.downcast_ref::<R::Ix>() {
         ix.clone()
@@ -1065,12 +1056,15 @@ where
         ));
     };
 
-    let result = handle
-        .query(typed_index)
-        .ok_or(RuntimeError::ChannelClosed)?;
-
-    let value = result.map_err(|err| RuntimeError::InvalidRequestFromTarget {
-        err: utils::Payload::new(err),
+    let value = handle.query(typed_index).map_err(|err| match err {
+        ObserveError::NotReady | ObserveError::Disconnected => RuntimeError::ChannelClosed,
+        ObserveError::Absent => RuntimeError::ResourceAbsent,
+        ObserveError::Fault(f) => RuntimeError::InvalidRequestFromTarget {
+            err: utils::Payload::new(f),
+        },
+        ObserveError::Exhausted => RuntimeError::UndefinedBehavior {
+            message: "demand exhausted".to_string(),
+        },
     })?;
 
     Ok(utils::Payload::new(value))
@@ -1138,11 +1132,11 @@ fn send_runtime_error_text(
     });
 }
 
-fn validate_source_txn_len(
-    current_len: usize,
+fn validate_source_txn_lens(
+    current_lens: &HashMap<URI, usize>,
     txn: &[scheme::Command<SourceText>],
-) -> RuntimeResult<usize> {
-    let mut len = current_len;
+) -> RuntimeResult<HashMap<URI, usize>> {
+    let mut lens = current_lens.clone();
     let mut staged: Vec<Option<usize>> = Vec::new();
 
     for command in txn {
@@ -1164,24 +1158,27 @@ fn validate_source_txn_len(
                     .get(*id)
                     .and_then(|v| *v)
                     .ok_or_else(|| runtime_invalid(format!("unknown staging id: {id}")))?;
-                len = len.saturating_add(frag_len);
+                let len = lens.get(&index.uri).copied().unwrap_or_default();
+                lens.insert(index.uri, len.saturating_add(frag_len));
             }
             scheme::Command::Delete { index } => {
+                let len = lens.get(&index.uri).copied().unwrap_or_default();
                 let span = clamp_span(index.span, len);
-                len = len.saturating_sub(span.end - span.start);
+                lens.insert(index.uri, len.saturating_sub(span.end - span.start));
             }
             scheme::Command::Replace { index, id } => {
+                let len = lens.get(&index.uri).copied().unwrap_or_default();
                 let span = clamp_span(index.span, len);
                 let frag_len = staged
                     .get(*id)
                     .and_then(|v| *v)
                     .ok_or_else(|| runtime_invalid(format!("unknown staging id: {id}")))?;
-                len = len - (span.end - span.start) + frag_len;
+                lens.insert(index.uri, len - (span.end - span.start) + frag_len);
             }
         }
     }
 
-    Ok(len)
+    Ok(lens)
 }
 
 fn clamp_span(span: Span, len: usize) -> Span {

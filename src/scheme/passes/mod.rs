@@ -8,19 +8,31 @@ pub(crate) mod strategy;
 pub use lowering::{AstMapAction, AstMapCtx, AstMapIntent, AstMapper, AstNode, IncrementalLowerer};
 pub use parsing::ParserPass;
 
-use crate::scheme::{IR, Pass, Transaction};
+use crate::scheme::{Command, PullOutcome, IR, LayerObserver, Pass};
 
 pub struct Identity;
 
-impl<U: IR + Clone + Send + 'static> Pass<U, U> for Identity {
-    type Error = std::convert::Infallible;
-
-    fn transform(
+impl<U> Pass<U, U> for Identity
+where
+    U: IR + Clone + Send + 'static,
+    U::Ix: Clone,
+    U::Value: Clone,
+{
+    fn push(
         &mut self,
-        _upstream: &U,
+        _upstream: &LayerObserver<U>,
         _downstream: &U,
-        txn: Transaction<U>,
-    ) -> Result<Transaction<U>, Self::Error> {
-        Ok(txn)
+        txn: &[Command<U>],
+    ) -> Vec<Command<U>> {
+        txn.iter().map(Command::clone_fields).collect()
+    }
+
+    fn pull(
+        &mut self,
+        _upstream: &LayerObserver<U>,
+        _downstream: &U,
+        _index: U::Ix,
+    ) -> PullOutcome<U> {
+        PullOutcome::Pending
     }
 }

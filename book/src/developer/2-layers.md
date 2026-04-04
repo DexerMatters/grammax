@@ -1,49 +1,97 @@
 # Layers
 
-In Grammax, a compiler frontend is structured into multiple layers, each responsible for a specific aspect of the compilation process. They are informative for a data-based design, and incremental for a transaction-based updating system. The layers are connected through passes, which are responsible for transforming commands from one layer to another. 
+Grammax treats a frontend as a stack of **layers** connected by **passes**. A layer is a queryable, mutable database. A pass is the rule that keeps one database derived from another.
 
-The layers and passes together form a *"terraced field"* structure where the commands flow from top to bottom, and the queries flow from bottom to top. This structure allows for efficient incremental updates and queries, as changes in one layer can be propagated to the next layer without needing to recompute everything.
+That division is strict:
 
-The parsing process itself also consists with the "terraced field" design as the following diagram shows:
+- layers own state;
+- passes derive state;
+- transactions move downward;
+- queries move upward.
 
+This is the core of the terraced-field design. A lower layer never mutates an upper layer directly, and an upper layer never reaches into a lower layer to "fix" it. Coordination happens only through transactions and lazy queries.
+
+```text
+SourceText
+    ↓ push
+ParseTreeIR
+    ↓ push
+AstArena
+
+AstArena query
+    ↑ pull
+ParseTreeIR query
+    ↑ pull
+SourceText query
 ```
-Source Layer
-    ↓ (Parsing Pass)
-CST Layer
-    ↓ (Lowering Pass)
-AST Layer
-```
-
-In this chapter, we will introduce the details of the structure of a compiler frontend built with Grammax, including the design of IRs, passes, commands, and signals. After understanding the structure, you will be able to build your own compiler frontend using Grammax's scheme.
-
 
 ## IR
 
-**IR** or Intermediate Representation is a crucial concept in compiler design. It serves as an intermediate layer between the source code and the target machine code, allowing for various optimizations and transformations to be applied during the compilation process. In Grammax, we can say that IRs are databases which can be updated and queried.
-
+In Grammax, an IR is the contract for one layer.
 
 ```rust
 pub trait IR {
     type Ix;
     type Value;
-    type Error;
+    type Fault;
 
-    fn query(&self, index: Self::Ix) -> Result<Self::Value, Self::Error>;
+    fn query(&self, index: Self::Ix) -> LazyResult<Self::Value, Self::Fault>;
 
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Error>
+    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
     where
         Self: Sized;
 }
+
+pub enum LazyResult<V, F> {
+    Present(V),
+    Absent,
+    Fault(F),
+}
 ```
 
-IRs require two main capabilities: **update** and **query**. Update is achieved through transactions, which are collections of commands that modify the IR. Query allows passes or the world outside the compiler to retrieve information from the IR. Therefore, The types of index, value, and error should be specified. 
+This API deliberately separates three states that many systems collapse into one loose "error":
 
-For example, if your layer maintains a `HashMap<String, Node>` structure, the index type would be `String`, the value type would be `Node`, and the error type could be an enum representing errors such as "NodeNotFound" or "InvalidTransaction". If your layer contains a tree structure, the index type could be a path to a node, and so forth. For the predefined layers in Grammax, the Source layer's IR maintains simply a string, the CST layer's IR a red-green tree allocator, and the AST layer's IR a user-defined tree structure. Each of them has its own query and update methods.
+- `Present(V)` means the layer can answer the query now.
+- `Absent` means the requested index is not populated yet.
+- `Fault(F)` means the index is meaningful, but the request is invalid or permanently impossible for domain reasons.
 
-## Transaction
+That distinction matters because `Absent` is part of normal lazy evaluation. It is not a failure. It is a signal that a pass may be able to synthesize the missing entry. By contrast, `Fault(F)` is terminal for that query.
 
-**Transaction** is a collection of commands that represent small-step updates to the IR. Each command can be one of `Create`, `Insert`, `Delete`, or `Replace`. A good transaction should be *closed* in the sense that `id` in `Insert`, `Delete`, and `Replace` commands should refer to the `id` created by a `Create` command within the same transaction. This ensures that the transaction can be processed independently without relying on the context of other transactions. You can divide a transaction into two stages: the first stage is to compose the desired structure by `Create` commands, and the second stage is to modify the IR by `Insert`, `Delete`, and `Replace` commands using the references created in the first stage.
+This is why `IR::Fault` is intentionally narrow: it should contain only **permanent domain faults**. Anything transient belongs in the observation layer, not inside the IR value space.
 
+For example:
+
+- `SourceText` can be `Absent` for a URI that has not been loaded yet.
+- `ParseTreeIR` can be `Absent` for a path that has not been parsed yet.
+- `AstArena` can return `Fault(TypeMismatch { .. })` if the caller asks for a node as the wrong Rust type.
+
+## Observation Errors
+
+Once a layer is observed through a pipeline, the caller no longer sees only raw `LazyResult`. It sees runtime conditions as well.
+
+```rust
+pub enum ObserveError<F> {
+    NotReady,
+    Disconnected,
+    Absent,
+    Fault(F),
+    Exhausted,
+}
+```
+
+These variants have precise meaning:
+
+- `NotReady` means the query channel has not been wired yet.
+- `Disconnected` means the pipeline is gone.
+- `Absent` means the layer still has no value after the pipeline tried to help.
+- `Fault(F)` forwards a permanent domain fault from the layer.
+- `Exhausted` means the pass explicitly gave up: it knows the requested index will never be produced.
+
+The helper `is_resolvable()` is the official test for transient states. Today that means `NotReady`, `Disconnected`, and `Absent`.
+
+## Transactions
+
+A transaction is a closed batch of commands that updates one layer.
 
 ```rust
 pub enum Command<Repr: IR> {
@@ -56,43 +104,91 @@ pub enum Command<Repr: IR> {
 pub type Transaction<Repr> = Arc<Vec<Command<Repr>>>;
 ```
 
-Take the CST layer as an example. Assuming that the user starts to edit a JSON file. The source text is `{"name": "John"}`. Then the user replaces `John` with `Doe`, and the source text becomes `{"name": "Doe"}`. The transaction generated by user's edit would look like this:
+The important invariant is that `Insert` and `Replace` refer only to `id`s created in the same transaction. A transaction should be self-contained. That keeps application simple and deterministic, and it makes downstream observation meaningful because every emitted batch is a coherent state transition.
 
-```
+In practice, most transactions follow a two-phase shape:
+
+1. Build new values with `Create`.
+2. Attach them with `Insert`, `Replace`, or remove old entries with `Delete`.
+
+For a source edit replacing `John` with `Doe`, a source-layer transaction might look like this:
+
+```text
 Create { id: 0, value: "Doe" }
-Replace { index: Span { start: 10, end: 14 }, id: 0 }
+Replace { index: DocumentSpan { .. }, id: 0 }
 ```
 
-First, we create a string with the value "Doe" and assign it an `id` of 0. Then we replace the span from index 10 to 14 (which corresponds to "John") with the string we just created.
-
-And the transaction generated by the parsing pass to update the CST layer would look like this:
-
-```
-Create { id: 1, value: {"field": "", "kind": "token", "rule_ix": 4, "text": "Doe"} }
-Replace { index: NodePath([0, 1, 2, 0, 1]), id: 1 }
-```
-
-This firstly creates a new node with the value representing the token "Doe", and then replaces the node at the specified path in the CST with the newly created node. The path `[0, 1, 2, 0, 1]` corresponds to the location of the token in the CST tree structure.
+The parsing pass then turns that source transaction into a CST transaction that creates new syntax nodes and rewires the affected path in `ParseTreeIR`.
 
 ## Pass
 
-**Pass** is a structure that observes the upper layer and transforms the transactions from the upper layer into ones for the lower layer. It is responsible for connecting the layers together and ensuring that updates are propagated correctly. Each pass has its own logic for how to transform transactions, which can involve querying the IR of the upper layer to get necessary information for the transformation.
+A pass is the bridge between two layers.
 
 ```rust
 pub trait Pass<U: IR, D: IR> {
-    type Error;
-
-    fn transform(
+    fn push(
         &mut self,
-        upstream: &U,
+        upstream: &LayerObserver<U>,
         downstream: &D,
-        txn: Transaction<U>,
-    ) -> Result<Transaction<D>, Self::Error>;
+        txn: &[Command<U>],
+    ) -> Vec<Command<D>>;
+
+    fn pull(
+        &mut self,
+        upstream: &LayerObserver<U>,
+        downstream: &D,
+        index: D::Ix,
+    ) -> PullOutcome<D>;
 }
 
+pub enum PullOutcome<Repr: IR> {
+    Ready(Vec<Command<Repr>>),
+    Pending,
+    Dead,
+}
 ```
 
-Passes require an implementation of the `transform` method, which takes a reference to the upstream IR and a transaction from the upstream layer, and returns a transaction for the downstream layer. This is fallible, as the transformation may fail due to various reasons such as invalid transactions or errors in the IR. The error type should be specified to handle such cases.
+The two methods are complementary, but they are not interchangeable.
 
-In this pattern, parsing can be seen as a pass that transforms user's edits (transactions on the Source layer) into updates to the CST layer, and lowering can be seen as a pass that transforms updates to the CST layer into updates to the AST layer. 
+### `push`
+
+`push` reacts to an upstream transaction that already happened. It is eager, directional, and transaction-oriented. Its job is to derive the downstream delta caused by the upstream delta.
+
+Typical `push` behavior:
+
+- parse an edited source document into new CST commands;
+- lower changed CST regions into AST commands;
+- emit nothing when the upstream transaction does not affect the downstream layer.
+
+### `pull`
+
+`pull` reacts to a missing downstream query. It is lazy, demand-driven, and index-oriented. Its job is to answer the question: "what commands, if any, would populate this exact downstream index?"
+
+The return values are intentionally strict:
+
+- `Ready(cmds)` means the pass can populate the requested index now.
+- `Pending` means the request is still unresolved and should be retried after future upstream activity.
+- `Dead` means this pass will never be able to produce that index.
+
+`Pending` is named from the state of the **pull request**, not from the direction of the dependency. It does not mean that background work is running. It means the request remains open because future upstream data may change the answer.
+
+That leads to an important rule for pass authors:
+
+- return `Pending` only when a future upstream transaction could legitimately make the index available;
+- return `Dead` when the index is structurally impossible or permanently unsupported.
+
+If you confuse those two, the runtime will keep retrying a request that should have been terminated.
+
+## Implementation Guidance
+
+When implementing a custom layer or pass, the following heuristics usually lead to the cleanest behavior:
+
+- Make `query()` cheap and side-effect-free.
+- Use `Absent` for missing data, not for malformed requests.
+- Keep `Fault` small and domain-specific.
+- Make `push()` derive only from the upstream transaction and observable upstream state.
+- Make `pull()` produce the smallest coherent downstream transaction that answers the missing index.
+- Prefer `Dead` over `Pending` unless you can point to a concrete future upstream event that may change the outcome.
+
+The built-in `ParserPass` and `IncrementalLowerer` are good reference implementations of this model.
 

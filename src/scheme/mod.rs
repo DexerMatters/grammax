@@ -5,7 +5,11 @@ pub use doc::*;
 pub use layers::{SourceAtom, SourceText};
 
 use std::thread::{self, JoinHandle};
-use std::{fmt, marker::PhantomData};
+use std::{
+    fmt,
+    marker::PhantomData,
+    sync::{Arc, OnceLock},
+};
 
 use crossbeam::channel;
 
@@ -67,169 +71,365 @@ impl fmt::Display for PassId {
     }
 }
 
+/// Three-way result for a lazy IR query.
+///
+/// - `Present(V)`: the value is available.
+/// - `Absent`:     the index is not yet populated; demand will resolve it.
+/// - `Fault(F)`:   a permanent domain error; demand cannot resolve it.
+pub enum LazyResult<V, F> {
+    Present(V),
+    Absent,
+    Fault(F),
+}
+
+impl<V, F> LazyResult<V, F> {
+    pub fn is_present(&self) -> bool {
+        matches!(self, Self::Present(_))
+    }
+
+    pub fn ok(self) -> Option<V> {
+        match self {
+            Self::Present(v) => Some(v),
+            _ => None,
+        }
+    }
+}
+
 pub trait IR {
     type Ix;
     type Value;
-    type Error;
+    /// Only permanent domain errors. Absence is expressed via `LazyResult::Absent`.
+    type Fault;
 
-    fn query(&self, index: Self::Ix) -> Result<Self::Value, Self::Error>;
+    fn query(&self, index: Self::Ix) -> LazyResult<Self::Value, Self::Fault>;
 
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Error>
+    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
     where
         Self: Sized;
 }
 
-pub trait Pass<U: IR, D: IR> {
-    type Error;
-
-    fn transform(
-        &mut self,
-        upstream: &U,
-        downstream: &D,
-        txn: Transaction<U>,
-    ) -> Result<Transaction<D>, Self::Error>;
+#[derive(Debug)]
+pub enum ObserveError<F> {
+    /// Channel not yet wired; may resolve soon.
+    NotReady,
+    /// Pipeline is dead; transient at the channel level.
+    Disconnected,
+    /// The queried index is not yet populated; demand can resolve it.
+    Absent,
+    /// Permanent domain fault; demand cannot resolve this.
+    Fault(F),
+    /// Demand was attempted but the pass gave up permanently.
+    Exhausted,
 }
 
-struct QueryMsg<Repr: IR> {
-    index: Repr::Ix,
-    reply: channel::Sender<Result<Repr::Value, Repr::Error>>,
+impl<F> ObserveError<F> {
+    /// Returns `true` for all conditions that may resolve with more upstream
+    /// data or a future transaction — i.e. the three transient states.
+    pub fn is_resolvable(&self) -> bool {
+        matches!(self, Self::NotReady | Self::Disconnected | Self::Absent)
+    }
+}
+
+pub trait Pass<U: IR, D: IR> {
+    /// Called when upstream emits a transaction. Return the corresponding
+    /// downstream commands (may be empty).
+    fn push(
+        &mut self,
+        upstream: &LayerObserver<U>,
+        downstream: &D,
+        txn: &[Command<U>],
+    ) -> Vec<Command<D>>;
+
+    /// Called when `index` is queried but not yet present in downstream.
+    /// Return `PullOutcome::Ready(cmds)` to populate it,
+    /// `PullOutcome::Pending` if upstream data isn't available yet (will
+    /// retry after the next push), or `PullOutcome::Dead` if the index
+    /// can never be resolved.
+    fn pull(&mut self, upstream: &LayerObserver<U>, downstream: &D, index: D::Ix)
+    -> PullOutcome<D>;
+}
+
+pub enum PullOutcome<Repr: IR> {
+    /// Commands that will populate the requested index.
+    Ready(Vec<Command<Repr>>),
+    /// Upstream data isn't available yet; retry after the next push.
+    Pending,
+    /// This index can never be resolved by this pass.
+    Dead,
+}
+
+pub(crate) struct QueryMsg<Repr: IR> {
+    pub(crate) index: Repr::Ix,
+    pub(crate) strict: bool,
+    pub(crate) reply: channel::Sender<Result<Repr::Value, ObserveError<Repr::Fault>>>,
 }
 
 pub struct QueryHandle<Repr: IR> {
-    sender: channel::Sender<QueryMsg<Repr>>,
+    query_sender: channel::Sender<QueryMsg<Repr>>,
 }
 
 impl<Repr: IR> Clone for QueryHandle<Repr> {
     fn clone(&self) -> Self {
         Self {
-            sender: self.sender.clone(),
+            query_sender: self.query_sender.clone(),
         }
     }
 }
 
 impl<Repr: IR> QueryHandle<Repr> {
-    pub fn query(&self, index: Repr::Ix) -> Option<Result<Repr::Value, Repr::Error>> {
+    pub(crate) fn from_sender(query_sender: channel::Sender<QueryMsg<Repr>>) -> Self {
+        Self { query_sender }
+    }
+
+    fn query_with_mode(
+        &self,
+        index: Repr::Ix,
+        strict: bool,
+    ) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
         let (reply_tx, reply_rx) = channel::bounded(1);
-        self.sender
+        self.query_sender
             .send(QueryMsg {
                 index,
+                strict,
                 reply: reply_tx,
             })
-            .ok()?;
-        reply_rx.recv().ok()
+            .map_err(|_| ObserveError::Disconnected)?;
+        reply_rx.recv().map_err(|_| ObserveError::Disconnected)?
+    }
+
+    pub fn query(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+        self.query_with_mode(index, false)
+    }
+
+    pub fn query_strict(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+        self.query_with_mode(index, true)
+    }
+}
+
+#[derive(Clone)]
+pub struct LayerObserver<Repr: IR> {
+    pub updates: channel::Receiver<(u64, Transaction<Repr>)>,
+    handle: Arc<OnceLock<QueryHandle<Repr>>>,
+}
+
+impl<Repr: IR> LayerObserver<Repr> {
+    pub fn recv_update(&self) -> Option<(u64, Transaction<Repr>)> {
+        self.updates.recv().ok()
+    }
+
+    pub fn recv(&self) -> Option<Transaction<Repr>> {
+        self.recv_update().map(|(_, txn)| txn)
+    }
+
+    pub fn try_recv_update(&self) -> Option<(u64, Transaction<Repr>)> {
+        self.updates.try_recv().ok()
+    }
+
+    pub fn try_recv(&self) -> Option<Transaction<Repr>> {
+        self.try_recv_update().map(|(_, txn)| txn)
+    }
+
+    pub fn query(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+        self.handle
+            .get()
+            .map_or(Err(ObserveError::NotReady), |h| h.query(index))
+    }
+
+    pub fn query_strict(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+        self.handle
+            .get()
+            .map_or(Err(ObserveError::NotReady), |h| h.query_strict(index))
+    }
+
+    pub(crate) fn new(
+        updates: channel::Receiver<(u64, Transaction<Repr>)>,
+        handle: Arc<OnceLock<QueryHandle<Repr>>>,
+    ) -> Self {
+        Self { updates, handle }
+    }
+
+    pub(crate) fn from_handle(handle: QueryHandle<Repr>) -> Self {
+        let (updates_tx, updates) = channel::unbounded();
+        drop(updates_tx);
+        let lock = Arc::new(OnceLock::new());
+        let _ = lock.set(handle);
+        Self {
+            updates,
+            handle: lock,
+        }
+    }
+}
+
+fn resolve_query<U, P, D>(
+    pass: &mut P,
+    upstream: &LayerObserver<U>,
+    downstream: &mut D,
+    demanded: &mut Vec<D::Ix>,
+    index: D::Ix,
+    strict: bool,
+) -> Result<D::Value, ObserveError<D::Fault>>
+where
+    U: IR,
+    D: IR,
+    P: Pass<U, D>,
+    D::Ix: Clone + PartialEq,
+{
+    let remember = |demanded: &mut Vec<D::Ix>, index: &D::Ix| {
+        if !demanded.iter().any(|existing| existing == index) {
+            demanded.push(index.clone());
+        }
+    };
+
+    match downstream.query(index.clone()) {
+        LazyResult::Present(value) => {
+            if !strict {
+                remember(demanded, &index);
+            }
+            Ok(value)
+        }
+        LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+        LazyResult::Absent if strict => Err(ObserveError::Absent),
+        LazyResult::Absent => {
+            let needs_upstream = match pass.pull(upstream, downstream, index.clone()) {
+                PullOutcome::Dead => return Err(ObserveError::Exhausted),
+                PullOutcome::Ready(txn) => {
+                    if !txn.is_empty() {
+                        downstream
+                            .apply_transaction(std::sync::Arc::new(txn))
+                            .map_err(ObserveError::Fault)?;
+                    }
+                    false
+                }
+                PullOutcome::Pending => true,
+            };
+
+            match downstream.query(index.clone()) {
+                LazyResult::Present(value) => {
+                    remember(demanded, &index);
+                    Ok(value)
+                }
+                LazyResult::Absent => {
+                    if needs_upstream {
+                        remember(demanded, &index);
+                    }
+                    Err(ObserveError::Absent)
+                }
+                LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+            }
+        }
     }
 }
 
 /// Concurrent wrapper for one pipeline stage.
 ///
-/// Both the upstream IR and the downstream IR live in the **same** worker
-/// thread, so `Pass::transform` can receive `&D` (the current downstream
-/// state) with no cloning and no unsafe code.
+/// The stage owns the downstream IR and reaches upstream through a
+/// [`LayerObserver`]. Transactions still flow top-to-bottom, while demand-aware
+/// queries resolve missing state by re-entering the same pass contract.
 pub struct Pipeline<U, P, D>
 where
-    U: IR + 'static,
+    U: IR + Send + 'static,
     U::Ix: Send + Sync,
     U::Value: Send + Sync,
-    U::Error: Send,
-    D: IR + Send + 'static,
-    D::Ix: Send + Sync,
+    U::Fault: Send,
+    D: IR + Send + Clone + 'static,
+    D::Ix: Send + Sync + PartialEq,
     D::Value: Send + Sync,
-    D::Error: Send,
+    D::Fault: Send,
     P: Pass<U, D> + 'static,
-    P::Error: Send,
 {
     handle: JoinHandle<()>,
     sender: channel::Sender<Transaction<U>>,
-    upstream_query_sender: channel::Sender<QueryMsg<U>>,
-    downstream_query_sender: channel::Sender<QueryMsg<D>>,
+    query_sender: channel::Sender<QueryMsg<D>>,
     _pass: PhantomData<P>,
 }
 
 impl<U, P, D> Pipeline<U, P, D>
 where
-    U: IR + 'static,
+    U: IR + Send + 'static,
     U::Ix: Clone + Send + Sync,
     U::Value: Clone + Send + Sync,
-    U::Error: Send,
-    D: IR + Send + 'static,
-    D::Ix: Clone + Send + Sync,
+    U::Fault: Send,
+    D: IR + Send + Clone + 'static,
+    D::Ix: Clone + PartialEq + Send + Sync,
     D::Value: Clone + Send + Sync,
-    D::Error: Send,
+    D::Fault: Send,
     P: Pass<U, D> + 'static,
-    P::Error: Send,
 {
-    pub fn connect(upstream: U, pass: P, downstream: D) -> Self
-    where
-        U: Send,
-        P: Send,
-    {
-        Self::connect_with(move || upstream, move || pass, downstream)
-    }
-
-    pub fn connect_with<UF, PF>(make_upstream: UF, make_pass: PF, downstream: D) -> Self
-    where
-        UF: FnOnce() -> U + Send + 'static,
-        PF: FnOnce() -> P + Send + 'static,
-    {
-        Self::connect_with_tap(make_upstream, make_pass, downstream, None)
-    }
-
-    pub fn connect_with_tap<UF, PF>(
-        make_upstream: UF,
+    pub fn connect_with_tap<PF>(
+        upstream: LayerObserver<U>,
         make_pass: PF,
         downstream: D,
         tap_sender: Option<channel::Sender<Transaction<D>>>,
     ) -> Self
     where
-        UF: FnOnce() -> U + Send + 'static,
         PF: FnOnce() -> P + Send + 'static,
+        P: Send,
     {
         let (sender, receiver) = channel::unbounded::<Transaction<U>>();
-        let (upstream_query_sender, upstream_query_rx) = channel::unbounded::<QueryMsg<U>>();
-        let (downstream_query_sender, downstream_query_rx) = channel::unbounded::<QueryMsg<D>>();
+        let (query_sender, query_rx) = channel::unbounded::<QueryMsg<D>>();
 
         let handle = thread::spawn(move || {
-            let mut upstream = make_upstream();
             let mut pass = make_pass();
             let mut downstream = downstream;
+            let mut demanded: Vec<D::Ix> = Vec::new();
             loop {
                 crossbeam::select! {
                     recv(receiver) -> msg => match msg {
                         Ok(txn) => {
-                            let for_pass = std::sync::Arc::clone(&txn);
-
-                            if upstream.apply_transaction(txn).is_err() {
-                                continue;
-                            }
-
-                            if let Ok(downstream_txn) = pass.transform(&upstream, &downstream, for_pass) {
-                                let for_tap = std::sync::Arc::clone(&downstream_txn);
-                                if downstream.apply_transaction(downstream_txn).is_ok() {
-                                    if let Some(tap) = &tap_sender {
-                                        let _ = tap.send(for_tap);
-                                    }
+                            let mut combined: Vec<Command<D>> = Vec::new();
+                            {
+                                let downstream_txn = pass.push(
+                                    &upstream,
+                                    &downstream,
+                                    txn.as_ref(),
+                                );
+                                if downstream
+                                    .apply_transaction(std::sync::Arc::new(downstream_txn.clone()))
+                                    .is_ok()
+                                {
+                                    combined.extend(downstream_txn);
                                 }
                             }
-                        }
-                        Err(_) => {
-                            for msg in upstream_query_rx.try_iter() {
-                                let _ = msg.reply.send(upstream.query(msg.index));
+
+                            let mut retained = Vec::with_capacity(demanded.len());
+                            for index in demanded.drain(..) {
+                                if downstream.query(index.clone()).is_present() {
+                                    retained.push(index);
+                                    continue;
+                                }
+
+                                let should_retain = match pass.pull(
+                                    &upstream,
+                                    &downstream,
+                                    index.clone(),
+                                ) {
+                                    PullOutcome::Ready(refresh_txn) => {
+                                        if downstream
+                                            .apply_transaction(std::sync::Arc::new(refresh_txn.clone()))
+                                            .is_ok()
+                                        {
+                                            combined.extend(refresh_txn);
+                                        }
+                                        true
+                                    }
+                                    PullOutcome::Pending => true,
+                                    PullOutcome::Dead => false,
+                                };
+                                if should_retain {
+                                    retained.push(index);
+                                }
                             }
-                            for msg in downstream_query_rx.try_iter() {
-                                let _ = msg.reply.send(downstream.query(msg.index));
+                            demanded = retained;
+
+                            if let Some(tap) = &tap_sender {
+                                let _ = tap.send(std::sync::Arc::new(combined));
                             }
-                            break;
                         }
+                        Err(_) => break,
                     },
-                    recv(upstream_query_rx) -> msg => match msg {
-                        Ok(QueryMsg { index, reply }) => {
-                            let _ = reply.send(upstream.query(index));
-                        }
-                        Err(_) => {}
-                    },
-                    recv(downstream_query_rx) -> msg => match msg {
-                        Ok(QueryMsg { index, reply }) => {
-                            let _ = reply.send(downstream.query(index));
+                    recv(query_rx) -> msg => match msg {
+                        Ok(QueryMsg { index, strict, reply }) => {
+                            let _ = reply.send(resolve_query(&mut pass, &upstream, &mut downstream, &mut demanded, index, strict));
                         }
                         Err(_) => {}
                     },
@@ -240,8 +440,7 @@ where
         Pipeline {
             handle,
             sender,
-            upstream_query_sender,
-            downstream_query_sender,
+            query_sender,
             _pass: PhantomData,
         }
     }
@@ -254,20 +453,10 @@ where
         self.sender.clone()
     }
 
-    pub fn upstream_query_handle(&self) -> QueryHandle<U> {
-        QueryHandle {
-            sender: self.upstream_query_sender.clone(),
-        }
-    }
-
     pub fn downstream_query_handle(&self) -> QueryHandle<D> {
         QueryHandle {
-            sender: self.downstream_query_sender.clone(),
+            query_sender: self.query_sender.clone(),
         }
-    }
-
-    pub fn query_upstream(&self, index: U::Ix) -> Option<Result<U::Value, U::Error>> {
-        self.upstream_query_handle().query(index)
     }
 
     pub fn shutdown(self) {

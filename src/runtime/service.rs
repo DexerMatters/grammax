@@ -11,7 +11,7 @@ use crate::{
 };
 
 use super::{
-    compiler::{ComposedCompiler, TypedTree},
+    compiler::{ComposedCompiler, SourceResolveHook, TypedTree},
     dispatcher::GlobalEventDispatcher,
     protocol::RuntimeEvent,
 };
@@ -29,10 +29,15 @@ where
     pub(crate) fn new<F>(grammar: &'static Grammar, f: F) -> Self
     where
         Impl: Interface<Tree>,
-        F: FnOnce(Option<channel::Sender<RuntimeEvent>>) -> ComposedCompiler<Tree> + Send + 'static,
+        F: FnOnce(
+                Option<channel::Sender<RuntimeEvent>>,
+                SourceResolveHook,
+            ) -> ComposedCompiler<Tree>
+            + Send
+            + 'static,
     {
         let (evt_tx, evt_rx) = channel::unbounded::<RuntimeEvent>();
-        let compiler = f(Some(evt_tx));
+        let compiler = f(Some(evt_tx), Impl::resolve_source);
         let ged = GlobalEventDispatcher::start(compiler, evt_rx);
         let api = Impl::new(ged, grammar);
         Self {

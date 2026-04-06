@@ -28,6 +28,7 @@ use crate::{
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
+pub(crate) type SourceResolveHook = fn(scheme::DocumentSpan) -> scheme::ResolveOutcome<SourceText>;
 type QueryFn = Arc<dyn Fn(utils::Payload) -> RuntimeWireResult<utils::Payload> + Send + Sync>;
 type SubmitTopFn = Arc<dyn Fn(RevisionId, SourceTxn) -> RuntimeResult<()> + Send + Sync>;
 type ShutdownHook = Box<dyn FnOnce() + Send>;
@@ -280,8 +281,8 @@ impl<
     where
         I: Interface<Tree>,
     {
-        RuntimeService::<Tree, I>::new(grammar, move |evt_tx| {
-            ComposedCompiler::from_tree_with_events(self.0, evt_tx)
+        RuntimeService::<Tree, I>::new(grammar, move |evt_tx, source_resolve| {
+            ComposedCompiler::from_tree_with_events(self.0, evt_tx, source_resolve)
         })
     }
 }
@@ -812,6 +813,7 @@ where
 fn start_source_root(
     input_rx: channel::Receiver<(RevisionId, SourceTxn)>,
     seed: SourceText,
+    source_resolve: SourceResolveHook,
     listeners: SharedListeners<SourceText>,
     event_sender: SharedEventSender,
     layer_path: RuntimePath,
@@ -866,7 +868,17 @@ fn start_source_root(
                             LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
                             LazyResult::Absent if strict => Err(ObserveError::Absent),
                             LazyResult::Absent => {
-                                match source.resolve(index.clone()) {
+                                let resolution = match source.resolve(index.clone()) {
+                                    scheme::ResolveOutcome::Done(txn) => scheme::ResolveOutcome::Done(txn),
+                                    scheme::ResolveOutcome::Blocked => {
+                                        match source_resolve(index.clone()) {
+                                            scheme::ResolveOutcome::Done(txn) => scheme::ResolveOutcome::Done(txn),
+                                            scheme::ResolveOutcome::Blocked | scheme::ResolveOutcome::Impossible => scheme::ResolveOutcome::Blocked,
+                                        }
+                                    }
+                                    scheme::ResolveOutcome::Impossible => source_resolve(index.clone()),
+                                };
+                                match resolution {
                                     scheme::ResolveOutcome::Done(txn) => {
                                         let _ = source.apply_transaction(Arc::clone(&txn));
                                         for (tx, _) in &clone_listeners(&listeners) {
@@ -881,7 +893,7 @@ fn start_source_root(
                                             &txn,
                                         );
                                         let _ = output_tx.send((u64::MAX, txn));
-                                        match source.query(index) {
+                                        match source.query(index.clone()) {
                                             LazyResult::Present(v) => Ok(v),
                                             LazyResult::Absent => Err(ObserveError::Absent),
                                             LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
@@ -973,6 +985,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
     fn from_tree_with_events(
         spec: Tree,
         event_sender: Option<channel::Sender<RuntimeEvent>>,
+        source_resolve: SourceResolveHook,
     ) -> Self
     where
         Tree: InstallTree + ListenerTree + SeededTree + TypedTree<Current = SourceText> + 'static,
@@ -1006,6 +1019,7 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
         let (root_output_rx, root_query, root_shutdown) = start_source_root(
             input_rx,
             spec.seed(),
+            source_resolve,
             spec.listeners(),
             Arc::clone(&core.event_sender),
             layer_path.clone(),

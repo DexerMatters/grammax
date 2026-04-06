@@ -1,4 +1,5 @@
 use rouille::url::Url;
+use std::sync::Arc;
 use tower_lsp::lsp_types::{DidChangeTextDocumentParams, DidOpenTextDocumentParams};
 use tower_lsp::{LanguageServer, lsp_types};
 
@@ -7,12 +8,39 @@ use crate::runtime::{
     self,
     compiler::{ContainsPath, Here, TypedTree},
 };
-use crate::scheme::{self, Range, SourceText, Span, URI};
+use crate::scheme::{self, Command, DocumentSpan, Range, ResolveOutcome, SourceText, Span, URI};
 
 pub trait LspInterface<Tree: TypedTree>: LanguageServer + Interface<Tree>
 where
     Tree: ContainsPath<Here, Target = SourceText>,
 {
+    fn resolve_missing_uri(index: DocumentSpan) -> ResolveOutcome<SourceText>
+    where
+        Self: Sized,
+    {
+        if index.uri.scheme.as_ref().as_str() != "file" {
+            return ResolveOutcome::Impossible;
+        }
+
+        let path = index.uri.path.as_ref().as_str();
+        match std::fs::read_to_string(path) {
+            Ok(text) => ResolveOutcome::Done(Arc::new(vec![
+                Command::Create {
+                    id: 0,
+                    value: text.into(),
+                },
+                Command::Insert {
+                    index: DocumentSpan {
+                        uri: index.uri,
+                        span: Span::new(0, 0),
+                    },
+                    id: 0,
+                },
+            ])),
+            Err(_) => ResolveOutcome::Impossible,
+        }
+    }
+
     fn open_document(&self, params: &DidOpenTextDocumentParams) -> LayerResult<Tree, Here, ()>
     where
         Self: Sized,

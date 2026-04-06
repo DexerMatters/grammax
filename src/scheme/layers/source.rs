@@ -2,9 +2,7 @@ use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
-use crate::scheme::{
-    Command, DocumentSpan, IR, LazyResult, ResolveOutcome, Span, Transaction, URI,
-};
+use crate::scheme::{Command, DocumentSpan, IR, LazyResult, Span, Transaction, URI};
 
 pub type SourceAtom = internment::Intern<String>;
 
@@ -361,30 +359,4 @@ impl IR for SourceText {
         }
         Ok(())
     }
-
-    fn resolve(&mut self, index: DocumentSpan) -> ResolveOutcome<Self> {
-        if index.uri.scheme.as_ref().as_str() != "file" {
-            return ResolveOutcome::Impossible;
-        }
-        let path = index.uri.path.as_ref().as_str();
-        match std::fs::read_to_string(path) {
-            Ok(text) => ResolveOutcome::Done(source_replace_txn(index.uri, text)),
-            Err(_) => ResolveOutcome::Impossible,
-        }
-    }
-}
-
-fn source_replace_txn(uri: URI, text: String) -> Transaction<SourceText> {
-    let staged_text: SourceAtom = text.into();
-    let index = DocumentSpan {
-        uri,
-        span: Span::new(0, 0),
-    };
-    std::sync::Arc::new(vec![
-        Command::Create {
-            id: 0,
-            value: staged_text,
-        },
-        Command::Insert { index, id: 0 },
-    ])
 }

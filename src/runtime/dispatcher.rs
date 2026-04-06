@@ -373,8 +373,15 @@ fn reduce_event<Tree: TypedTree>(
     }];
 
     if advances {
-        state.settled_revision = state.settled_revision.max(revision);
-        effects.push(GedEffect::FlushReadyQueries);
+        // u64::MAX is the sentinel for internally-triggered lazy-load
+        // transactions (see start_source_root). They must not advance
+        // settled_revision, otherwise all parked revision-based queries
+        // would fire immediately before the pipeline has processed the
+        // subsequent real user edits.
+        if revision != u64::MAX {
+            state.settled_revision = state.settled_revision.max(revision);
+            effects.push(GedEffect::FlushReadyQueries);
+        }
     }
 
     effects

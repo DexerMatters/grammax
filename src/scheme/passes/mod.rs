@@ -8,7 +8,7 @@ pub(crate) mod strategy;
 pub use lowering::{AstMapAction, AstMapCtx, AstMapIntent, AstMapper, AstNode, IncrementalLowerer};
 pub use parsing::ParserPass;
 
-use crate::scheme::{Command, PullOutcome, IR, LayerObserver, Pass};
+use crate::scheme::{Command, IR, LayerObserver, Pass};
 
 pub struct Identity;
 
@@ -25,14 +25,5 @@ where
         txn: &[Command<U>],
     ) -> Vec<Command<U>> {
         txn.iter().map(Command::clone_fields).collect()
-    }
-
-    fn pull(
-        &mut self,
-        _upstream: &LayerObserver<U>,
-        _downstream: &U,
-        _index: U::Ix,
-    ) -> PullOutcome<U> {
-        PullOutcome::Pending
     }
 }

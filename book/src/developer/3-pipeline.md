@@ -1,41 +1,36 @@
 # Pipeline
 
-Grammax executes each stage of a compiler as a concurrent pipeline node. Each node owns one downstream layer, receives upstream transactions, applies its pass, and serves queries against its current state.
+Grammax runs each stage of a compiler as a concurrent pipeline node. Each node owns one downstream layer, receives upstream transactions, applies its pass, and answers queries against its current state.
 
-That concurrency is intentionally hidden behind typed builders and observers. As a developer, you compose a tree, store or move the observers you care about, and then hand the final tree to the runtime.
+You do not have to manage that concurrency manually. The builder API and the observer API hide most of it behind ordinary Rust types.
 
 ## Building a Linear Pipeline
 
-The public builder is `Build::new()`. It starts from a root `SourceText` layer and extends the tree one stage at a time.
+The public entry point is `Build::new()`. It starts with a root `SourceText` layer.
 
-The API is continuation-based, but the most useful way to *think* about it is monadic: each composition step takes the current typed tree, attaches one more stage, and passes the enriched tree to the next step.
-
-In other words, `then(...)` behaves like a typed bind:
-
-- it consumes the current builder;
-- it produces a larger builder;
-- it also yields the observer for the newly created layer;
-- the continuation decides what to do next with that enriched context.
-
-The surface syntax is Rust closures, but the semantic model is close to a monadic pipeline construction where every step receives the accumulated structure and continues from there.
-
-The core shape is:
+You extend the pipeline one stage at a time with `then(...)`:
 
 ```rust
 Build::new().then(pass, seed, |build, observer| {
-    // `build` is the extended tree
-    // `observer` watches the newly added downstream layer
+    // `build` is the larger pipeline
+    // `observer` watches the new downstream layer
 })
 ```
 
-This shape is deliberate. Every time you add a stage, Grammax gives you two things immediately:
+Each `then(...)` call does two things at once:
 
-- the new typed builder;
-- a `LayerObserver` for the layer you just created.
+- add one new downstream layer;
+- give you a `LayerObserver` for that new layer.
 
-That means observation is part of composition, not an afterthought. In monadic terms, the observer is extra context returned together with the new pipeline state.
+So the normal way to read the builder is simply:
 
-For example:
+1. add a stage;
+2. optionally keep its observer;
+3. continue building from there.
+
+If you know monadic APIs, `then(...)` behaves like a typed bind. If you do not, just read it as “attach one more stage and continue.”
+
+Example:
 
 ```text
 SourceText
@@ -48,33 +43,29 @@ SourceText
 ```
 
 ```rust
-pipeline = Build::new()
+let pipeline = Build::new()
     .then(P1, A, |pipeline, a| {
-        // Observer `a` is introduced at the same step that creates `A`.
         pipeline.then(P2, B, |pipeline, b| {
-            // The next step can use both the accumulated pipeline and observer `b`.
             pipeline.then(P3, C, |pipeline, c| {
-                // At this point `a`, `b`, and `c` can be stored, moved into tasks,
-                // or passed into the runtime setup.
+                let _ = a;
+                let _ = b;
+                let _ = c;
                 pipeline
             })
         })
-    })
+    });
 ```
 
-Here `P1`, `P2`, and `P3` are passes, while `A`, `B`, and `C` are the downstream layers they create.
+Read that example from top to bottom:
 
-Read it as a sequence of dependent steps:
+1. start from `SourceText`;
+2. attach `P1` to create layer `A`;
+3. attach `P2` to create layer `B`;
+4. attach `P3` to create layer `C`;
+5. keep any observers you care about;
+6. return the final typed tree.
 
-1. start from the source layer;
-2. bind `P1` to create layer `A` and obtain observer `a`;
-3. bind `P2` to create layer `B` and obtain observer `b`;
-4. bind `P3` to create layer `C` and obtain observer `c`;
-5. return the final pipeline.
-
-The important part is that each step can see what earlier steps produced. You do not separately build a tree and later rediscover its handles. The handles are introduced exactly where the stage is introduced.
-
-A typical frontend pipeline looks like this:
+A typical frontend looks like this:
 
 ```rust
 Build::new().then(ParserPass::new(grammar), ParseTreeIR::default(), |build, cst_observer| {
@@ -90,23 +81,21 @@ Build::new().then(ParserPass::new(grammar), ParseTreeIR::default(), |build, cst_
 })
 ```
 
-The resulting tree is still rooted at `SourceText`, but now contains two derived layers beneath it.
+That pipeline is still rooted at `SourceText`, but it now has CST and AST layers beneath it.
 
 ## Branching a Pipeline
 
-The branching API is `fanout(...)`.
+Use `fanout(...)` when one layer should feed two independent branches.
 
-Conceptually, `fanout(...)` duplicates the current layer into two independent builder continuations. Each continuation describes a complete branch starting from the same upstream state.
+Conceptually, `fanout(...)` duplicates the current layer into two builder continuations. Each branch can then grow on its own.
 
-In that sense, a branched pipeline is still built monadically, but the bound value is copied into two branch-local continuations instead of being threaded into just one.
-
-The exact generic type becomes large quickly, which is normal. The important part is conceptual:
+The important rules are:
 
 - each branch is typed independently;
-- each branch receives its own observer;
-- path types such as `Down<P>` and `Another<P>` describe how runtime code reaches those branches later.
+- each branch gets its own observers;
+- later runtime code reaches branches through path types such as `Down<P>` and `Another<P>`.
 
-For example:
+Example:
 
 ```text
 SourceText
@@ -121,48 +110,43 @@ SourceText
 ```
 
 ```rust
-pipeline = Build::new()
+let pipeline = Build::new()
     .then(P1, A, |pipeline, a| {
         pipeline.fanout(
-            |left_branch| {
-                left_branch.then(P2, B, |left_branch, b| {
-                // This continuation can only extend the left branch.
-                    left_branch.then(P4, D, |left_branch, d| {
-                        // `a`, `b`, and `d` are available on the left path.
-                        left_branch
+            |left| {
+                left.then(P2, B, |left, b| {
+                    left.then(P4, D, |left, d| {
+                        let _ = a;
+                        let _ = b;
+                        let _ = d;
+                        left
                     })
                 })
             },
-            |right_branch| {
-                right_branch.then(P3, C, |right_branch, c| {
-                    // The right branch receives `c` and cannot accidentally extend the left side.
-                    right_branch
+            |right| {
+                right.then(P3, C, |right, c| {
+                    let _ = c;
+                    right
                 })
             },
         )
-    })
+    });
 ```
 
-This should be read as:
-
-1. build the common prefix once with `P1` producing `A`;
-2. split that prefix into two typed branches with `fanout(...)`;
-3. build the left branch as `P2 -> B -> P4 -> D`;
-4. build the right branch as `P3 -> C`;
-5. store or route the observers that matter to your interface or tooling.
-
-The builder API may look unusual at first, but this is exactly why it scales: each closure receives only the branch it is allowed to extend, so impossible compositions become unrepresentable.
+The key benefit is safety: each closure only receives the branch it is allowed to extend.
 
 ## Layer Observation
 
-`LayerObserver<Repr>` is the public handle for a live layer in a built tree. You usually obtain it from the builder continuation and move it into whichever task needs to watch that layer.
+`LayerObserver<Repr>` is the public handle for a live layer.
+
+You usually get it during pipeline construction and move it into whichever task needs it.
 
 An observer does two jobs:
 
 - receive transactions emitted by the layer;
 - query the current state of the layer.
 
-Printing every CST transaction is straightforward:
+Example: printing every CST transaction.
 
 ```rust
 std::thread::spawn(move || {
@@ -175,11 +159,11 @@ std::thread::spawn(move || {
 });
 ```
 
-If you do not care about revisions, `recv()` and `try_recv()` strip the revision number and return only the transaction.
+If the revision number does not matter, `recv()` and `try_recv()` return only the transaction.
 
 ## Querying Through an Observer
 
-Observers can also query their layer directly:
+Observers can also query the current state directly:
 
 ```rust
 let result = cst_observer.query(ParseTreeQuery::Path(DocumentNodePath::root(uri)));
@@ -196,22 +180,31 @@ match result {
 }
 ```
 
-Two query modes are available:
+There are two query modes:
 
-- `query(index)` performs normal lazy resolution. If the layer reports `Absent`, the pipeline may call `pull()` on the pass and retry.
-- `query_strict(index)` skips that extra demand step and reports `ObserveError::Absent` immediately when the entry is missing.
+- `query(index)` performs normal lazy demand.
+- `query_strict(index)` skips that extra demand step and returns `ObserveError::Absent` immediately if the entry is missing.
 
-This is the practical meaning of lazy resources in Grammax: the observer asks for a value, the layer answers if it already has it, and the pass gets exactly one chance to materialize it on demand.
+Normal lazy demand works like this:
+
+1. the layer sees `Absent`;
+2. the pipeline asks the index for its upstream dependency through `Demand<U>`;
+3. the upstream query runs synchronously;
+4. if needed, the root layer calls `resolve()`;
+5. the resulting transaction flows back down through normal `push()` calls;
+6. the original reply is completed when the requested value finally appears.
+
+So the observer API still feels simple even though the pipeline may be doing multi-layer lazy propagation behind the scenes.
 
 ## Path Types in Runtime Code
 
-When a tree is later wrapped by the runtime, paths are described with the same type-level vocabulary used by `ContainsPath`:
+When a tree is wrapped by the runtime, paths are described with the same type-level vocabulary used by `ContainsPath`:
 
-- `Here` means the current layer;
-- `Down<P>` means descend into the left child and continue with `P`;
-- `Another<P>` means descend into the right child and continue with `P`.
+- `Here` means the current layer.
+- `Down<P>` means go into the left child, then continue with `P`.
+- `Another<P>` means go into the right child, then continue with `P`.
 
-For a linear pipeline `SourceText -> ParseTreeIR -> AstArena`, the useful paths are:
+For a linear pipeline `SourceText -> ParseTreeIR -> AstArena`, the common paths are:
 
 - `Here` for `SourceText`;
 - `Down<Here>` for `ParseTreeIR`;
@@ -219,6 +212,6 @@ For a linear pipeline `SourceText -> ParseTreeIR -> AstArena`, the useful paths 
 
 For a forked tree, `Another<P>` addresses the right branch.
 
-These paths are more than documentation. They are the static proof that a runtime interface is querying a layer that actually exists.
+These path types are not just documentation. They are the static proof that the layer you want to query really exists in that tree.
 
 

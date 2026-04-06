@@ -593,25 +593,32 @@ impl Parser {
             return None;
         }
 
+        let mut start = pos;
+        while start > 0 && !self.text.is_char_boundary(start) {
+            start -= 1;
+        }
+        let mut end = pos + expected_width;
+        while end < self.text.len() && !self.text.is_char_boundary(end) {
+            end += 1;
+        }
+        let expected_width = end.saturating_sub(start);
+
         self.messages.clear();
         self.recovery_cache.clear();
 
-        let cache_key = self.build_parse_rule_cache_key(
-            rule_ix,
-            expected_width,
-            &self.text[pos..pos + expected_width],
-        );
-        if let Some(cached) = self.lookup_parse_rule_cache(&cache_key, pos, expected_width) {
+        let cache_key =
+            self.build_parse_rule_cache_key(rule_ix, expected_width, &self.text[start..end]);
+        if let Some(cached) = self.lookup_parse_rule_cache(&cache_key, start, expected_width) {
             return cached;
         }
 
         let old_pos = self.pos;
         let old_bracketed_scope_opened = self.bracketed_scope_opened;
 
-        self.pos = pos;
+        self.pos = start;
         self.bracketed_scope_opened = false;
 
-        let parse_end = pos + expected_width;
+        let parse_end = end;
         let analysis = self.analysis_for_rule(rule_ix);
         let mut state_stack = vec![analysis.start_state];
         let mut node_stack: Vec<StackEntry> = vec![];
@@ -630,7 +637,7 @@ impl Parser {
             let Some(action) = action else {
                 return self.finalize_parse_rule_failure(
                     cache_key,
-                    pos,
+                    start,
                     old_pos,
                     old_bracketed_scope_opened,
                     expected_width,
@@ -666,7 +673,7 @@ impl Parser {
                         ));
                         return self.finalize_parse_rule_failure(
                             cache_key,
-                            pos,
+                            start,
                             old_pos,
                             old_bracketed_scope_opened,
                             expected_width,
@@ -682,7 +689,7 @@ impl Parser {
         let Some(parsed_rule_green) = self.extract_rule_node(parsed_green, rule_ix) else {
             return self.finalize_parse_rule_failure(
                 cache_key,
-                pos,
+                start,
                 old_pos,
                 old_bracketed_scope_opened,
                 expected_width,
@@ -692,7 +699,7 @@ impl Parser {
         if width != expected_width || parsed_rule_width != expected_width {
             return self.finalize_parse_rule_failure(
                 cache_key,
-                pos,
+                start,
                 old_pos,
                 old_bracketed_scope_opened,
                 expected_width,
@@ -701,14 +708,14 @@ impl Parser {
         self.pos = old_pos;
         self.bracketed_scope_opened = old_bracketed_scope_opened;
         if self.messages.is_empty() {
-            self.prime_reuse_from_tree(parsed_rule_green, pos);
+            self.prime_reuse_from_tree(parsed_rule_green, start);
         } else {
             self.store_parse_rule_cache(
                 cache_key,
-                self.text[pos..pos + expected_width].to_string(),
+                self.text[start..end].to_string(),
                 Some(parsed_rule_green),
                 self.messages.clone(),
-                pos,
+                start,
             );
         }
         Some(parsed_rule_green)

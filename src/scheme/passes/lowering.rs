@@ -8,10 +8,10 @@ use crate::{
     grammar::Grammar,
     parsec::{msg::ParserMessages, view::NodeView},
     scheme::{
-        self, PullOutcome, LayerObserver, ObserveError, URI,
+        self, LayerObserver, ObserveError, URI,
         layers::{
-            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, DocumentNodePath,
-            ParseTreeIR, ParseTreeQuery, ParseTreeValue, ast::AstMapAny,
+            AstArena, AstCell, AstDelta, AstTxnBuilder, AstVec, DocumentNodePath, ParseTreeIR,
+            ParseTreeQuery, ParseTreeValue, ast::AstMapAny,
         },
     },
 };
@@ -709,36 +709,6 @@ impl scheme::Pass<ParseTreeIR, AstArena<AstMapAny>> for IncrementalLowerer {
             return Vec::new();
         }
         commands
-    }
-
-    fn pull(
-        &mut self,
-        upstream: &LayerObserver<ParseTreeIR>,
-        downstream: &AstArena<AstMapAny>,
-        path: DocumentNodePath,
-    ) -> PullOutcome<AstArena<AstMapAny>> {
-        let upstream = QueriedParseTree::new(upstream);
-        let uri = path.0;
-        let root = upstream.view(&DocumentNodePath::root(uri));
-        match upstream.take_failure() {
-            Some(false) => return PullOutcome::Dead,
-            Some(true) => return PullOutcome::Pending,
-            None => {}
-        }
-
-        if root.is_none() {
-            return PullOutcome::Pending;
-        }
-        let synthetic: Vec<CstCommand> = vec![scheme::Command::Insert {
-            index: ParseTreeQuery::Path(DocumentNodePath::root(uri)),
-            id: 0,
-        }];
-        let commands = self.apply_from_queries(&upstream, &uri, downstream, &synthetic);
-        match upstream.take_failure() {
-            Some(false) => PullOutcome::Dead,
-            Some(true) => PullOutcome::Pending,
-            None => PullOutcome::Ready(commands),
-        }
     }
 }
 

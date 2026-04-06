@@ -4,9 +4,9 @@ use crate::{
     grammar::Grammar,
     parsec::{Parser, ParserConfig},
     scheme::{
-        self, PullOutcome, DocumentSpan, LayerObserver, ObserveError, Span, URI,
+        self, DocumentSpan, LayerObserver, ObserveError, Span, URI,
         layers::{
-            ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText,
+            ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText,
             source::SourceFault,
         },
     },
@@ -88,24 +88,6 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
 
         full_parse_transaction(self, &uri, new_text)
     }
-
-    fn pull(
-        &mut self,
-        upstream: &LayerObserver<SourceText>,
-        _downstream: &ParseTreeIR,
-        index: ParseTreeQuery,
-    ) -> PullOutcome<ParseTreeIR> {
-        let Some(uri) = extract_uri_from_demand(&index) else {
-            return PullOutcome::Dead;
-        };
-        let new_text_atom = match full_source_text(upstream, &uri) {
-            Ok(atom) => atom,
-            Err(err) if err.is_resolvable() => return PullOutcome::Pending,
-            Err(_) => return PullOutcome::Dead,
-        };
-        let new_text = new_text_atom.as_ref().as_str();
-        PullOutcome::Ready(full_parse_transaction(self, &uri, new_text))
-    }
 }
 
 fn full_source_text(
@@ -116,14 +98,6 @@ fn full_source_text(
         uri: *uri,
         span: Span::new(0, usize::MAX),
     })
-}
-
-fn extract_uri_from_demand(index: &ParseTreeQuery) -> Option<URI> {
-    match index {
-        ParseTreeQuery::Path(path) => Some(path.0),
-        ParseTreeQuery::Message(uri) => Some(*uri),
-        ParseTreeQuery::Allocator => None,
-    }
 }
 
 fn full_parse_transaction(

@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fmt, fs,
+    fmt,
     marker::PhantomData,
     sync::{
         Arc, Mutex, OnceLock,
@@ -21,10 +21,8 @@ use crate::{
     interface::Interface,
     runtime::RuntimeService,
     scheme::{
-        self, IR, LayerObserver, LazyResult, ObserveError, Pipeline, QueryHandle, QueryMsg,
-        SourceAtom, Span, URI,
-        layers::{SourceText, source::SourceFault},
-        passes::Identity,
+        self, IR, LayerObserver, LazyResult, ObserveError, Pipeline, QueryHandle, QueryMsg, Span,
+        URI, layers::SourceText, passes::Identity,
     },
     utils::{self},
 };
@@ -539,8 +537,14 @@ where
     U::Fault: Send + Sync + fmt::Debug + 'static,
     Left: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
-    <Left::Current as IR>::Ix:
-        Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    <Left::Current as IR>::Ix: Clone
+        + PartialEq
+        + Send
+        + Sync
+        + Serialize
+        + DeserializeOwned
+        + scheme::Demand<U>
+        + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, Left::Current> + Send + 'static,
@@ -586,14 +590,26 @@ where
     U::Fault: Send + Sync + fmt::Debug + 'static,
     Left: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
-    <Left::Current as IR>::Ix:
-        Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    <Left::Current as IR>::Ix: Clone
+        + PartialEq
+        + Send
+        + Sync
+        + Serialize
+        + DeserializeOwned
+        + scheme::Demand<U>
+        + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     Right: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Right::Current: IR + Clone + Send + 'static,
-    <Right::Current as IR>::Ix:
-        Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    <Right::Current as IR>::Ix: Clone
+        + PartialEq
+        + Send
+        + Sync
+        + Serialize
+        + DeserializeOwned
+        + scheme::Demand<U>
+        + 'static,
     <Right::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Right::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     P1: scheme::Pass<U, Left::Current> + Send + 'static,
@@ -694,7 +710,14 @@ where
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
     D: IR + Clone + Send + 'static,
-    D::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    D::Ix: Clone
+        + PartialEq
+        + Send
+        + Sync
+        + Serialize
+        + DeserializeOwned
+        + scheme::Demand<U>
+        + 'static,
     D::Value: Clone + Send + Sync + 'static,
     D::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, D> + Send + 'static,
@@ -786,52 +809,6 @@ where
     (next_output_rx, downstream_query)
 }
 
-fn source_replace_txn(uri: URI, text: String) -> SourceTxn {
-    let staged_text: SourceAtom = text.into();
-    let index = scheme::DocumentSpan {
-        uri,
-        span: Span::new(0, 0),
-    };
-    Arc::new(vec![
-        scheme::Command::Create {
-            id: 0,
-            value: staged_text,
-        },
-        scheme::Command::Insert { index, id: 0 },
-    ])
-}
-
-fn load_source_from_uri(uri: URI) -> Result<SourceTxn, ObserveError<SourceFault>> {
-    if uri.scheme.as_ref().as_str() != "file" {
-        return Err(ObserveError::Exhausted);
-    }
-
-    let path = uri.path.as_ref().as_str();
-    let text = fs::read_to_string(path).map_err(|_err| ObserveError::Exhausted)?;
-    Ok(source_replace_txn(uri, text))
-}
-
-fn resolve_source_query(
-    source: &mut SourceText,
-    index: scheme::DocumentSpan,
-    strict: bool,
-) -> Result<scheme::SourceAtom, ObserveError<SourceFault>> {
-    match source.query(index.clone()) {
-        LazyResult::Present(value) => Ok(value),
-        LazyResult::Absent if !strict => {
-            let txn = load_source_from_uri(index.uri)?;
-            source.apply_transaction(txn).map_err(ObserveError::Fault)?;
-            match source.query(index) {
-                LazyResult::Present(value) => Ok(value),
-                LazyResult::Absent => Err(ObserveError::Absent),
-                LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
-            }
-        }
-        LazyResult::Absent => Err(ObserveError::Absent),
-        LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
-    }
-}
-
 fn start_source_root(
     input_rx: channel::Receiver<(RevisionId, SourceTxn)>,
     seed: SourceText,
@@ -884,7 +861,38 @@ fn start_source_root(
                 },
                 recv(query_rx) -> msg => match msg {
                     Ok(QueryMsg { index, strict, reply }) => {
-                        let _ = reply.send(resolve_source_query(&mut source, index, strict));
+                        let result = match source.query(index.clone()) {
+                            LazyResult::Present(value) => Ok(value),
+                            LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+                            LazyResult::Absent if strict => Err(ObserveError::Absent),
+                            LazyResult::Absent => {
+                                match source.resolve(index.clone()) {
+                                    scheme::ResolveOutcome::Done(txn) => {
+                                        let _ = source.apply_transaction(Arc::clone(&txn));
+                                        for (tx, _) in &clone_listeners(&listeners) {
+                                            let _ = tx.send((u64::MAX, Arc::clone(&txn)));
+                                        }
+                                        send_layer_event::<SourceText>(
+                                            &event_sender,
+                                            u64::MAX,
+                                            layer_path.clone(),
+                                            pass_path.clone(),
+                                            false,
+                                            &txn,
+                                        );
+                                        let _ = output_tx.send((u64::MAX, txn));
+                                        match source.query(index) {
+                                            LazyResult::Present(v) => Ok(v),
+                                            LazyResult::Absent => Err(ObserveError::Absent),
+                                            LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+                                        }
+                                    }
+                                    scheme::ResolveOutcome::Blocked => Err(ObserveError::Absent),
+                                    scheme::ResolveOutcome::Impossible => Err(ObserveError::Impossible),
+                                }
+                            }
+                        };
+                        let _ = reply.send(result);
                     }
                     Err(_) => {}
                 },
@@ -1062,7 +1070,7 @@ where
         ObserveError::Fault(f) => RuntimeError::InvalidRequestFromTarget {
             err: utils::Payload::new(f),
         },
-        ObserveError::Exhausted => RuntimeError::UndefinedBehavior {
+        ObserveError::Impossible => RuntimeError::UndefinedBehavior {
             message: "demand exhausted".to_string(),
         },
     })?;

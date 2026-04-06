@@ -2,7 +2,9 @@ use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
-use crate::scheme::{Command, DocumentSpan, IR, LazyResult, Span, Transaction, URI};
+use crate::scheme::{
+    Command, DocumentSpan, IR, LazyResult, ResolveOutcome, Span, Transaction, URI,
+};
 
 pub type SourceAtom = internment::Intern<String>;
 
@@ -130,8 +132,8 @@ impl GapBuf {
         let mut v = Vec::with_capacity(self.len());
         v.extend_from_slice(&self.buf[..self.gap_start]);
         v.extend_from_slice(&self.buf[self.gap_end..]);
-        // SAFETY: Only valid UTF-8 is ever inserted (callers go through &str).
-        unsafe { String::from_utf8_unchecked(v) }
+        String::from_utf8(v)
+            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
     }
 
     /// Return a substring `[start, end)` as a `String`.
@@ -147,7 +149,8 @@ impl GapBuf {
             let after_len = end - self.gap_start;
             v.extend_from_slice(&self.buf[self.gap_end..self.gap_end + after_len]);
         }
-        unsafe { String::from_utf8_unchecked(v) }
+        String::from_utf8(v)
+            .unwrap_or_else(|e| String::from_utf8_lossy(&e.into_bytes()).into_owned())
     }
 }
 
@@ -245,6 +248,43 @@ fn validate_span(span: &Span, len: usize) -> Result<(), SourceFault> {
     }
 }
 
+fn floor_to_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx > 0 && !s.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn ceil_to_char_boundary(s: &str, mut idx: usize) -> usize {
+    idx = idx.min(s.len());
+    while idx < s.len() && !s.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
+}
+
+fn align_span_for_query(gap: &GapBuf, span: &Span) -> Span {
+    let text = gap.as_string();
+    Span {
+        start: floor_to_char_boundary(&text, span.start),
+        end: floor_to_char_boundary(&text, span.end),
+    }
+}
+
+fn align_span_for_edit(gap: &GapBuf, span: &Span) -> Span {
+    let text = gap.as_string();
+    Span {
+        start: floor_to_char_boundary(&text, span.start),
+        end: ceil_to_char_boundary(&text, span.end),
+    }
+}
+
+fn align_insert_point(gap: &GapBuf, pos: usize) -> usize {
+    let text = gap.as_string();
+    ceil_to_char_boundary(&text, pos)
+}
+
 // ── IR impl ──────────────────────────────────────────────────────────────────
 
 impl IR for SourceText {
@@ -255,10 +295,17 @@ impl IR for SourceText {
 
     fn query(&self, index: DocumentSpan) -> LazyResult<SourceAtom, SourceFault> {
         use LazyResult::*;
-        let Some(gap) = self.gap_by_uri(&index.uri) else { return Absent };
-        let span = clamp_span(&index.span, gap.len());
-        if span.start == 0 && span.end == 0 { return Present(SourceAtom::from_ref("")); }
-        if let Err(f) = validate_span(&span, gap.len()) { return Fault(f); }
+        let Some(gap) = self.gap_by_uri(&index.uri) else {
+            return Absent;
+        };
+        let mut span = clamp_span(&index.span, gap.len());
+        if span.start == 0 && span.end == 0 {
+            return Present(SourceAtom::from_ref(""));
+        }
+        if let Err(f) = validate_span(&span, gap.len()) {
+            return Fault(f);
+        }
+        span = align_span_for_query(gap, &span);
         if span.start == 0 && span.end == gap.len() {
             if let Some(cached) = self.full_text_cache.borrow().get(&index.uri).copied() {
                 return Present(cached);
@@ -279,20 +326,24 @@ impl IR for SourceText {
                     self.staging.insert(*id, *value);
                 }
                 Command::Insert { index, id } => {
-                    if index.span.start != index.span.end {
-                        return Err(SourceFault::NotAnInsertionPoint { span: index.span });
-                    }
                     let fragment = self.staged_atom(*id)?;
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);
-                    let at = index.span.start.min(gap.len());
+                    let len = gap.len();
+                    let span = clamp_span(&index.span, len);
+                    validate_span(&span, len)?;
+                    if span.start != span.end {
+                        return Err(SourceFault::NotAnInsertionPoint { span: index.span });
+                    }
+                    let at = align_insert_point(gap, span.start);
                     gap.insert_str(at, fragment.as_ref().as_str());
                     self.invalidate_cached_text(&index.uri);
                 }
                 Command::Delete { index } => {
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);
                     let len = gap.len();
-                    let span = clamp_span(&index.span, len);
+                    let mut span = clamp_span(&index.span, len);
                     validate_span(&span, len)?;
+                    span = align_span_for_edit(gap, &span);
                     gap.drain(span.start, span.end);
                     self.invalidate_cached_text(&index.uri);
                 }
@@ -300,8 +351,9 @@ impl IR for SourceText {
                     let fragment = self.staged_atom(*id)?;
                     let gap = self.gap_mut_by_uri_or_init(&index.uri);
                     let len = gap.len();
-                    let span = clamp_span(&index.span, len);
+                    let mut span = clamp_span(&index.span, len);
                     validate_span(&span, len)?;
+                    span = align_span_for_edit(gap, &span);
                     gap.replace_range(span.start, span.end, fragment.as_ref().as_str());
                     self.invalidate_cached_text(&index.uri);
                 }
@@ -309,4 +361,30 @@ impl IR for SourceText {
         }
         Ok(())
     }
+
+    fn resolve(&mut self, index: DocumentSpan) -> ResolveOutcome<Self> {
+        if index.uri.scheme.as_ref().as_str() != "file" {
+            return ResolveOutcome::Impossible;
+        }
+        let path = index.uri.path.as_ref().as_str();
+        match std::fs::read_to_string(path) {
+            Ok(text) => ResolveOutcome::Done(source_replace_txn(index.uri, text)),
+            Err(_) => ResolveOutcome::Impossible,
+        }
+    }
+}
+
+fn source_replace_txn(uri: URI, text: String) -> Transaction<SourceText> {
+    let staged_text: SourceAtom = text.into();
+    let index = DocumentSpan {
+        uri,
+        span: Span::new(0, 0),
+    };
+    std::sync::Arc::new(vec![
+        Command::Create {
+            id: 0,
+            value: staged_text,
+        },
+        Command::Insert { index, id: 0 },
+    ])
 }

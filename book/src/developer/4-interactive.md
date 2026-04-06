@@ -1,16 +1,16 @@
 # Interactive
 
-A Grammax compiler becomes **interactive** when a built tree is wrapped in a runtime service and exposed through an interface. The runtime drives the event loop. The interface decides what requests the outside world may make.
+A Grammax compiler becomes **interactive** when a built tree is wrapped in a runtime service and exposed through an interface.
 
-This separation is important:
+The split is simple:
 
-- the tree describes the compiler;
-- the runtime hosts the compiler;
-- the interface describes the public control surface.
+- the tree describes the compiler itself;
+- the runtime hosts that compiler;
+- the interface defines the operations available to the outside world.
 
 ## Runtime Service
 
-You build a runtime from a fully composed tree:
+You create a runtime from a fully composed tree:
 
 ```rust
 use grammax::interface::BasicInterface;
@@ -25,13 +25,15 @@ let runtime = Build::new().then(
 );
 ```
 
-`build_runtime::<I>(grammar)` wraps the typed tree into `RuntimeService<Tree, I>`, where `I` is your chosen interface. The service owns the runtime dispatcher and exposes the interface methods directly.
+`build_runtime::<I>(grammar)` wraps the typed tree into `RuntimeService<Tree, I>`, where `I` is the chosen interface type.
+
+The service owns the runtime dispatcher. The interface methods become the public API you use.
 
 Predefined interfaces include:
 
-- `BasicInterface<Tree>` for direct source-text editing and simple queries;
-- `CliInterface<Tree>` for terminal-oriented inspection of parse results;
-- `WebPreviewInterface<Tree>` for browser-facing CST previews.
+- `BasicInterface<Tree>` for simple editing and querying;
+- `CliInterface<Tree>` for terminal-oriented inspection;
+- `WebPreviewInterface<Tree>` for browser-facing CST preview workflows.
 
 ## The `Interface` Trait
 
@@ -49,9 +51,11 @@ pub trait Interface<Tree: TypedTree> {
 }
 ```
 
-The `GlobalEventDispatcher` is the runtime-owned request channel. Interfaces do not construct it themselves. They receive it from `RuntimeService` and use the helper methods on `Interface<Tree>` to issue typed requests safely.
+The `GlobalEventDispatcher` is created by the runtime. Interfaces do not build it themselves.
 
-Because the tree shape is part of the type system, interfaces can declare exactly which layers they require. For example:
+Instead, an interface receives the dispatcher and uses the helper methods on `Interface<Tree>` to send typed requests safely.
+
+Because the tree shape is encoded in the type system, an interface can state exactly which layers it needs. For example:
 
 ```rust
 impl<Tree: TypedTree> Interface<Tree> for WebPreviewInterface<Tree>
@@ -60,11 +64,16 @@ where
         + ContainsPath<Down<Here>, Target = ParseTreeIR>,
 ```
 
-This means the interface will only compile for trees that contain `SourceText` at `Here` and `ParseTreeIR` one step below it.
+This means the interface only compiles for trees that contain:
+
+- `SourceText` at `Here`;
+- `ParseTreeIR` at `Down<Here>`.
 
 ## Querying a Layer
 
-The central helper is `query_layer::<Path>(revision, index)`.
+The main helper is `query_layer::<Path>(revision, index)`.
+
+Example:
 
 ```rust
 let messages = match self.query_layer::<Down<Here>>(
@@ -104,24 +113,26 @@ let root_view = match self.query_layer::<Down<Here>>(
 };
 ```
 
-This example shows the exact current CST query surface:
+This shows the current CST query surface clearly:
 
-- parser messages are queried as `ParseTreeQuery::Message(uri)`;
-- the allocator is queried as `ParseTreeQuery::Allocator`;
-- tree structure is queried as `ParseTreeQuery::Path(DocumentNodePath)` and returned as `ParseTreeValue::View`.
+- `ParseTreeQuery::Message(uri)` returns parser messages;
+- `ParseTreeQuery::Allocator` returns the allocator;
+- `ParseTreeQuery::Path(DocumentNodePath)` returns a node view.
 
-The optional revision parameter lets the interface query a specific accepted revision instead of the latest available state.
+The optional revision parameter lets the interface ask for a specific accepted revision instead of “whatever is current right now.”
 
 ## Editing Source Text
 
-For source editing, the two most important helpers are:
+For source edits, the two most useful helpers are:
 
 - `edit_source_text(uri, start, end, text)`;
 - `edit_source_text_till::<Path>(uri, start, end, text)`.
 
-The first sends an edit and returns the accepted revision. The second also waits for the chosen downstream layer to emit its transaction for that revision.
+The first sends the edit and returns the accepted revision.
 
-This is especially useful in request/response frontends:
+The second sends the edit and then waits until a chosen downstream layer emits the transaction for that same revision.
+
+That is especially useful in request/response frontends:
 
 ```rust
 match body {
@@ -135,16 +146,16 @@ match body {
 }
 ```
 
-Here `Down<Here>` means: apply the text edit at the source layer, then wait until the parse-tree layer emits the corresponding CST transaction.
+Here `Down<Here>` means: apply the edit at the source layer, then wait until the parse-tree layer emits the corresponding CST transaction.
 
 ## Writing a Good Custom Interface
 
-The cleanest interfaces in Grammax usually follow a simple pattern:
+In practice, a clean custom interface usually follows a small set of rules:
 
 - keep only frontend-facing state in the interface struct;
-- express layer requirements through `ContainsPath` bounds;
+- express required layers through `ContainsPath` bounds;
 - use `query_layer()` for typed reads;
 - use `edit_source_text()` or `edit_source_text_till()` for writes;
 - translate runtime errors into the protocol your frontend actually speaks.
 
-If your frontend needs raw layer streaming rather than request/response access, keep the `LayerObserver`s produced during tree composition and run them beside the runtime service. The runtime and the observers are meant to coexist.
+If your frontend needs streaming updates instead of request/response behavior, keep the `LayerObserver`s produced during tree construction and run them beside the runtime service. The runtime API and raw observers are meant to work together.

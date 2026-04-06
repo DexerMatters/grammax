@@ -287,8 +287,9 @@ pub struct TokenizedMatcher {
 #[typetag::serde]
 impl Matcher for RegexMatcher {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
-        if let Some(mat) = self.compiled().find(&input[*pos..]) {
+        if let Some(mat) = self.compiled().find(slice_from(input, pos)) {
             if mat.start() == 0 {
                 *pos += mat.end();
                 return Some(*pos - start);
@@ -317,8 +318,9 @@ impl Matcher for RegexMatcher {
 #[typetag::serde]
 impl Matcher for IntegerMatcher {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
-        let remaining = &input[*pos..];
+        let remaining = slice_from(input, pos);
 
         if remaining.starts_with("0x") || remaining.starts_with("0X") {
             *pos += 2;
@@ -364,11 +366,12 @@ impl Matcher for IntegerMatcher {
 #[typetag::serde]
 impl Matcher for FloatMatcher {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
         let mut temp_pos = *pos;
         let _ = NUMBER.matches(input, &mut temp_pos);
 
-        if temp_pos >= input.len() || input.chars().nth(temp_pos).unwrap_or(' ') != '.' {
+        if temp_pos >= input.len() || slice_from(input, &mut temp_pos).chars().next() != Some('.') {
             return None;
         }
 
@@ -398,9 +401,10 @@ impl Matcher for FloatMatcher {
 #[typetag::serde]
 impl Matcher for IdentMatcher {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
 
-        if let Some(first_char) = input[*pos..].chars().next() {
+        if let Some(first_char) = slice_from(input, pos).chars().next() {
             if !first_char.is_ascii_alphabetic() && first_char != '_' {
                 return None;
             }
@@ -410,7 +414,7 @@ impl Matcher for IdentMatcher {
         }
 
         while *pos < input.len() {
-            if let Some(c) = input[*pos..].chars().next() {
+            if let Some(c) = slice_from(input, pos).chars().next() {
                 if c.is_ascii_alphanumeric() || c == '_' {
                     *pos += c.len_utf8();
                 } else {
@@ -440,12 +444,13 @@ impl Matcher for IdentMatcher {
 #[typetag::serde]
 impl Matcher for CharMatcherWithEscapes {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
 
-        if let Some(first_char) = input[*pos..].chars().next() {
+        if let Some(first_char) = slice_from(input, pos).chars().next() {
             if first_char == '\\' {
                 *pos += first_char.len_utf8();
-                if let Some(next_char) = input[*pos..].chars().next() {
+                if let Some(next_char) = slice_from(input, pos).chars().next() {
                     match next_char {
                         'n' | 't' | 'r' | '\\' | '"' | '\'' | 'b' | 'f' | 'v' | '0' | 'x' | 'u' => {
                             *pos += next_char.len_utf8();
@@ -649,8 +654,9 @@ impl Matcher for EmptyMatcher {
 #[typetag::serde]
 impl Matcher for OneOf {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
-        if let Some(next_char) = input[*pos..].chars().next() {
+        if let Some(next_char) = slice_from(input, pos).chars().next() {
             if self.0.contains(next_char) {
                 *pos += next_char.len_utf8();
                 return Some(*pos - start);
@@ -675,8 +681,9 @@ impl Matcher for OneOf {
 #[typetag::serde]
 impl Matcher for OwnedLiteral {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
-        if input[*pos..].starts_with(&self.0) {
+        if slice_from(input, pos).starts_with(&self.0) {
             *pos += self.0.len();
             Some(*pos - start)
         } else {
@@ -704,8 +711,9 @@ impl Matcher for OwnedLiteral {
 #[typetag::serde]
 impl Matcher for CharLiteral {
     fn matches(&self, input: &str, pos: &mut usize) -> Option<usize> {
+        normalize_pos(input, pos);
         let start = *pos;
-        if let Some(next_char) = input[*pos..].chars().next() {
+        if let Some(next_char) = slice_from(input, pos).chars().next() {
             if next_char == self.ch {
                 *pos += next_char.len_utf8();
                 return Some(*pos - start);
@@ -954,13 +962,30 @@ pub fn token<M: IntoMatcher>(matcher: M) -> TokenizedMatcher {
     }
 }
 
+fn normalize_pos(input: &str, pos: &mut usize) {
+    if *pos >= input.len() {
+        *pos = input.len();
+        return;
+    }
+    // Incremental edit offsets may land inside a multi-byte UTF-8 character.
+    // Move to the next valid boundary before slicing.
+    while *pos < input.len() && !input.is_char_boundary(*pos) {
+        *pos += 1;
+    }
+}
+
+fn slice_from<'a>(input: &'a str, pos: &mut usize) -> &'a str {
+    normalize_pos(input, pos);
+    &input[*pos..]
+}
+
 fn consume_while<F>(input: &str, pos: &mut usize, mut predicate: F) -> usize
 where
     F: FnMut(char) -> bool,
 {
     let start = *pos;
     while *pos < input.len() {
-        if let Some(c) = input[*pos..].chars().next() {
+        if let Some(c) = slice_from(input, pos).chars().next() {
             if predicate(c) {
                 *pos += c.len_utf8();
             } else {

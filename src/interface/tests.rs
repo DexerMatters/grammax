@@ -104,7 +104,7 @@ fn test_tap_prints_cst_commands() {
                 AstArena::default(),
                 |b, ast_obs| {
                     (
-                        b.build_runtime::<BasicInterface<_>>(grammar),
+                        b.build_runtime::<WebPreviewInterface<_>>(grammar),
                         cst_obs,
                         ast_obs,
                     )
@@ -134,10 +134,7 @@ fn test_tap_prints_cst_commands() {
         }
     });
 
-    pass_runtime
-        .insert(0, r#"{"name": "John", "age": 30, "is_student": false}"#)
-        .expect("submit");
-    thread::sleep(std::time::Duration::from_millis(100));
+    pass_runtime.run().unwrap();
 }
 
 #[cfg(feature = "webui")]

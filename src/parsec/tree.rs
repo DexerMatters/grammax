@@ -154,6 +154,8 @@ pub type TreeAllocRef = Rc<UnsafeCell<TreeAlloc>>;
 pub(crate) trait TreeAllocRefExt {
     /// Creates a new tree allocator reference.
     fn create() -> Self;
+    /// Creates an immutable snapshot clone safe to move away from the mutating owner thread.
+    fn snapshot(&self) -> Self;
     /// Retrieves a cloned green node snapshot by its ID.
     fn get_node(&self, id: GreenId) -> GreenNode;
     /// Clones a green node snapshot by its ID, avoiding long-lived `RefCell` borrows.
@@ -169,6 +171,16 @@ impl TreeAllocRefExt for TreeAllocRef {
         Rc::new(UnsafeCell::new(TreeAlloc {
             nodes: Vec::new(),
             dedup: FxHashMap::default(),
+        }))
+    }
+
+    fn snapshot(&self) -> Self {
+        // SAFETY: TreeAllocRef is single-threaded (`Rc`). We clone owned data
+        // out of the current allocator and return a detached copy.
+        let borrowed = unsafe { &*self.get() };
+        Rc::new(UnsafeCell::new(TreeAlloc {
+            nodes: borrowed.nodes.clone(),
+            dedup: borrowed.dedup.clone(),
         }))
     }
 

@@ -637,16 +637,32 @@ impl IR for ParseTreeIR {
                 if !self.roots.contains_key(&uri) && !self.messages_cache.contains_key(&uri) {
                     return Absent;
                 }
-                Present(ParseTreeValue::Messages(self.messages_cache.get(&uri).cloned().unwrap_or_default()))
+                Present(ParseTreeValue::Messages(
+                    self.messages_cache.get(&uri).cloned().unwrap_or_default(),
+                ))
             }
-            ParseTreeQuery::Allocator => Present(ParseTreeValue::Allocator(self.alloc.clone())),
+            // Return a detached snapshot so query consumers never race with
+            // concurrent allocator mutation in the pipeline thread.
+            ParseTreeQuery::Allocator => Present(ParseTreeValue::Allocator(self.alloc.snapshot())),
             ParseTreeQuery::Path(path) => {
-                if !self.roots.contains_key(&path.0) { return Absent; }
-                let Some(green) = self.green_at_path(&path) else { return Absent; };
-                let Some(grammar) = self.grammar else { return Fault(ParseTreeFault::MissingGrammar); };
-                let Some(offset) = self.offset_at_path(&path) else { return Absent; };
+                if !self.roots.contains_key(&path.0) {
+                    return Absent;
+                }
+                let Some(green) = self.green_at_path(&path) else {
+                    return Absent;
+                };
+                let Some(grammar) = self.grammar else {
+                    return Fault(ParseTreeFault::MissingGrammar);
+                };
+                let Some(offset) = self.offset_at_path(&path) else {
+                    return Absent;
+                };
+                let alloc_snapshot = self.alloc.snapshot();
                 Present(ParseTreeValue::View(
-                    self.viewer(grammar).node(green, offset).with_path(path.1.clone().into())
+                    Viewer::new(grammar, alloc_snapshot, String::new())
+                        .with_token_texts(self.token_text.clone())
+                        .node(green, offset)
+                        .with_path(path.1.clone().into()),
                 ))
             }
         }

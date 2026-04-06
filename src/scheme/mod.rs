@@ -95,6 +95,15 @@ impl<V, F> LazyResult<V, F> {
     }
 }
 
+/// Declares the upstream dependency for a downstream index type.
+///
+/// Implement this on `D::Ix` to declare which upstream index must be resolved
+/// when this index is absent. The pipeline calls `upstream_index` automatically
+/// on every absent query — no pass involvement required.
+pub trait Demand<U: IR> {
+    fn upstream_index(&self) -> Option<U::Ix>;
+}
+
 pub trait IR {
     type Ix;
     type Value;
@@ -106,6 +115,27 @@ pub trait IR {
     fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
     where
         Self: Sized;
+
+    /// Lazily resolve a missing index.
+    ///
+    /// Called only when `query` returns `Absent` and strict mode is off.
+    /// The default implementation always returns `Impossible`, meaning the IR
+    /// has no lazy-resolution capability.
+    fn resolve(&mut self, _index: Self::Ix) -> ResolveOutcome<Self>
+    where
+        Self: Sized,
+    {
+        ResolveOutcome::Impossible
+    }
+}
+
+pub enum ResolveOutcome<R: IR> {
+    /// Commands that populate the requested index.
+    Done(Transaction<R>),
+    /// Upstream data is not yet available; retry after the next upstream push.
+    Blocked,
+    /// This index can never be resolved by this layer.
+    Impossible,
 }
 
 #[derive(Debug)]
@@ -118,8 +148,8 @@ pub enum ObserveError<F> {
     Absent,
     /// Permanent domain fault; demand cannot resolve this.
     Fault(F),
-    /// Demand was attempted but the pass gave up permanently.
-    Exhausted,
+    /// Resolution was attempted but the index can never be produced by this layer.
+    Impossible,
 }
 
 impl<F> ObserveError<F> {
@@ -139,23 +169,6 @@ pub trait Pass<U: IR, D: IR> {
         downstream: &D,
         txn: &[Command<U>],
     ) -> Vec<Command<D>>;
-
-    /// Called when `index` is queried but not yet present in downstream.
-    /// Return `PullOutcome::Ready(cmds)` to populate it,
-    /// `PullOutcome::Pending` if upstream data isn't available yet (will
-    /// retry after the next push), or `PullOutcome::Dead` if the index
-    /// can never be resolved.
-    fn pull(&mut self, upstream: &LayerObserver<U>, downstream: &D, index: D::Ix)
-    -> PullOutcome<D>;
-}
-
-pub enum PullOutcome<Repr: IR> {
-    /// Commands that will populate the requested index.
-    Ready(Vec<Command<Repr>>),
-    /// Upstream data isn't available yet; retry after the next push.
-    Pending,
-    /// This index can never be resolved by this pass.
-    Dead,
 }
 
 pub(crate) struct QueryMsg<Repr: IR> {
@@ -260,63 +273,28 @@ impl<Repr: IR> LayerObserver<Repr> {
     }
 }
 
-fn resolve_query<U, P, D>(
-    pass: &mut P,
+fn resolve_query<U, D>(
     upstream: &LayerObserver<U>,
-    downstream: &mut D,
-    demanded: &mut Vec<D::Ix>,
+    downstream: &D,
     index: D::Ix,
     strict: bool,
 ) -> Result<D::Value, ObserveError<D::Fault>>
 where
     U: IR,
     D: IR,
-    P: Pass<U, D>,
-    D::Ix: Clone + PartialEq,
+    D::Ix: Clone + Demand<U>,
 {
-    let remember = |demanded: &mut Vec<D::Ix>, index: &D::Ix| {
-        if !demanded.iter().any(|existing| existing == index) {
-            demanded.push(index.clone());
-        }
-    };
-
     match downstream.query(index.clone()) {
-        LazyResult::Present(value) => {
-            if !strict {
-                remember(demanded, &index);
-            }
-            Ok(value)
-        }
+        LazyResult::Present(value) => Ok(value),
         LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
         LazyResult::Absent if strict => Err(ObserveError::Absent),
-        LazyResult::Absent => {
-            let needs_upstream = match pass.pull(upstream, downstream, index.clone()) {
-                PullOutcome::Dead => return Err(ObserveError::Exhausted),
-                PullOutcome::Ready(txn) => {
-                    if !txn.is_empty() {
-                        downstream
-                            .apply_transaction(std::sync::Arc::new(txn))
-                            .map_err(ObserveError::Fault)?;
-                    }
-                    false
-                }
-                PullOutcome::Pending => true,
-            };
-
-            match downstream.query(index.clone()) {
-                LazyResult::Present(value) => {
-                    remember(demanded, &index);
-                    Ok(value)
-                }
-                LazyResult::Absent => {
-                    if needs_upstream {
-                        remember(demanded, &index);
-                    }
-                    Err(ObserveError::Absent)
-                }
-                LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
-            }
-        }
+        LazyResult::Absent => match index.upstream_index() {
+            None => Err(ObserveError::Impossible),
+            Some(u_ix) => match upstream.query(u_ix) {
+                Err(ObserveError::Impossible) => Err(ObserveError::Impossible),
+                _ => Err(ObserveError::Absent),
+            },
+        },
     }
 }
 
@@ -332,7 +310,7 @@ where
     U::Value: Send + Sync,
     U::Fault: Send,
     D: IR + Send + Clone + 'static,
-    D::Ix: Send + Sync + PartialEq,
+    D::Ix: Clone + PartialEq + Send + Sync + Demand<U>,
     D::Value: Send + Sync,
     D::Fault: Send,
     P: Pass<U, D> + 'static,
@@ -350,7 +328,7 @@ where
     U::Value: Clone + Send + Sync,
     U::Fault: Send,
     D: IR + Send + Clone + 'static,
-    D::Ix: Clone + PartialEq + Send + Sync,
+    D::Ix: Clone + PartialEq + Send + Sync + Demand<U>,
     D::Value: Clone + Send + Sync,
     D::Fault: Send,
     P: Pass<U, D> + 'static,
@@ -371,65 +349,45 @@ where
         let handle = thread::spawn(move || {
             let mut pass = make_pass();
             let mut downstream = downstream;
-            let mut demanded: Vec<D::Ix> = Vec::new();
+            let mut pending: Vec<(
+                D::Ix,
+                channel::Sender<Result<D::Value, ObserveError<D::Fault>>>,
+            )> = Vec::new();
             loop {
                 crossbeam::select! {
                     recv(receiver) -> msg => match msg {
                         Ok(txn) => {
-                            let mut combined: Vec<Command<D>> = Vec::new();
-                            {
-                                let downstream_txn = pass.push(
-                                    &upstream,
-                                    &downstream,
-                                    txn.as_ref(),
-                                );
-                                if downstream
-                                    .apply_transaction(std::sync::Arc::new(downstream_txn.clone()))
-                                    .is_ok()
-                                {
-                                    combined.extend(downstream_txn);
-                                }
-                            }
-
-                            let mut retained = Vec::with_capacity(demanded.len());
-                            for index in demanded.drain(..) {
-                                if downstream.query(index.clone()).is_present() {
-                                    retained.push(index);
-                                    continue;
-                                }
-
-                                let should_retain = match pass.pull(
-                                    &upstream,
-                                    &downstream,
-                                    index.clone(),
-                                ) {
-                                    PullOutcome::Ready(refresh_txn) => {
-                                        if downstream
-                                            .apply_transaction(std::sync::Arc::new(refresh_txn.clone()))
-                                            .is_ok()
-                                        {
-                                            combined.extend(refresh_txn);
-                                        }
-                                        true
-                                    }
-                                    PullOutcome::Pending => true,
-                                    PullOutcome::Dead => false,
-                                };
-                                if should_retain {
-                                    retained.push(index);
-                                }
-                            }
-                            demanded = retained;
-
+                            let cmds = Arc::new(pass.push(&upstream, &downstream, txn.as_ref()));
+                            let tap_cmds = if downstream.apply_transaction(Arc::clone(&cmds)).is_ok() {
+                                cmds
+                            } else {
+                                Arc::new(vec![])
+                            };
                             if let Some(tap) = &tap_sender {
-                                let _ = tap.send(std::sync::Arc::new(combined));
+                                let _ = tap.send(tap_cmds);
                             }
+                            pending.retain_mut(|(index, reply)| {
+                                match downstream.query(index.clone()) {
+                                    LazyResult::Present(v) => { let _ = reply.send(Ok(v)); false }
+                                    LazyResult::Fault(f) => { let _ = reply.send(Err(ObserveError::Fault(f))); false }
+                                    LazyResult::Absent => {
+                                        let keep = index.upstream_index()
+                                            .map(|u_ix| !matches!(upstream.query(u_ix), Err(ObserveError::Impossible)))
+                                            .unwrap_or(false);
+                                        if !keep { let _ = reply.send(Err(ObserveError::Impossible)); }
+                                        keep
+                                    }
+                                }
+                            });
                         }
                         Err(_) => break,
                     },
                     recv(query_rx) -> msg => match msg {
                         Ok(QueryMsg { index, strict, reply }) => {
-                            let _ = reply.send(resolve_query(&mut pass, &upstream, &mut downstream, &mut demanded, index, strict));
+                            match resolve_query(&upstream, &downstream, index.clone(), strict) {
+                                Err(ObserveError::Absent) if !strict => pending.push((index, reply)),
+                                other => { let _ = reply.send(other); }
+                            }
                         }
                         Err(_) => {}
                     },

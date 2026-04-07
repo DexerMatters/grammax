@@ -39,6 +39,7 @@ Next generation solution for a neat language server.
 - [x] Language server protocol integration
 
 ## Framework
+- [x] Lazy computation framework
 - [ ] Scope graph layer for type checkers
 
 ## LSP features

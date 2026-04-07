@@ -11,6 +11,10 @@ impl URI {
             path: internment::Intern::from_ref(path.as_ref()),
         }
     }
+
+    pub fn exists(&self) -> bool {
+        fs::metadata(self.path.as_ref()).is_ok()
+    }
 }
 
 impl Default for URI {
@@ -186,7 +190,7 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
-use std::{fmt, ops};
+use std::{fmt, fs, ops};
 
 use serde::{Deserialize, Serialize};
 

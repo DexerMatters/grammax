@@ -1,6 +1,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct URI {
     pub scheme: internment::Intern<String>,
+    pub authority: Option<internment::Intern<String>>,
     pub path: internment::Intern<String>,
 }
 
@@ -8,12 +9,95 @@ impl URI {
     pub fn new(scheme: impl AsRef<str>, path: impl AsRef<str>) -> Self {
         URI {
             scheme: internment::Intern::from_ref(scheme.as_ref()),
+            authority: None,
             path: internment::Intern::from_ref(path.as_ref()),
         }
     }
 
-    pub fn exists(&self) -> bool {
-        fs::metadata(self.path.as_ref()).is_ok()
+    pub fn new_with_authority(
+        scheme: impl AsRef<str>,
+        authority: impl AsRef<str>,
+        path: impl AsRef<str>,
+    ) -> Self {
+        URI {
+            scheme: internment::Intern::from_ref(scheme.as_ref()),
+            authority: Some(internment::Intern::from_ref(authority.as_ref())),
+            path: internment::Intern::from_ref(path.as_ref()),
+        }
+    }
+
+    pub fn valid(&self) -> bool {
+        if self.scheme.is_empty() || self.path.is_empty() {
+            return false;
+        }
+        // File scheme requires the path exists on the filesystem
+        if self.scheme.as_ref() == "file" {
+            return std::path::Path::new(self.path.as_ref()).exists();
+        } else if self.scheme.as_ref() == "http" || self.scheme.as_ref() == "https" {
+            // For http/https, we can do a simple check for authority and path
+            return self.authority.is_some() && !self.path.as_ref().is_empty();
+        }
+        false
+    }
+
+    pub fn each_subdirectory(&self, f: impl Fn(URI)) {
+        if self.scheme.as_ref() != "file" {
+            return;
+        }
+        let path = std::path::Path::new(self.path.as_ref());
+        if !path.is_dir() {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                f(URI {
+                    scheme: self.scheme,
+                    authority: self.authority,
+                    path: internment::Intern::from_ref(entry.path().to_string_lossy().as_ref()),
+                });
+            }
+        }
+    }
+
+    pub fn each_subdirectory_recursive(&self, f: impl Fn(URI)) {
+        if self.scheme.as_ref() != "file" {
+            return;
+        }
+        let path = std::path::Path::new(self.path.as_ref());
+        if !path.is_dir() {
+            return;
+        }
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let sub_uri = URI {
+                    scheme: self.scheme,
+                    authority: self.authority,
+                    path: internment::Intern::from_ref(entry.path().to_string_lossy().as_ref()),
+                };
+                f(sub_uri);
+                sub_uri.each_subdirectory_recursive(&f);
+            }
+        }
+    }
+
+    pub fn fetch_text(&self) -> Result<String, std::io::Error> {
+        if self.scheme.as_ref() != "file" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Only file scheme is supported for fetching text",
+            ));
+        }
+        std::fs::read_to_string(self.path.as_ref())
+    }
+
+    pub fn fetch_binary(&self) -> Result<Vec<u8>, std::io::Error> {
+        if self.scheme.as_ref() != "file" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Only file scheme is supported for fetching binary data",
+            ));
+        }
+        std::fs::read(self.path.as_ref())
     }
 }
 
@@ -21,6 +105,7 @@ impl Default for URI {
     fn default() -> Self {
         URI {
             scheme: internment::Intern::from_ref("file"),
+            authority: None,
             path: internment::Intern::from_ref("undefined"),
         }
     }
@@ -28,7 +113,11 @@ impl Default for URI {
 
 impl fmt::Display for URI {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}://{}", self.scheme, self.path)
+        if let Some(authority) = &self.authority {
+            write!(f, "{}://{}/{}", self.scheme, authority, self.path)
+        } else {
+            write!(f, "{}://{}", self.scheme, self.path)
+        }
     }
 }
 
@@ -36,7 +125,17 @@ impl From<&str> for URI {
     fn from(s: &str) -> Self {
         let parts: Vec<&str> = s.splitn(2, "://").collect();
         if parts.len() == 2 {
-            URI::new(parts[0], parts[1])
+            let scheme = parts[0];
+            let rest = parts[1];
+            // Try to split authority from path
+            if let Some(slash_pos) = rest.find('/') {
+                let authority = &rest[..slash_pos];
+                let path = &rest[slash_pos + 1..];
+                URI::new_with_authority(scheme, authority, path)
+            } else {
+                // No path separator, entire rest is authority
+                URI::new_with_authority(scheme, rest, "")
+            }
         } else {
             URI::new("file", s)
         }

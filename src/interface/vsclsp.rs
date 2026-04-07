@@ -1,21 +1,18 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
+use orx_concurrent_vec::ConcurrentVec;
 use rouille::url::Url;
 use tower_lsp::lsp_types::{
-    CompletionOptions, DidChangeTextDocumentParams, DidOpenTextDocumentParams,
-    HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    CompletionOptions, HoverProviderCapability, InitializeParams, InitializeResult,
     ServerCapabilities,
 };
-use tower_lsp::{Client, ClientSocket, LanguageServer, LspService, Server, jsonrpc, lsp_types};
+use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc, lsp_types};
 
 use crate::grammar::Grammar;
-use crate::interface::{Interface, LayerResult};
+use crate::interface::Interface;
+use crate::runtime::compiler::{ContainsPath, Here, TypedTree};
 use crate::runtime::dispatcher::GlobalEventDispatcher;
-use crate::runtime::{
-    self,
-    compiler::{ContainsPath, Here, TypedTree},
-};
-use crate::scheme::{Range, URI};
+use crate::scheme::{Command, DocumentSpan, Range, ResolveOutcome, SourceText, URI};
 
 pub trait LanguageServerHandle<Tree: TypedTree> {
     fn resolve(&self, uri: &URI) -> Option<String>;
@@ -26,7 +23,7 @@ pub struct LanguageServerInterface<Tree: TypedTree, I: LanguageServerHandle<Tree
     ged: GlobalEventDispatcher,
     _marker: std::marker::PhantomData<fn() -> (Tree, I)>,
 
-    codebase: boxcar::Vec<URI>,
+    codebase: ConcurrentVec<URI>,
 }
 
 impl<Tree, I> LanguageServerInterface<Tree, I>
@@ -47,7 +44,7 @@ where
 
 impl<Tree, I> Interface<Tree> for LanguageServerInterface<Tree, I>
 where
-    Tree: TypedTree,
+    Tree: TypedTree + ContainsPath<Here, Target = SourceText>,
     I: LanguageServerHandle<Tree> + 'static,
 {
     fn new(ged: GlobalEventDispatcher, _grammar: &'static Grammar) -> Self
@@ -58,12 +55,32 @@ where
             client: OnceLock::new(),
             ged,
             _marker: std::marker::PhantomData,
-            codebase: boxcar::Vec::new(),
+            codebase: ConcurrentVec::new(),
         }
     }
 
     fn ged(&self) -> &GlobalEventDispatcher {
         &self.ged
+    }
+
+    fn resolve_source(&self, index: DocumentSpan) -> ResolveOutcome<SourceText>
+    where
+        Self: Sized,
+    {
+        if !index.uri.valid() {
+            return ResolveOutcome::Impossible;
+        }
+        let Ok(text) = index.uri.fetch_text() else {
+            return ResolveOutcome::Impossible;
+        };
+        let transaction = vec![
+            Command::Create {
+                id: 0,
+                value: internment::Intern::new(text),
+            },
+            Command::Insert { index, id: 0 },
+        ];
+        ResolveOutcome::Done(Arc::new(transaction))
     }
 }
 
@@ -74,12 +91,17 @@ where
     I: LanguageServerHandle<Tree> + Send + Sync + 'static,
 {
     async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
-        let workspace_uris = params
+        params
             .workspace_folders
             .unwrap_or_default()
             .into_iter()
-            .map(|folder| folder.uri.into())
-            .collect::<Vec<URI>>();
+            .map::<URI, _>(|folder| folder.uri.into())
+            .for_each(|uri| {
+                self.codebase.push(uri);
+                uri.each_subdirectory_recursive(|uri| {
+                    self.codebase.push(uri);
+                });
+            });
 
         Ok(InitializeResult {
             capabilities: ServerCapabilities {

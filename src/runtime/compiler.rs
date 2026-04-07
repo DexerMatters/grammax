@@ -28,7 +28,8 @@ use crate::{
 };
 
 type SourceTxn = scheme::Transaction<SourceText>;
-pub(crate) type SourceResolveHook = fn(scheme::DocumentSpan) -> scheme::ResolveOutcome<SourceText>;
+pub(crate) type SourceResolveHook =
+    Arc<dyn Fn(scheme::DocumentSpan) -> scheme::ResolveOutcome<SourceText> + Send + Sync>;
 type QueryFn = Arc<dyn Fn(utils::Payload) -> RuntimeWireResult<utils::Payload> + Send + Sync>;
 type SubmitTopFn = Arc<dyn Fn(RevisionId, SourceTxn) -> RuntimeResult<()> + Send + Sync>;
 type ShutdownHook = Box<dyn FnOnce() + Send>;
@@ -279,7 +280,7 @@ impl<
 {
     pub fn build_runtime<I>(self, grammar: &'static grammar::Grammar) -> RuntimeService<Tree, I>
     where
-        I: Interface<Tree>,
+        I: Interface<Tree> + Send + Sync + 'static,
     {
         RuntimeService::<Tree, I>::new(grammar, move |evt_tx, source_resolve| {
             ComposedCompiler::from_tree_with_events(self.0, evt_tx, source_resolve)

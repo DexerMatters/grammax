@@ -45,7 +45,7 @@ where
         &self.ged
     }
 
-    fn resolve_source(index: DocumentSpan) -> ResolveOutcome<crate::scheme::SourceText>
+    fn resolve_source(&self, index: DocumentSpan) -> ResolveOutcome<crate::scheme::SourceText>
     where
         Self: Sized,
     {

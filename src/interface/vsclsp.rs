@@ -1,27 +1,30 @@
 use std::sync::{Arc, OnceLock};
 
 use rouille::url::Url;
+use tower_lsp::lsp_types::SemanticTokensRegistrationOptions;
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc, lsp_types};
 
 use crate::grammar::Grammar;
 use crate::interface::Interface;
+use crate::runtime::Down;
 use crate::runtime::compiler::{ContainsPath, Here, TypedTree};
 use crate::runtime::dispatcher::GlobalEventDispatcher;
-use crate::scheme::{Command, DocumentSpan, Range, ResolveOutcome, SourceText, URI};
-
-pub trait LanguageServerHandle<Tree: TypedTree> {
-    fn resolve(&self, uri: &URI) -> Option<String>;
-}
+use crate::scheme::layers::ParseTreeIR;
+use crate::scheme::{Command, IR, Range, ResolveOutcome, SourceText, URI};
 
 pub struct LanguageServerInterface<Tree: TypedTree, I: LanguageServerHandle<Tree>> {
     client: OnceLock<Client>,
     ged: GlobalEventDispatcher,
+    handle: I,
     _marker: std::marker::PhantomData<fn() -> (Tree, I)>,
 }
 
 impl<Tree, I> LanguageServerInterface<Tree, I>
 where
-    Tree: TypedTree + 'static,
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>
+        + 'static,
     I: LanguageServerHandle<Tree> + Send + Sync + 'static,
 {
     pub async fn run(self) {
@@ -37,7 +40,9 @@ where
 
 impl<Tree, I> Interface<Tree> for LanguageServerInterface<Tree, I>
 where
-    Tree: TypedTree + ContainsPath<Here, Target = SourceText>,
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>,
     I: LanguageServerHandle<Tree> + 'static,
 {
     fn new(ged: GlobalEventDispatcher, _grammar: &'static Grammar) -> Self
@@ -46,6 +51,7 @@ where
     {
         Self {
             client: OnceLock::new(),
+            handle: I::new(),
             ged,
             _marker: std::marker::PhantomData,
         }
@@ -55,7 +61,7 @@ where
         &self.ged
     }
 
-    fn resolve_source(&self, index: DocumentSpan) -> ResolveOutcome<SourceText>
+    fn resolve_source(&self, index: <SourceText as IR>::Ix) -> ResolveOutcome<SourceText>
     where
         Self: Sized,
     {
@@ -79,13 +85,17 @@ where
 #[tower_lsp::async_trait]
 impl<Tree, I> LanguageServer for LanguageServerInterface<Tree, I>
 where
-    Tree: TypedTree + 'static,
+    Tree: TypedTree
+        + ContainsPath<Here, Target = SourceText>
+        + ContainsPath<Down<Here>, Target = ParseTreeIR>
+        + 'static,
     I: LanguageServerHandle<Tree> + Send + Sync + 'static,
 {
     async fn initialize(
         &self,
         _params: lsp_types::InitializeParams,
     ) -> jsonrpc::Result<lsp_types::InitializeResult> {
+        let config = self.handle.configure();
         Ok(lsp_types::InitializeResult {
             capabilities: lsp_types::ServerCapabilities {
                 hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
@@ -97,6 +107,36 @@ where
                     }),
                     ..Default::default()
                 }),
+                semantic_tokens_provider: Some(
+                    lsp_types::SemanticTokensServerCapabilities::SemanticTokensRegistrationOptions(
+                        SemanticTokensRegistrationOptions {
+                            text_document_registration_options: {
+                                lsp_types::TextDocumentRegistrationOptions {
+                                    document_selector: Some(vec![lsp_types::DocumentFilter {
+                                        language: Some(config.language_id),
+                                        scheme: Some("file".to_string()),
+                                        pattern: Some(format!(
+                                            "*.{{{}}}",
+                                            config.file_extensions.join(",")
+                                        )),
+                                    }]),
+                                }
+                            },
+                            semantic_tokens_options: lsp_types::SemanticTokensOptions {
+                                work_done_progress_options:
+                                    lsp_types::WorkDoneProgressOptions::default(),
+                                legend: lsp_types::SemanticTokensLegend {
+                                    token_types: config.token_types.to_vec(),
+                                    token_modifiers: config.token_modifiers.to_vec(),
+                                },
+                                range: Some(true),
+                                full: Some(lsp_types::SemanticTokensFullOptions::Bool(true)),
+                            },
+                            static_registration_options:
+                                lsp_types::StaticRegistrationOptions::default(),
+                        },
+                    ),
+                ),
                 ..Default::default()
             },
             ..Default::default()
@@ -113,6 +153,33 @@ where
     async fn shutdown(&self) -> jsonrpc::Result<()> {
         Ok(())
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct LanguageServerConfig {
+    pub language_id: String,
+    pub file_extensions: Vec<String>,
+    pub token_types: &'static [lsp_types::SemanticTokenType],
+    pub token_modifiers: &'static [lsp_types::SemanticTokenModifier],
+}
+
+impl Default for LanguageServerConfig {
+    fn default() -> Self {
+        Self {
+            language_id: "plaintext".to_string(),
+            file_extensions: vec!["txt".to_string()],
+            token_types: &[],
+            token_modifiers: &[],
+        }
+    }
+}
+
+pub trait LanguageServerHandle<Tree: TypedTree> {
+    fn new() -> Self
+    where
+        Self: Sized;
+
+    fn configure(&self) -> LanguageServerConfig;
 }
 
 impl From<Url> for URI {

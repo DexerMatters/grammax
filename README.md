@@ -4,6 +4,8 @@ Next generation solution for a neat language server.
 
 # Progress 
 
+## Basic
+
 - [x] Basic grammar DSL
 - [x] Design normalized grammar 
 - [x] Normalize repetitive and optional rules
@@ -17,8 +19,8 @@ Next generation solution for a neat language server.
 - [x] Coarse-grained error recovery
 - [x] Fine-grained error recovery (missing tokens)
 - [x] Error recovery with scope analysis
-- [ ] Stabilize error recovery
-- [ ] Pretty print for errors
+- [x] Stabilize error recovery
+- [x] Pretty print for errors
 - [ ] Warnings for preferred alternatives
 - [x] Concurrent runtime platform
 - [ ] Fully configurable runtime behaviors 
@@ -33,8 +35,15 @@ Next generation solution for a neat language server.
 - [x] Basic interactive platform
 - [x] IR ready for semantic analysis of red-green AST
 - [ ] Specified meta information on AST nodes
-- [ ] Simple reactive framework 
-- [ ] Language server protocol integration
+- [x] Simple reactive framework 
+- [x] Language server protocol integration
+
+## Framework
+- [ ] Scope graph layer for type checkers
+
+## LSP features
+- [ ] Semantic highlighting
+- [ ] Code completion
 
 ## Documentation
 - [ ] Inline documentation for public APIs

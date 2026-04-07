@@ -34,7 +34,7 @@ pub trait Interface<Tree: TypedTree> {
 
     fn resolve_source(
         &self,
-        _index: scheme::DocumentSpan,
+        _index: <scheme::SourceText as scheme::IR>::Ix,
     ) -> scheme::ResolveOutcome<scheme::SourceText>
     where
         Self: Sized,

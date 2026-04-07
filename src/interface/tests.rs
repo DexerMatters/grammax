@@ -3,15 +3,11 @@ use color_print::cprintln;
 
 #[cfg(feature = "webui")]
 use crate::{
-    interface::{Interface, webui::WebPreviewInterface},
-    new_grammar, new_grammar_no_cache,
-    runtime::{
-        Build, ParserPass,
-        compiler::{ContainsPath, Down, Here, TypedTree},
-        dispatcher::GlobalEventDispatcher,
-    },
+    interface::webui::WebPreviewInterface,
+    new_grammar,
+    runtime::{Build, ParserPass},
     scheme::{
-        Command, DocumentSpan, ResolveOutcome, Span, URI,
+        Span,
         layers::{
             AstArena, AstCell, AstVec, DocumentNodePath, ParseTreeIR, ParseTreeQuery,
             ParseTreeValue,
@@ -21,53 +17,7 @@ use crate::{
 };
 
 #[cfg(feature = "webui")]
-use std::{marker::PhantomData, sync::Arc, thread};
-
-#[cfg(feature = "webui")]
-struct LazyResolveInterface<Tree: TypedTree> {
-    ged: GlobalEventDispatcher,
-    _marker: PhantomData<fn() -> Tree>,
-}
-
-#[cfg(feature = "webui")]
-impl<Tree: TypedTree> Interface<Tree> for LazyResolveInterface<Tree>
-where
-    Tree: ContainsPath<Here, Target = crate::scheme::SourceText>,
-{
-    fn new(ged: GlobalEventDispatcher, _grammar: &'static crate::grammar::Grammar) -> Self {
-        Self {
-            ged,
-            _marker: PhantomData,
-        }
-    }
-
-    fn ged(&self) -> &GlobalEventDispatcher {
-        &self.ged
-    }
-
-    fn resolve_source(&self, index: DocumentSpan) -> ResolveOutcome<crate::scheme::SourceText>
-    where
-        Self: Sized,
-    {
-        let uri = URI::new("mem", "lazy-arith");
-        if index.uri != uri {
-            return ResolveOutcome::Impossible;
-        }
-        ResolveOutcome::Done(Arc::new(vec![
-            Command::Create {
-                id: 0,
-                value: "1+2".to_string().into(),
-            },
-            Command::Insert {
-                index: DocumentSpan {
-                    uri,
-                    span: Span::new(0, 0),
-                },
-                id: 0,
-            },
-        ]))
-    }
-}
+use std::thread;
 
 #[cfg(feature = "webui")]
 #[test]
@@ -288,42 +238,4 @@ fn test_arith_commands() {
     });
 
     pass_runtime.run().unwrap();
-}
-
-#[cfg(feature = "webui")]
-#[test]
-fn test_interface_resolves_lazy_source() {
-    let grammar = new_grammar_no_cache!(
-        start where
-        start -> r!(expr) + tt(EndOfInput)
-        expr -> r!(add) | r!(primary)
-        add  -> r!(expr) + tt("+") + r!(expr).drop(1)
-        primary -> tt(NUMBER)
-    );
-
-    let runtime = Build::new().then(
-        ParserPass::new(grammar),
-        ParseTreeIR::with_grammar(grammar),
-        |b, _cst_obs| b.build_runtime::<LazyResolveInterface<_>>(grammar),
-    );
-
-    let uri = URI::new("mem", "lazy-arith");
-    let lazy_root = runtime
-        .query_layer::<Down<Here>>(None, ParseTreeQuery::Path(DocumentNodePath::root(uri)))
-        .expect("lazy parse query should resolve source through the interface");
-
-    match lazy_root {
-        ParseTreeValue::View(view) => {
-            let rendered = format!("{view}");
-            assert!(rendered.contains("1"), "unexpected CST: {rendered}");
-            assert!(rendered.contains("+"), "unexpected CST: {rendered}");
-            assert!(rendered.contains("2"), "unexpected CST: {rendered}");
-        }
-        other => panic!("expected parse tree view, got {other:?}"),
-    }
-
-    let source = runtime
-        .query_source_text(None, &uri, Span::new(0, usize::MAX))
-        .expect("source query should observe the interface-resolved text");
-    assert_eq!(source.as_ref().as_str(), "1+2");
 }

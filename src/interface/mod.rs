@@ -32,21 +32,14 @@ pub trait Interface<Tree: TypedTree> {
         Self: Sized;
     fn ged(&self) -> &GlobalEventDispatcher;
 
-    fn resolve<R: scheme::IR>(&self, _index: R::Ix) -> scheme::ResolveOutcome<R>
-    where
-        Self: Sized,
-    {
-        scheme::ResolveOutcome::Impossible
-    }
-
     fn resolve_source(
         &self,
-        index: scheme::DocumentSpan,
+        _index: scheme::DocumentSpan,
     ) -> scheme::ResolveOutcome<scheme::SourceText>
     where
         Self: Sized,
     {
-        self.resolve::<scheme::SourceText>(index)
+        scheme::ResolveOutcome::Impossible
     }
 
     fn shutdown(&self) -> LayerResult<Tree, Here, ()>

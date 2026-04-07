@@ -1,11 +1,6 @@
 use std::sync::{Arc, OnceLock};
 
-use orx_concurrent_vec::ConcurrentVec;
 use rouille::url::Url;
-use tower_lsp::lsp_types::{
-    CompletionOptions, HoverProviderCapability, InitializeParams, InitializeResult,
-    ServerCapabilities,
-};
 use tower_lsp::{Client, LanguageServer, LspService, Server, jsonrpc, lsp_types};
 
 use crate::grammar::Grammar;
@@ -22,8 +17,6 @@ pub struct LanguageServerInterface<Tree: TypedTree, I: LanguageServerHandle<Tree
     client: OnceLock<Client>,
     ged: GlobalEventDispatcher,
     _marker: std::marker::PhantomData<fn() -> (Tree, I)>,
-
-    codebase: ConcurrentVec<URI>,
 }
 
 impl<Tree, I> LanguageServerInterface<Tree, I>
@@ -55,7 +48,6 @@ where
             client: OnceLock::new(),
             ged,
             _marker: std::marker::PhantomData,
-            codebase: ConcurrentVec::new(),
         }
     }
 
@@ -90,23 +82,14 @@ where
     Tree: TypedTree + 'static,
     I: LanguageServerHandle<Tree> + Send + Sync + 'static,
 {
-    async fn initialize(&self, params: InitializeParams) -> jsonrpc::Result<InitializeResult> {
-        params
-            .workspace_folders
-            .unwrap_or_default()
-            .into_iter()
-            .map::<URI, _>(|folder| folder.uri.into())
-            .for_each(|uri| {
-                self.codebase.push(uri);
-                uri.each_subdirectory_recursive(|uri| {
-                    self.codebase.push(uri);
-                });
-            });
-
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                completion_provider: Some(CompletionOptions::default()),
+    async fn initialize(
+        &self,
+        _params: lsp_types::InitializeParams,
+    ) -> jsonrpc::Result<lsp_types::InitializeResult> {
+        Ok(lsp_types::InitializeResult {
+            capabilities: lsp_types::ServerCapabilities {
+                hover_provider: Some(lsp_types::HoverProviderCapability::Simple(true)),
+                completion_provider: Some(lsp_types::CompletionOptions::default()),
                 workspace: Some(lsp_types::WorkspaceServerCapabilities {
                     workspace_folders: Some(lsp_types::WorkspaceFoldersServerCapabilities {
                         supported: Some(true),
@@ -118,6 +101,13 @@ where
             },
             ..Default::default()
         })
+    }
+
+    async fn did_open(&self, params: lsp_types::DidOpenTextDocumentParams) {
+        let uri: URI = params.text_document.uri.into();
+        if !uri.valid() {
+            return;
+        }
     }
 
     async fn shutdown(&self) -> jsonrpc::Result<()> {

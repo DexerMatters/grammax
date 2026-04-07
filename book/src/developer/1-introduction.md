@@ -1,8 +1,19 @@
 # Introduction
 
-**Grammax** is a framework for building incremental compiler frontends as a stack of persistent layers. It follows the ["terraced fields" design](../design/0-terraces.md): edits flow downward as transactions, and missing data is fetched upward through lazy demand.
+Grammax is a framework for building incremental compiler frontends as a stack of persistent layers. It follows the [terraced fields design](../design/0-terraces.md): edits flow downward as transactions, and missing data is fetched upward through lazy demand.
 
-This part of the book explains how that system works internally. The goal is to make the runtime model easy to follow, so you can build your own layers, passes, and interfaces without guessing how the pieces fit together.
+If you are new to the project, this part of the book is the best place to start. The goal is to explain the runtime model in plain terms so you can understand how the pieces fit together before you write your own layer, pass, or interface.
+
+## The Big Picture
+
+The core idea is simple:
+
+- layers store state;
+- passes transform transactions between layers;
+- the pipeline moves transactions downward and demand upward;
+- the runtime turns the whole tree into a live service.
+
+That separation is what makes Grammax incremental. A parser pass does not reach out and mutate the AST directly. An AST layer does not repair source text on its own. Instead, each layer only knows how to answer queries about its own data and how to apply transactions that were already constructed for it.
 
 ## What This Part Covers
 
@@ -11,7 +22,7 @@ This part of the book explains how that system works internally. The goal is to 
 - `grammax::scheme::passes` contains the built-in passes that connect those layers.
 - `grammax::runtime` and `grammax::interface` wrap a composed tree into an interactive service.
 
-The standard frontend looks like this:
+The standard frontend is usually arranged like this:
 
 ```text
 SourceText
@@ -27,28 +38,41 @@ AstArena
 
 Each layer has one clear job:
 
-- **SourceText** stores editable document text.
-- **ParseTreeIR** stores the lossless CST and parser messages.
-- **AstArena** stores user-facing AST values derived from the CST.
+- `SourceText` stores editable document text.
+- `ParseTreeIR` stores the lossless CST and parser messages.
+- `AstArena` stores user-facing AST values derived from the CST.
 
 Each pass also has one clear job:
 
-- **ParserPass** turns source transactions into CST transactions.
-- **IncrementalLowerer** turns CST transactions into AST transactions.
+- `ParserPass` turns source transactions into CST transactions.
+- `IncrementalLowerer` turns CST transactions into AST transactions.
 
-Lazy loading is not implemented inside those passes. Instead, the pipeline handles it automatically:
+That is the whole architecture in one sentence: source changes become transactions, transactions flow downward, and missing data is pulled upward only when the runtime needs it.
 
-- each index type can declare which upstream index it depends on through `Demand<U>`;
-- the root layer can override `IR::resolve` to fetch missing external data;
-- once the missing upstream data arrives, the normal `push()` path runs and fills the downstream layer.
+## Lazy Loading
 
-So when you read the rest of this guide, keep this model in mind:
+Lazy loading is not encoded inside individual passes. The pipeline handles it automatically.
 
-- layers store data;
-- passes translate transactions;
-- the pipeline propagates demand;
-- the runtime exposes the whole thing as a live service.
+- each downstream index type can declare which upstream index it depends on through `Demand<U>`;
+- the root layer can use `IR::resolve` when it knows how to produce missing data itself;
+- in the standard runtime, the interface can also provide root data for the source layer, such as loading a missing file-backed URI;
+- once the missing data arrives, the normal `push()` path runs and fills the downstream layer.
 
-The following chapters explain those responsibilities one by one.
+That means lazy behavior stays declarative. A layer does not need to know who triggered the query, and a pass does not need to contain special-case loading logic. The dependency is written once, close to the index type that actually needs it.
+
+## How To Read The Rest Of This Guide
+
+The next chapters explain the system in this order:
+
+- [layers](./2-layers.md) explains the `IR` contract, transactions, demand, and the built-in layers;
+- [pipeline](./3-pipeline.md) explains how the builder wires layers together and how queries travel through the tree;
+- [interactive](./4-interactive.md) explains how a composed tree becomes a runtime service with an interface on top.
+
+If you keep the four nouns below in mind, the rest of the book becomes much easier to follow:
+
+- layer = owns data;
+- pass = translates transactions;
+- pipeline = propagates transactions and demand;
+- interface = talks to the outside world.
 
 

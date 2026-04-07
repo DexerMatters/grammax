@@ -4,7 +4,7 @@ Grammax runs each stage of a compiler as a concurrent pipeline node. Each node o
 
 You do not have to manage that concurrency manually. The builder API and the observer API hide most of it behind ordinary Rust types.
 
-## Building a Linear Pipeline
+## Building A Linear Pipeline
 
 The public entry point is `Build::new()`. It starts with a root `SourceText` layer.
 
@@ -22,13 +22,13 @@ Each `then(...)` call does two things at once:
 - add one new downstream layer;
 - give you a `LayerObserver` for that new layer.
 
-So the normal way to read the builder is simply:
+So the normal way to read the builder is:
 
 1. add a stage;
 2. optionally keep its observer;
 3. continue building from there.
 
-If you know monadic APIs, `then(...)` behaves like a typed bind. If you do not, just read it as “attach one more stage and continue.”
+If you know monadic APIs, `then(...)` behaves like a typed bind. If you do not, just read it as "attach one more stage and continue."
 
 Example:
 
@@ -68,7 +68,7 @@ Read that example from top to bottom:
 A typical frontend looks like this:
 
 ```rust
-Build::new().then(ParserPass::new(grammar), ParseTreeIR::default(), |build, cst_observer| {
+Build::new().then(ParserPass::new(grammar), ParseTreeIR::with_grammar(grammar), |build, cst_observer| {
     build.then(
         IncrementalLowerer::new(grammar, mapper),
         AstArena::<AstMapAny>::default(),
@@ -83,7 +83,7 @@ Build::new().then(ParserPass::new(grammar), ParseTreeIR::default(), |build, cst_
 
 That pipeline is still rooted at `SourceText`, but it now has CST and AST layers beneath it.
 
-## Branching a Pipeline
+## Branching A Pipeline
 
 Use `fanout(...)` when one layer should feed two independent branches.
 
@@ -161,7 +161,7 @@ std::thread::spawn(move || {
 
 If the revision number does not matter, `recv()` and `try_recv()` return only the transaction.
 
-## Querying Through an Observer
+## Querying Through An Observer
 
 Observers can also query the current state directly:
 
@@ -190,18 +190,18 @@ Normal lazy demand works like this:
 1. the layer sees `Absent`;
 2. the pipeline asks the index for its upstream dependency through `Demand<U>`;
 3. the upstream query runs synchronously;
-4. if needed, the root layer calls `resolve()`;
+4. if needed, the root layer resolves the missing data;
 5. the resulting transaction flows back down through normal `push()` calls;
 6. the original reply is completed when the requested value finally appears.
 
 So the observer API still feels simple even though the pipeline may be doing multi-layer lazy propagation behind the scenes.
 
-## Path Types in Runtime Code
+## Runtime Paths
 
 When a tree is wrapped by the runtime, paths are described with the same type-level vocabulary used by `ContainsPath`:
 
-- `Here` means the current layer.
-- `Down<P>` means go into the left child, then continue with `P`.
+- `Here` means the current layer;
+- `Down<P>` means go into the left child, then continue with `P`;
 - `Another<P>` means go into the right child, then continue with `P`.
 
 For a linear pipeline `SourceText -> ParseTreeIR -> AstArena`, the common paths are:

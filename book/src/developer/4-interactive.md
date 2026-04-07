@@ -1,16 +1,16 @@
 # Interactive
 
-A Grammax compiler becomes **interactive** when a built tree is wrapped in a runtime service and exposed through an interface.
+A Grammax compiler becomes interactive when a composed tree is wrapped in a runtime service and exposed through an interface.
 
-The split is simple:
+That split keeps the core compiler logic independent from the way a user talks to it.
 
 - the tree describes the compiler itself;
-- the runtime hosts that compiler;
+- the runtime owns the live worker and dispatcher;
 - the interface defines the operations available to the outside world.
 
-## Runtime Service
+## Building A Runtime
 
-You create a runtime from a fully composed tree:
+The runtime starts from a composed tree:
 
 ```rust
 use grammax::interface::BasicInterface;
@@ -20,24 +20,25 @@ use grammax::scheme::passes::ParserPass;
 
 let runtime = Build::new().then(
     ParserPass::new(grammar),
-    ParseTreeIR::default(),
+    ParseTreeIR::with_grammar(grammar),
     |build, _cst_observer| build.build_runtime::<BasicInterface<_>>(grammar),
 );
 ```
 
 `build_runtime::<I>(grammar)` wraps the typed tree into `RuntimeService<Tree, I>`, where `I` is the chosen interface type.
 
-The service owns the runtime dispatcher. The interface methods become the public API you use.
+The runtime service owns the `GlobalEventDispatcher`. The interface methods become the public API that the frontend uses.
 
-Predefined interfaces include:
+The built-in interfaces in the repository are:
 
 - `BasicInterface<Tree>` for simple editing and querying;
 - `CliInterface<Tree>` for terminal-oriented inspection;
-- `WebPreviewInterface<Tree>` for browser-facing CST preview workflows.
+- `WebPreviewInterface<Tree>` for browser-facing CST preview workflows;
+- `LanguageServerInterface<Tree, I>` for the LSP-based frontend used by the `vsclsp` feature.
 
-## The `Interface` Trait
+## The Interface Trait
 
-Custom interfaces implement `Interface<Tree>`:
+Every interface implements `Interface<Tree>`:
 
 ```rust
 pub trait Interface<Tree: TypedTree> {
@@ -51,9 +52,9 @@ pub trait Interface<Tree: TypedTree> {
 }
 ```
 
-The `GlobalEventDispatcher` is created by the runtime. Interfaces do not build it themselves.
+The runtime creates the dispatcher. The interface does not build it itself.
 
-Instead, an interface receives the dispatcher and uses the helper methods on `Interface<Tree>` to send typed requests safely.
+Instead, the interface receives the dispatcher and uses the helper methods on `Interface<Tree>` to send typed requests safely.
 
 Because the tree shape is encoded in the type system, an interface can state exactly which layers it needs. For example:
 
@@ -64,12 +65,12 @@ where
         + ContainsPath<Down<Here>, Target = ParseTreeIR>,
 ```
 
-This means the interface only compiles for trees that contain:
+That means the interface only compiles for trees that contain:
 
 - `SourceText` at `Here`;
 - `ParseTreeIR` at `Down<Here>`.
 
-## Querying a Layer
+## Querying A Layer
 
 The main helper is `query_layer::<Path>(revision, index)`.
 
@@ -113,13 +114,13 @@ let root_view = match self.query_layer::<Down<Here>>(
 };
 ```
 
-This shows the current CST query surface clearly:
+This is the current CST query surface:
 
 - `ParseTreeQuery::Message(uri)` returns parser messages;
 - `ParseTreeQuery::Allocator` returns the allocator;
 - `ParseTreeQuery::Path(DocumentNodePath)` returns a node view.
 
-The optional revision parameter lets the interface ask for a specific accepted revision instead of “whatever is current right now.”
+The optional revision parameter lets the interface ask for a specific accepted revision instead of "whatever is current right now."
 
 ## Editing Source Text
 
@@ -148,7 +149,15 @@ match body {
 
 Here `Down<Here>` means: apply the edit at the source layer, then wait until the parse-tree layer emits the corresponding CST transaction.
 
-## Writing a Good Custom Interface
+## Root Source Resolution
+
+The runtime can also ask the interface to resolve missing source data.
+
+This is how file-backed documents enter the system without being preloaded. The current LSP interface implements that hook with `resolve_source`: it validates the URI, loads the file from disk with `fetch_text()`, and returns a source transaction that creates the text and inserts it at the root.
+
+That keeps source loading out of `SourceText` itself. The layer remains a plain text store, while the interface decides where text comes from.
+
+## Writing A Good Custom Interface
 
 In practice, a clean custom interface usually follows a small set of rules:
 
@@ -156,6 +165,7 @@ In practice, a clean custom interface usually follows a small set of rules:
 - express required layers through `ContainsPath` bounds;
 - use `query_layer()` for typed reads;
 - use `edit_source_text()` or `edit_source_text_till()` for writes;
+- provide a source-resolution hook only if the frontend owns how source documents are loaded;
 - translate runtime errors into the protocol your frontend actually speaks.
 
 If your frontend needs streaming updates instead of request/response behavior, keep the `LayerObserver`s produced during tree construction and run them beside the runtime service. The runtime API and raw observers are meant to work together.

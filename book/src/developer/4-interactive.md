@@ -153,9 +153,9 @@ Here `Down<Here>` means: apply the edit at the source layer, then wait until the
 
 The runtime can also ask the interface to resolve missing source data.
 
-This is how file-backed documents enter the system without being preloaded. The current LSP interface implements that hook with `resolve_source`: it validates the URI, loads the file from disk with `fetch_text()`, and returns a source transaction that creates the text and inserts it at the root.
+This is how source text enters the system when the source layer has not seen a URI yet. The current LSP interface keeps the latest text it receives from `did_open`, so `resolve_source` can serve an open document even if that URI is not loaded locally yet. If the URI was never opened in the editor, it falls back to `fetch_text()` for file-backed documents on disk.
 
-That keeps source loading out of `SourceText` itself. The layer remains a plain text store, while the interface decides where text comes from.
+That keeps source loading out of `SourceText` itself. The layer remains a plain text store, while the interface decides where text comes from and can choose between live editor content and the filesystem.
 
 ## Writing A Good Custom Interface
 

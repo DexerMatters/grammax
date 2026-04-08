@@ -1,4 +1,5 @@
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use rouille::url::Url;
 use tower_lsp::lsp_types::SemanticTokensRegistrationOptions;
@@ -14,6 +15,7 @@ use crate::scheme::{Command, IR, Range, ResolveOutcome, SourceText, URI};
 
 pub struct LanguageServerInterface<Tree: TypedTree, I: LanguageServerHandle<Tree>> {
     client: OnceLock<Client>,
+    opened_documents: Arc<Mutex<HashMap<URI, String>>>,
     ged: GlobalEventDispatcher,
     handle: I,
     _marker: std::marker::PhantomData<fn() -> (Tree, I)>,
@@ -51,6 +53,7 @@ where
     {
         Self {
             client: OnceLock::new(),
+            opened_documents: Arc::new(Mutex::new(HashMap::new())),
             handle: I::new(),
             ged,
             _marker: std::marker::PhantomData,
@@ -65,9 +68,19 @@ where
     where
         Self: Sized,
     {
-        if !index.uri.valid() {
-            return ResolveOutcome::Impossible;
+        if let Ok(opened_documents) = self.opened_documents.lock() {
+            if let Some(text) = opened_documents.get(&index.uri) {
+                let transaction = vec![
+                    Command::Create {
+                        id: 0,
+                        value: internment::Intern::new(text.clone()),
+                    },
+                    Command::Insert { index, id: 0 },
+                ];
+                return ResolveOutcome::Done(Arc::new(transaction));
+            }
         }
+
         let Ok(text) = index.uri.fetch_text() else {
             return ResolveOutcome::Impossible;
         };
@@ -145,8 +158,8 @@ where
 
     async fn did_open(&self, params: lsp_types::DidOpenTextDocumentParams) {
         let uri: URI = params.text_document.uri.into();
-        if !uri.valid() {
-            return;
+        if let Ok(mut opened_documents) = self.opened_documents.lock() {
+            opened_documents.insert(uri, params.text_document.text);
         }
     }
 

@@ -116,20 +116,20 @@ fn test_tap_prints_cst_commands() {
         while let Some(transaction) = cst_observer.recv() {
             println!("=== CST transaction ===");
             for cmd in transaction.iter() {
-                cprintln!("<yellow>CST Command: {:?}</>", cmd);
+                cprintln!("<yellow><bold>CST Command</>: {:?}</>", cmd);
             }
         }
     });
 
     thread::spawn(move || {
         while let Some(transaction) = ast_observer.recv() {
-            if let Ok(root) = ast_observer.query(DocumentNodePath::root("file://undefined")) {
+            if let Ok(root) = ast_observer.query(DocumentNodePath::root("file://preview")) {
                 println!("=== Current JSON AST ===");
                 cprintln!("<cyan>{:#?}</>", root);
             }
             println!("=== AST transaction ===");
             for cmd in transaction.iter() {
-                cprintln!("<green>AST Command  {:?}</>", cmd);
+                cprintln!("<green><bold>AST Command</>: {:?}</>", cmd);
             }
         }
     });

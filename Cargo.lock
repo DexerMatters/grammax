@@ -895,6 +895,7 @@ dependencies = [
  "tokio",
  "tower-lsp",
  "typetag",
+ "ultragraph",
  "webbrowser",
 ]
 
@@ -2234,6 +2235,12 @@ dependencies = [
  "quote",
  "syn",
 ]
+
+[[package]]
+name = "ultragraph"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c226ce8b5e04038b4809d57b20d128b8a6dc02303bece62a333769cf199d75af"
 
 [[package]]
 name = "unicase"

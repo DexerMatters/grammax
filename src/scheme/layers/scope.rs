@@ -12,7 +12,7 @@ type Label = &'static str;
 
 pub type WFDatum<T> = fn(&Datum<T>) -> bool;
 
-pub type WFPath = Regex;
+pub type WFLabel = Regex;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Path {
@@ -85,7 +85,7 @@ where
     T: Display + Clone + Eq,
 {
     pub start: ScopeIx,
-    pub wf_path: WFPath,
+    pub wf_label: WFLabel,
     pub wf_dest: WFDatum<T>,
 }
 
@@ -103,6 +103,7 @@ where
     T: Display + Clone + Eq,
 {
     edges: MultiMap<EdgeIx, Label>,
+    adjacency: FxHashMap<ScopeIx, Vec<(ScopeIx, Label)>>,
     scopes: Vec<Datum<T>>,
     staging: FxHashMap<usize, ScopeGraphAnswer<T>>,
 }
@@ -114,6 +115,7 @@ where
     pub fn new() -> Self {
         Self {
             edges: MultiMap::new(),
+            adjacency: FxHashMap::default(),
             scopes: vec![Datum::empty(Span::empty())], // Entry
             staging: FxHashMap::default(),
         }
@@ -127,6 +129,10 @@ where
 
     pub fn add_edge(&mut self, from: ScopeIx, to: ScopeIx, label: Label) {
         self.edges.insert((from, to), label);
+        let neighbors = self.adjacency.entry(from).or_default();
+        if !neighbors.contains(&(to, label)) {
+            neighbors.push((to, label));
+        }
     }
 }
 
@@ -139,11 +145,12 @@ where
     type Fault = ();
 
     fn query(&self, index: Self::Ix) -> LazyResult<Self::Value, Self::Fault> {
+        use rustc_hash::FxHashSet;
         use std::collections::VecDeque;
 
         let ScopeGraphQuery {
             start,
-            wf_path,
+            wf_label,
             wf_dest,
         } = index;
 
@@ -151,24 +158,11 @@ where
             return LazyResult::Absent;
         };
 
-        if wf_dest(start_datum) && wf_path.is_match("") {
+        if wf_dest(start_datum) && wf_label.is_match("") {
             return LazyResult::Present(ScopeGraphAnswer {
                 path: Path::dest(start),
                 dest: start_datum.clone(),
             });
-        }
-
-        let mut adjacency: FxHashMap<ScopeIx, Vec<(ScopeIx, Label)>> = FxHashMap::default();
-        for ((from, to), labels) in self.edges.iter_all() {
-            for &label in labels {
-                adjacency.entry(*from).or_default().push((*to, label));
-            }
-        }
-        for neighbors in adjacency.values_mut() {
-            neighbors.sort_unstable_by(|(to_a, label_a), (to_b, label_b)| {
-                to_a.cmp(to_b).then_with(|| label_a.cmp(label_b))
-            });
-            neighbors.dedup();
         }
 
         #[derive(Debug, Clone)]
@@ -177,74 +171,44 @@ where
             parent: Option<usize>,
             from: ScopeIx,
             label: Label,
-            path_text: String,
-            depth: usize,
         }
 
-        fn contains_scope(states: &[SearchState], mut state_ix: usize, target: ScopeIx) -> bool {
-            loop {
-                let state = &states[state_ix];
-                if state.scope == target {
-                    return true;
-                }
-                let Some(parent_ix) = state.parent else {
-                    return false;
-                };
-                state_ix = parent_ix;
-            }
-        }
-
-        let max_depth = self.scopes.len().saturating_sub(1);
         let mut states = vec![SearchState {
             scope: start,
             parent: None,
             from: start,
             label: "",
-            path_text: String::new(),
-            depth: 0,
         }];
         let mut queue = VecDeque::from([0usize]);
+        let mut visited: FxHashSet<ScopeIx> = FxHashSet::default();
+        visited.insert(start);
 
         while let Some(cur_ix) = queue.pop_front() {
             let cur_scope = states[cur_ix].scope;
-            let cur_depth = states[cur_ix].depth;
-            let cur_path_text = states[cur_ix].path_text.clone();
-            if cur_depth >= max_depth {
-                continue;
-            }
 
-            let Some(neighbors) = adjacency.get(&cur_scope) else {
+            let Some(neighbors) = self.adjacency.get(&cur_scope) else {
                 continue;
             };
 
             for &(to, label) in neighbors {
-                if to >= self.scopes.len() {
+                if visited.contains(&to) {
                     continue;
                 }
-                if contains_scope(&states, cur_ix, to) {
+                if !wf_label.is_match(label) {
                     continue;
                 }
 
-                let mut path_text = cur_path_text.clone();
-                if path_text.is_empty() {
-                    path_text.push_str(label);
-                } else {
-                    path_text.push('/');
-                    path_text.push_str(label);
-                }
-
+                visited.insert(to);
                 let next_ix = states.len();
                 states.push(SearchState {
                     scope: to,
                     parent: Some(cur_ix),
                     from: cur_scope,
                     label,
-                    path_text,
-                    depth: cur_depth + 1,
                 });
 
                 let datum = &self.scopes[to];
-                if wf_dest(datum) && wf_path.is_match(&states[next_ix].path_text) {
+                if wf_dest(datum) {
                     let mut path = Path::dest(to);
                     let mut walk_ix = next_ix;
                     while let Some(parent_ix) = states[walk_ix].parent {

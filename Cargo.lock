@@ -884,6 +884,7 @@ dependencies = [
  "ctrlc",
  "internment",
  "mime_guess",
+ "multimap",
  "ractor",
  "regex",
  "rouille",
@@ -895,7 +896,6 @@ dependencies = [
  "tokio",
  "tower-lsp",
  "typetag",
- "ultragraph",
  "webbrowser",
 ]
 
@@ -1303,6 +1303,15 @@ dependencies = [
  "log",
  "wasi",
  "windows-sys",
+]
+
+[[package]]
+name = "multimap"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
+dependencies = [
+ "serde",
 ]
 
 [[package]]
@@ -2235,12 +2244,6 @@ dependencies = [
  "quote",
  "syn",
 ]
-
-[[package]]
-name = "ultragraph"
-version = "0.8.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c226ce8b5e04038b4809d57b20d128b8a6dc02303bece62a333769cf199d75af"
 
 [[package]]
 name = "unicase"

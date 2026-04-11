@@ -2,7 +2,7 @@ use std::cell::RefCell;
 
 use rustc_hash::FxHashMap;
 
-use crate::scheme::{Command, DocumentSpan, IR, LazyResult, Span, Transaction, URI};
+use crate::scheme::{Command, DocumentSpan, LazyResult, SimpleIR, Span, Transaction, URI};
 
 pub type SourceAtom = internment::Intern<String>;
 
@@ -285,8 +285,8 @@ fn align_insert_point(gap: &GapBuf, pos: usize) -> usize {
 
 // ── IR impl ──────────────────────────────────────────────────────────────────
 
-impl IR for SourceText {
-    type Ix = DocumentSpan;
+impl SimpleIR for SourceText {
+    type Index = DocumentSpan;
     /// An interned text fragment (either stored or staged).
     type Value = SourceAtom;
     type Fault = SourceFault;
@@ -316,7 +316,7 @@ impl IR for SourceText {
     }
 
     /// Clears staging table then applies the transaction directly.
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), SourceFault> {
+    fn apply(&mut self, transaction: Transaction<Self>) -> Result<(), SourceFault> {
         self.staging.clear();
         for command in transaction.iter() {
             match command {

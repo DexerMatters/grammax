@@ -19,7 +19,7 @@ fn path_query(uri: &URI, path: &NodePath) -> ParseTreeQuery {
     ParseTreeQuery::Path(DocumentNodePath(*uri, path.0.clone()))
 }
 
-type Command = crate::scheme::Command<ParseTreeIR>;
+type Command = crate::scheme::LayerCommand<ParseTreeIR>;
 type EqCache = FxHashMap<(usize, usize, usize, usize, bool), bool>;
 type AlignCache = FxHashMap<(usize, usize), bool>;
 

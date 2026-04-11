@@ -64,7 +64,7 @@ where
         &self.ged
     }
 
-    fn resolve_source(&self, index: <SourceText as IR>::Ix) -> ResolveOutcome<SourceText>
+    fn resolve_source(&self, index: <SourceText as IR>::Index) -> ResolveOutcome<SourceText>
     where
         Self: Sized,
     {

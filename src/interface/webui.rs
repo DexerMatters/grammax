@@ -15,7 +15,7 @@ use crate::{
     },
     scheme::{
         Command,
-        layers::{DocumentNodePath, ParseTreeIR, SourceText},
+        layers::{DocumentNodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText},
     },
 };
 
@@ -267,9 +267,8 @@ fn is_port_free(host: &str, port: u16) -> bool {
     }
 }
 
-fn commands_to_web_json(commands: &[Command<ParseTreeIR>]) -> serde_json::Value {
+fn commands_to_web_json(commands: &[Command<ParseTreeQuery, ParseTreeValue>]) -> serde_json::Value {
     use crate::scheme::Command;
-    use crate::scheme::layers::ParseTreeQuery;
 
     fn path_to_json(path: &DocumentNodePath) -> serde_json::Value {
         serde_json::Value::Array(

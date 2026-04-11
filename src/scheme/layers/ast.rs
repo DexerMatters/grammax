@@ -178,7 +178,7 @@ impl<'de, T> serde::Deserialize<'de> for AstCell<T> {
     }
 }
 
-pub type AstDelta<T> = Vec<scheme::Command<AstArena<T>>>;
+pub type AstDelta<T> = Vec<scheme::LayerCommand<AstArena<T>>>;
 
 // ── AstMapAny ─────────────────────────────────────────────────────────────────
 
@@ -765,30 +765,43 @@ impl<T> AstArena<T> {
     }
 }
 
-impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::IR for AstArena<T> {
-    type Ix = DocumentNodePath;
+impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::SimpleIR for AstArena<T> {
+    type Index = DocumentNodePath;
     type Value = T;
     type Fault = AstArenaFault;
 
     fn query(&self, index: DocumentNodePath) -> LazyResult<T, AstArenaFault> {
         use LazyResult::*;
-        let Some(path) = self.resolve_path(&index) else { return Absent };
-        let Some(node) = self.get_erased(path) else { return Absent };
-        let type_mismatch = AstArenaFault::TypeMismatch { path: index.clone(), expected: type_name::<T>() };
+        let Some(path) = self.resolve_path(&index) else {
+            return Absent;
+        };
+        let Some(node) = self.get_erased(path) else {
+            return Absent;
+        };
+        let type_mismatch = AstArenaFault::TypeMismatch {
+            path: index.clone(),
+            expected: type_name::<T>(),
+        };
         AST_CELL_CLONE_ARENA.with(|slot| {
             let prev = slot.replace(Some(self.storage_ptr()));
             let result = if TypeId::of::<T>() == TypeId::of::<AstMapAny>() {
                 let boxed: Box<dyn Any> = Box::new(AstMapAny(node.clone()));
-                boxed.downcast::<T>().map(|b| Present(*b)).unwrap_or(Fault(type_mismatch))
+                boxed
+                    .downcast::<T>()
+                    .map(|b| Present(*b))
+                    .unwrap_or(Fault(type_mismatch))
             } else {
-                node.downcast_ref::<T>().cloned().map(Present).unwrap_or(Fault(type_mismatch))
+                node.downcast_ref::<T>()
+                    .cloned()
+                    .map(Present)
+                    .unwrap_or(Fault(type_mismatch))
             };
             slot.set(prev);
             result
         })
     }
 
-    fn apply_transaction(&mut self, txn: scheme::Transaction<Self>) -> Result<(), AstArenaFault> {
+    fn apply(&mut self, txn: scheme::Transaction<Self>) -> Result<(), AstArenaFault> {
         use std::collections::HashMap;
 
         // Is T == AstMapAny?  If so we must *unwrap* the inner ErasedAstNode

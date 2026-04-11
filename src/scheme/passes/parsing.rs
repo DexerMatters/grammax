@@ -5,10 +5,7 @@ use crate::{
     parsec::{Parser, ParserConfig},
     scheme::{
         self, DocumentSpan, LayerObserver, ObserveError, Span, URI,
-        layers::{
-            ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText,
-            source::SourceFault,
-        },
+        layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText, source::SourceFault},
     },
 };
 
@@ -52,8 +49,8 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
         &mut self,
         upstream: &LayerObserver<SourceText>,
         downstream: &ParseTreeIR,
-        txn: &[scheme::Command<SourceText>],
-    ) -> Vec<scheme::Command<ParseTreeIR>> {
+        txn: &[scheme::LayerCommand<SourceText>],
+    ) -> Vec<scheme::LayerCommand<ParseTreeIR>> {
         // Every SourceText transaction must carry at least one edit command that
         // identifies which document changed. No URI -> nothing to do.
         let Some(uri) = find_uri_in_txn(txn) else {
@@ -104,7 +101,7 @@ fn full_parse_transaction(
     pass: &mut ParserPass,
     uri: &URI,
     new_text: &str,
-) -> Vec<scheme::Command<ParseTreeIR>> {
+) -> Vec<scheme::LayerCommand<ParseTreeIR>> {
     let crate::parsec::Result { root, .. } = pass.reparser.parser.parse_text(new_text);
     pass.reparser.current = std::rc::Rc::new(root.clone());
     let tree_cmds = delta::generate_commands_for_full_tree(
@@ -118,7 +115,7 @@ fn full_parse_transaction(
 
 /// Extract the single edit (URI, Span, new_len) from a SourceText transaction.
 /// Returns `None` for multi-edit batches or transactions with no edit commands.
-fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(URI, Span, usize)> {
+fn extract_edit(txn: &[scheme::LayerCommand<SourceText>]) -> Option<(URI, Span, usize)> {
     let mut staged_len: FxHashMap<usize, usize> = FxHashMap::default();
     let mut edit_count = 0usize;
     let mut result: Option<(URI, Span, usize)> = None;
@@ -149,7 +146,7 @@ fn extract_edit(txn: &[scheme::Command<SourceText>]) -> Option<(URI, Span, usize
 }
 
 /// Extract just the URI from any edit command in the transaction (for multi-edit batches).
-fn find_uri_in_txn(txn: &[scheme::Command<SourceText>]) -> Option<URI> {
+fn find_uri_in_txn(txn: &[scheme::LayerCommand<SourceText>]) -> Option<URI> {
     for cmd in txn {
         match cmd {
             scheme::Command::Delete { index: ds } => return Some(ds.uri),
@@ -168,8 +165,8 @@ fn find_uri_in_txn(txn: &[scheme::Command<SourceText>]) -> Option<URI> {
 fn prepend_messages_command(
     uri: &URI,
     messages: &crate::parsec::msg::ParserMessages,
-    rest: Vec<scheme::Command<ParseTreeIR>>,
-) -> Vec<scheme::Command<ParseTreeIR>> {
+    rest: Vec<scheme::LayerCommand<ParseTreeIR>>,
+) -> Vec<scheme::LayerCommand<ParseTreeIR>> {
     if messages.is_empty() {
         return rest;
     }

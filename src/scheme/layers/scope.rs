@@ -1,10 +1,9 @@
 use std::fmt::Display;
 
-use multimap::MultiMap;
 use regex::Regex;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::scheme::{Command, IR, LazyResult, Span, Transaction};
+use crate::scheme::{Command, IR, LazyResult, Span, Transaction, URI};
 
 type ScopeIx = usize;
 type EdgeIx = (ScopeIx, ScopeIx);
@@ -46,6 +45,7 @@ where
     T: Display + Clone + Eq,
 {
     kind: DatumKind<T>,
+    uri: URI,
     span: Span,
 }
 
@@ -53,23 +53,26 @@ impl<T> Datum<T>
 where
     T: Display + Clone + Eq,
 {
-    pub fn name(name: String, span: Span) -> Self {
+    pub fn name(name: String, uri: URI, span: Span) -> Self {
         Self {
             kind: DatumKind::Name(name),
+            uri,
             span,
         }
     }
 
-    pub fn value(value: T, span: Span) -> Self {
+    pub fn value(value: T, uri: URI, span: Span) -> Self {
         Self {
             kind: DatumKind::Value(value),
+            uri,
             span,
         }
     }
 
-    pub fn empty(span: Span) -> Self {
+    pub fn empty(uri: URI, span: Span) -> Self {
         Self {
             kind: DatumKind::Empty,
+            uri,
             span,
         }
     }
@@ -98,14 +101,28 @@ where
     pub dest: Datum<T>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScopeGraphIndex {
+    Scope(ScopeIx),
+    Edge(ScopeIx, ScopeIx, Label),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum ScopeGraphValue<T>
+where
+    T: Display + Clone + Eq,
+{
+    Datum(Datum<T>),
+    Edge,
+}
+
 pub struct ScopeGraphIR<T>
 where
     T: Display + Clone + Eq,
 {
-    edges: MultiMap<EdgeIx, Label>,
+    edges: FxHashMap<EdgeIx, FxHashSet<Label>>,
     adjacency: FxHashMap<ScopeIx, Vec<(ScopeIx, Label)>>,
     scopes: Vec<Datum<T>>,
-    staging: FxHashMap<usize, ScopeGraphAnswer<T>>,
 }
 
 impl<T> ScopeGraphIR<T>
@@ -114,10 +131,9 @@ where
 {
     pub fn new() -> Self {
         Self {
-            edges: MultiMap::new(),
+            edges: FxHashMap::default(),
             adjacency: FxHashMap::default(),
-            scopes: vec![Datum::empty(Span::empty())], // Entry
-            staging: FxHashMap::default(),
+            scopes: vec![Datum::empty(URI::default(), Span::empty())], // Entry
         }
     }
 
@@ -128,7 +144,7 @@ where
     }
 
     pub fn add_edge(&mut self, from: ScopeIx, to: ScopeIx, label: Label) {
-        self.edges.insert((from, to), label);
+        self.edges.entry((from, to)).or_default().insert(label);
         let neighbors = self.adjacency.entry(from).or_default();
         if !neighbors.contains(&(to, label)) {
             neighbors.push((to, label));
@@ -140,11 +156,13 @@ impl<T> IR for ScopeGraphIR<T>
 where
     T: Display + Clone + Eq,
 {
-    type Ix = ScopeGraphQuery<T>;
-    type Value = ScopeGraphAnswer<T>;
+    type Query = ScopeGraphQuery<T>;
+    type Answer = ScopeGraphAnswer<T>;
+    type Index = ScopeGraphIndex;
+    type Value = ScopeGraphValue<T>;
     type Fault = ();
 
-    fn query(&self, index: Self::Ix) -> LazyResult<Self::Value, Self::Fault> {
+    fn query(&self, index: Self::Query) -> LazyResult<Self::Answer, Self::Fault> {
         use rustc_hash::FxHashSet;
         use std::collections::VecDeque;
 
@@ -229,28 +247,68 @@ where
         LazyResult::Absent
     }
 
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
+    fn apply(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
     where
         Self: Sized,
     {
-        self.staging.clear();
+        let mut staged: FxHashMap<usize, ScopeGraphValue<T>> = FxHashMap::default();
         for command in transaction.iter() {
             match command {
                 Command::Create { id, value } => {
-                    self.staging.insert(*id, value.clone());
+                    staged.insert(*id, value.clone());
                 }
-                Command::Insert { index: _, id: _ } => {
-                    todo!()
-                }
-                Command::Delete { index: _ } => {
-                    todo!()
-                }
-                Command::Replace { index: _, id: _ } => {
-                    todo!()
-                }
+                Command::Insert { index, id } => match index {
+                    ScopeGraphIndex::Scope(ix) => {
+                        if let Some(ScopeGraphValue::Datum(datum)) = staged.remove(id) {
+                            while self.scopes.len() <= *ix {
+                                self.scopes
+                                    .push(Datum::empty(URI::default(), Span::empty()));
+                            }
+                            self.scopes[*ix] = datum;
+                        }
+                    }
+                    ScopeGraphIndex::Edge(from, to, label) => {
+                        staged.remove(id);
+                        self.add_edge(*from, *to, label);
+                    }
+                },
+                Command::Delete { index } => match index {
+                    ScopeGraphIndex::Scope(ix) => {
+                        if *ix < self.scopes.len() {
+                            self.scopes[*ix] = Datum::empty(URI::default(), Span::empty());
+                            self.adjacency.remove(ix);
+                            for neighbors in self.adjacency.values_mut() {
+                                neighbors.retain(|(to, _)| to != ix);
+                            }
+                            self.edges.retain(|(f, t), _| f != ix && t != ix);
+                        }
+                    }
+                    ScopeGraphIndex::Edge(from, to, label) => {
+                        if let Some(labels) = self.edges.get_mut(&(*from, *to)) {
+                            labels.remove(label);
+                            if labels.is_empty() {
+                                self.edges.remove(&(*from, *to));
+                            }
+                        }
+                        if let Some(neighbors) = self.adjacency.get_mut(from) {
+                            neighbors.retain(|(t, l)| t != to || l != label);
+                        }
+                    }
+                },
+                Command::Replace { index, id } => match index {
+                    ScopeGraphIndex::Scope(ix) => {
+                        if let Some(ScopeGraphValue::Datum(datum)) = staged.remove(id) {
+                            if *ix < self.scopes.len() {
+                                self.scopes[*ix] = datum;
+                            }
+                        }
+                    }
+                    ScopeGraphIndex::Edge(..) => {
+                        staged.remove(id); // edges are binary; replace is a no-op
+                    }
+                },
             }
         }
-
         Ok(())
     }
 }

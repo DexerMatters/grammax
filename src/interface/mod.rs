@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use std::{any::type_name, marker::PhantomData};
 
 use crate::{
@@ -34,7 +34,7 @@ pub trait Interface<Tree: TypedTree> {
 
     fn resolve_source(
         &self,
-        _index: <scheme::SourceText as scheme::IR>::Ix,
+        _index: <scheme::SourceText as scheme::IR>::Query,
     ) -> scheme::ResolveOutcome<scheme::SourceText>
     where
         Self: Sized,
@@ -59,13 +59,14 @@ pub trait Interface<Tree: TypedTree> {
     fn query_layer<Path>(
         &self,
         revision: Option<runtime::RevisionId>,
-        index: <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix,
-    ) -> LayerResult<Tree, Path, <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value>
+        index: <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Query,
+    ) -> LayerResult<Tree, Path, <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Answer>
     where
         Tree: ContainsPath<Path>,
-        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value: Send + Sync + 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Answer: Send + Sync + 'static,
         <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Fault: 'static,
-        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Ix: Serialize + Send + Sync + 'static,
+        <<Tree as ContainsPath<Path>>::Target as scheme::IR>::Query:
+            Serialize + DeserializeOwned + Send + Sync + 'static,
         Self: Sized,
     {
         match request(
@@ -81,7 +82,7 @@ pub trait Interface<Tree: TypedTree> {
         })?
         {
             runtime::RuntimeSignal::QueryResult { value, .. } => value
-                .downcast::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Value>()
+                .downcast::<<<Tree as ContainsPath<Path>>::Target as scheme::IR>::Answer>()
                 .ok_or_else(|| runtime::RuntimeError::UnexpectedRequestType),
             other => Err(runtime::RuntimeError::UndefinedBehavior {
                 message: format!("unexpected signal for query request: {other:?}"),

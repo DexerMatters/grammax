@@ -95,33 +95,39 @@ impl<V, F> LazyResult<V, F> {
     }
 }
 
-/// Declares the upstream dependency for a downstream index type.
+/// Declares the upstream dependency for a downstream query type.
 ///
-/// Implement this on `D::Ix` to declare which upstream index must be resolved
-/// when this index is absent. The pipeline calls `upstream_index` automatically
+/// Implement this on `D::Query` to declare which upstream index must be resolved
+/// when this query is absent. The pipeline calls `upstream_index` automatically
 /// on every absent query — no pass involvement required.
 pub trait Demand<U: IR> {
-    fn upstream_index(&self) -> Option<U::Ix>;
+    fn upstream_index(&self) -> Option<U::Query>;
 }
 
 pub trait IR {
-    type Ix;
+    /// The index type used for read queries.
+    type Query;
+    /// The value returned by read queries.
+    type Answer;
+    /// The index type used in mutation commands.
+    type Index;
+    /// The value type stored and mutated via commands.
     type Value;
     /// Only permanent domain errors. Absence is expressed via `LazyResult::Absent`.
     type Fault;
 
-    fn query(&self, index: Self::Ix) -> LazyResult<Self::Value, Self::Fault>;
+    fn query(&self, index: Self::Query) -> LazyResult<Self::Answer, Self::Fault>;
 
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
+    fn apply(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
     where
         Self: Sized;
 
-    /// Lazily resolve a missing index.
+    /// Lazily resolve a missing query.
     ///
     /// Called only when `query` returns `Absent` and strict mode is off.
     /// The default implementation always returns `Impossible`, meaning the IR
     /// has no lazy-resolution capability.
-    fn resolve(&mut self, _index: Self::Ix) -> ResolveOutcome<Self>
+    fn resolve(&mut self, _index: Self::Query) -> ResolveOutcome<Self>
     where
         Self: Sized,
     {
@@ -167,14 +173,14 @@ pub trait Pass<U: IR, D: IR> {
         &mut self,
         upstream: &LayerObserver<U>,
         downstream: &D,
-        txn: &[Command<U>],
-    ) -> Vec<Command<D>>;
+        txn: &[Command<U::Index, U::Value>],
+    ) -> Vec<Command<D::Index, D::Value>>;
 }
 
 pub(crate) struct QueryMsg<Repr: IR> {
-    pub(crate) index: Repr::Ix,
+    pub(crate) index: Repr::Query,
     pub(crate) strict: bool,
-    pub(crate) reply: channel::Sender<Result<Repr::Value, ObserveError<Repr::Fault>>>,
+    pub(crate) reply: channel::Sender<Result<Repr::Answer, ObserveError<Repr::Fault>>>,
 }
 
 pub struct QueryHandle<Repr: IR> {
@@ -196,9 +202,9 @@ impl<Repr: IR> QueryHandle<Repr> {
 
     fn query_with_mode(
         &self,
-        index: Repr::Ix,
+        index: Repr::Query,
         strict: bool,
-    ) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+    ) -> Result<Repr::Answer, ObserveError<Repr::Fault>> {
         let (reply_tx, reply_rx) = channel::bounded(1);
         self.query_sender
             .send(QueryMsg {
@@ -210,11 +216,14 @@ impl<Repr: IR> QueryHandle<Repr> {
         reply_rx.recv().map_err(|_| ObserveError::Disconnected)?
     }
 
-    pub fn query(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+    pub fn query(&self, index: Repr::Query) -> Result<Repr::Answer, ObserveError<Repr::Fault>> {
         self.query_with_mode(index, false)
     }
 
-    pub fn query_strict(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+    pub fn query_strict(
+        &self,
+        index: Repr::Query,
+    ) -> Result<Repr::Answer, ObserveError<Repr::Fault>> {
         self.query_with_mode(index, true)
     }
 }
@@ -242,13 +251,16 @@ impl<Repr: IR> LayerObserver<Repr> {
         self.try_recv_update().map(|(_, txn)| txn)
     }
 
-    pub fn query(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+    pub fn query(&self, index: Repr::Query) -> Result<Repr::Answer, ObserveError<Repr::Fault>> {
         self.handle
             .get()
             .map_or(Err(ObserveError::NotReady), |h| h.query(index))
     }
 
-    pub fn query_strict(&self, index: Repr::Ix) -> Result<Repr::Value, ObserveError<Repr::Fault>> {
+    pub fn query_strict(
+        &self,
+        index: Repr::Query,
+    ) -> Result<Repr::Answer, ObserveError<Repr::Fault>> {
         self.handle
             .get()
             .map_or(Err(ObserveError::NotReady), |h| h.query_strict(index))
@@ -276,13 +288,13 @@ impl<Repr: IR> LayerObserver<Repr> {
 fn resolve_query<U, D>(
     upstream: &LayerObserver<U>,
     downstream: &D,
-    index: D::Ix,
+    index: D::Query,
     strict: bool,
-) -> Result<D::Value, ObserveError<D::Fault>>
+) -> Result<D::Answer, ObserveError<D::Fault>>
 where
     U: IR,
     D: IR,
-    D::Ix: Clone + Demand<U>,
+    D::Query: Clone + Demand<U>,
 {
     match downstream.query(index.clone()) {
         LazyResult::Present(value) => Ok(value),
@@ -306,11 +318,15 @@ where
 pub struct Pipeline<U, P, D>
 where
     U: IR + Send + 'static,
-    U::Ix: Send + Sync,
+    U::Query: Send + Sync,
+    U::Answer: Send + Sync,
+    U::Index: Send + Sync,
     U::Value: Send + Sync,
     U::Fault: Send,
     D: IR + Send + Clone + 'static,
-    D::Ix: Clone + PartialEq + Send + Sync + Demand<U>,
+    D::Query: Clone + PartialEq + Send + Sync + Demand<U>,
+    D::Answer: Send + Sync,
+    D::Index: Send + Sync,
     D::Value: Send + Sync,
     D::Fault: Send,
     P: Pass<U, D> + 'static,
@@ -324,12 +340,16 @@ where
 impl<U, P, D> Pipeline<U, P, D>
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + Send + Sync,
-    U::Value: Clone + Send + Sync,
+    U::Query: Clone + Send + Sync,
+    U::Answer: Send + Sync,
+    U::Index: Send + Sync,
+    U::Value: Send + Sync,
     U::Fault: Send,
     D: IR + Send + Clone + 'static,
-    D::Ix: Clone + PartialEq + Send + Sync + Demand<U>,
-    D::Value: Clone + Send + Sync,
+    D::Query: Clone + PartialEq + Send + Sync + Demand<U>,
+    D::Answer: Clone + Send + Sync,
+    D::Index: Send + Sync,
+    D::Value: Send + Sync,
     D::Fault: Send,
     P: Pass<U, D> + 'static,
 {
@@ -350,15 +370,15 @@ where
             let mut pass = make_pass();
             let mut downstream = downstream;
             let mut pending: Vec<(
-                D::Ix,
-                channel::Sender<Result<D::Value, ObserveError<D::Fault>>>,
+                D::Query,
+                channel::Sender<Result<D::Answer, ObserveError<D::Fault>>>,
             )> = Vec::new();
             loop {
                 crossbeam::select! {
                     recv(receiver) -> msg => match msg {
                         Ok(txn) => {
                             let cmds = Arc::new(pass.push(&upstream, &downstream, txn.as_ref()));
-                            let tap_cmds = if downstream.apply_transaction(Arc::clone(&cmds)).is_ok() {
+                            let tap_cmds = if downstream.apply(Arc::clone(&cmds)).is_ok() {
                                 cmds
                             } else {
                                 Arc::new(vec![])
@@ -428,26 +448,19 @@ where
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 #[serde(bound(
-    serialize = "Repr::Ix: serde::Serialize, Repr::Value: serde::Serialize",
-    deserialize = "Repr::Ix: serde::Deserialize<'de>, Repr::Value: serde::Deserialize<'de>"
+    serialize = "I: serde::Serialize, V: serde::Serialize",
+    deserialize = "I: serde::Deserialize<'de>, V: serde::Deserialize<'de>"
 ))]
-pub enum Command<Repr: IR> {
-    Create { id: usize, value: Repr::Value },
-    Insert { index: Repr::Ix, id: usize },
-    Delete { index: Repr::Ix },
-    Replace { index: Repr::Ix, id: usize },
+pub enum Command<I, V> {
+    Create { id: usize, value: V },
+    Insert { index: I, id: usize },
+    Delete { index: I },
+    Replace { index: I, id: usize },
 }
 
-impl<Repr: IR> Command<Repr> {
+impl<I: Clone, V: Clone> Command<I, V> {
     /// Clone this command by cloning only its fields.
-    ///
-    /// This method only requires `Repr::Ix: Clone` and `Repr::Value: Clone`,
-    /// unlike the derive-generated `Clone` impl which requires `Repr: Clone`.
-    pub fn clone_fields(&self) -> Self
-    where
-        Repr::Ix: Clone,
-        Repr::Value: Clone,
-    {
+    pub fn clone_fields(&self) -> Self {
         match self {
             Command::Create { id, value } => Command::Create {
                 id: *id,
@@ -468,4 +481,50 @@ impl<Repr: IR> Command<Repr> {
     }
 }
 
-pub type Transaction<Repr> = std::sync::Arc<Vec<Command<Repr>>>;
+/// A [`Command`] parameterized by an IR layer's write-side index and value types.
+pub type LayerCommand<R: IR> = Command<R::Index, R::Value>;
+
+/// A batch of [`LayerCommand`]s for a single layer.
+pub type Transaction<R: IR> = std::sync::Arc<Vec<LayerCommand<R>>>;
+
+/// A simplified IR where the read-side and write-side types are unified.
+///
+/// Implement this instead of [`IR`] when `Query = Index` and `Answer = Value`
+/// (the common case for most pipeline layers). A blanket
+/// `impl<T: SimpleIR> IR for T` is provided automatically.
+pub trait SimpleIR {
+    /// The unified index/query address type.
+    type Index;
+    /// The unified stored/returned value type.
+    type Value;
+    /// Only permanent domain errors. Absence is expressed via [`LazyResult::Absent`].
+    type Fault;
+
+    fn query(&self, index: Self::Index) -> LazyResult<Self::Value, Self::Fault>;
+
+    fn apply(
+        &mut self,
+        transaction: std::sync::Arc<Vec<Command<Self::Index, Self::Value>>>,
+    ) -> Result<(), Self::Fault>
+    where
+        Self: Sized;
+}
+
+impl<T: SimpleIR> IR for T {
+    type Query = T::Index;
+    type Answer = T::Value;
+    type Index = T::Index;
+    type Value = T::Value;
+    type Fault = T::Fault;
+
+    fn query(&self, index: T::Index) -> LazyResult<T::Value, T::Fault> {
+        <Self as SimpleIR>::query(self, index)
+    }
+
+    fn apply(
+        &mut self,
+        transaction: std::sync::Arc<Vec<Command<T::Index, T::Value>>>,
+    ) -> Result<(), T::Fault> {
+        <Self as SimpleIR>::apply(self, transaction)
+    }
+}

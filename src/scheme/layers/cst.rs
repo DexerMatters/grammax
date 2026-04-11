@@ -8,7 +8,7 @@ use crate::{
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
         view::{NodeView, Viewer},
     },
-    scheme::{self, IR, LazyResult, Span, URI},
+    scheme::{self, LazyResult, SimpleIR, Span, URI},
 };
 
 /// Internal path within a single document's parse tree.
@@ -625,8 +625,8 @@ impl ParseTreeIR {
     }
 }
 
-impl IR for ParseTreeIR {
-    type Ix = ParseTreeQuery;
+impl SimpleIR for ParseTreeIR {
+    type Index = ParseTreeQuery;
     type Value = ParseTreeValue;
     type Fault = ParseTreeFault;
 
@@ -668,10 +668,7 @@ impl IR for ParseTreeIR {
         }
     }
 
-    fn apply_transaction(
-        &mut self,
-        transaction: scheme::Transaction<Self>,
-    ) -> Result<(), ParseTreeFault> {
+    fn apply(&mut self, transaction: scheme::Transaction<Self>) -> Result<(), ParseTreeFault> {
         // Flush a batch of child edits for the current (URI, parent_path) pair.
         let flush_pending =
             |this: &mut Self,

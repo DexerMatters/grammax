@@ -222,7 +222,9 @@ impl<U: IR, P1, Left: TypedTree, P2, Right: TypedTree> ListenerTree
 fn make_observer<U>(listeners: &SharedListeners<U>) -> LayerObserver<U>
 where
     U: IR + Send + 'static,
-    U::Ix: Send + Sync + 'static,
+    U::Query: Send + Sync + 'static,
+    U::Answer: Send + Sync + 'static,
+    U::Index: Send + Sync + 'static,
     U::Value: Send + Sync + 'static,
 {
     let (tx, rx) = channel::unbounded();
@@ -291,14 +293,18 @@ impl<
 impl<U> Build<End<U>>
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    U::Answer: Clone + Send + Sync + 'static,
+    U::Index: Clone + Send + Sync + 'static,
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
 {
     pub fn then<P, D, K, R>(self, pass: P, downstream: D, k: K) -> R
     where
         D: IR + Clone + Send + 'static,
-        D::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+        D::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+        D::Answer: Clone + Send + Sync + 'static,
+        D::Index: Clone + Send + Sync + 'static,
         D::Value: Clone + Send + Sync + 'static,
         D::Fault: Send + Sync + fmt::Debug + 'static,
         P: scheme::Pass<U, D>,
@@ -358,11 +364,15 @@ where
 impl<U, P, D> Build<Then<U, P, End<D>>>
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    U::Answer: Clone + Send + Sync + 'static,
+    U::Index: Clone + Send + Sync + 'static,
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
     D: IR + Clone + Send + 'static,
-    D::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    D::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    D::Answer: Clone + Send + Sync + 'static,
+    D::Index: Clone + Send + Sync + 'static,
     D::Value: Clone + Send + Sync + 'static,
     D::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, D>,
@@ -370,7 +380,9 @@ where
     pub fn then<NewP, NewD, K, R>(self, pass: NewP, downstream: NewD, k: K) -> R
     where
         NewD: IR + Clone + Send + 'static,
-        NewD::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+        NewD::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+        NewD::Answer: Clone + Send + Sync + 'static,
+        NewD::Index: Clone + Send + Sync + 'static,
         NewD::Value: Clone + Send + Sync + 'static,
         NewD::Fault: Send + Sync + fmt::Debug + 'static,
         NewP: scheme::Pass<D, NewD>,
@@ -503,6 +515,7 @@ trait InstallTree: TypedTree + Sized {
     ) where
         Self::Current: Send + 'static,
         SourceText: Send + 'static,
+        <Self::Current as IR>::Answer: Clone + Send + Sync + 'static,
         <Self::Current as IR>::Value: Clone + Send + Sync + 'static,
         <Self::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static;
 }
@@ -510,7 +523,9 @@ trait InstallTree: TypedTree + Sized {
 impl<U> InstallTree for End<U>
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    U::Answer: Clone + Send + Sync + 'static,
+    U::Index: Clone + Send + Sync + 'static,
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
 {
@@ -534,19 +549,17 @@ where
 impl<U, P, Left> InstallTree for Then<U, P, Left>
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    U::Answer: Clone + Send + Sync + 'static,
+    U::Index: Clone + Send + Sync + 'static,
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
     Left: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
-    <Left::Current as IR>::Ix: Clone
-        + PartialEq
-        + Send
-        + Sync
-        + Serialize
-        + DeserializeOwned
-        + scheme::Demand<U>
-        + 'static,
+    <Left::Current as IR>::Query:
+        Clone + PartialEq + Send + Sync + DeserializeOwned + scheme::Demand<U> + 'static,
+    <Left::Current as IR>::Answer: Clone + Send + Sync + 'static,
+    <Left::Current as IR>::Index: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, Left::Current> + Send + 'static,
@@ -587,31 +600,25 @@ where
 impl<U, P1, Left, P2, Right> InstallTree for Fork<U, P1, Left, P2, Right>
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    U::Answer: Clone + Send + Sync + 'static,
+    U::Index: Clone + Send + Sync + 'static,
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
     Left: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Left::Current: IR + Clone + Send + 'static,
-    <Left::Current as IR>::Ix: Clone
-        + PartialEq
-        + Send
-        + Sync
-        + Serialize
-        + DeserializeOwned
-        + scheme::Demand<U>
-        + 'static,
+    <Left::Current as IR>::Query:
+        Clone + PartialEq + Send + Sync + DeserializeOwned + scheme::Demand<U> + 'static,
+    <Left::Current as IR>::Answer: Clone + Send + Sync + 'static,
+    <Left::Current as IR>::Index: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Left::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     Right: InstallTree + ListenerTree + SeededTree + TypedTree + 'static,
     Right::Current: IR + Clone + Send + 'static,
-    <Right::Current as IR>::Ix: Clone
-        + PartialEq
-        + Send
-        + Sync
-        + Serialize
-        + DeserializeOwned
-        + scheme::Demand<U>
-        + 'static,
+    <Right::Current as IR>::Query:
+        Clone + PartialEq + Send + Sync + DeserializeOwned + scheme::Demand<U> + 'static,
+    <Right::Current as IR>::Answer: Clone + Send + Sync + 'static,
+    <Right::Current as IR>::Index: Clone + Send + Sync + 'static,
     <Right::Current as IR>::Value: Clone + Send + Sync + 'static,
     <Right::Current as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     P1: scheme::Pass<U, Left::Current> + Send + 'static,
@@ -708,18 +715,15 @@ fn connect_stage<U, D, P>(
 )
 where
     U: IR + Send + 'static,
-    U::Ix: Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+    U::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+    U::Answer: Clone + Send + Sync + 'static,
+    U::Index: Clone + Send + Sync + 'static,
     U::Value: Clone + Send + Sync + 'static,
     U::Fault: Send + Sync + fmt::Debug + 'static,
     D: IR + Clone + Send + 'static,
-    D::Ix: Clone
-        + PartialEq
-        + Send
-        + Sync
-        + Serialize
-        + DeserializeOwned
-        + scheme::Demand<U>
-        + 'static,
+    D::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + scheme::Demand<U> + 'static,
+    D::Answer: Clone + Send + Sync + 'static,
+    D::Index: Clone + Send + Sync + 'static,
     D::Value: Clone + Send + Sync + 'static,
     D::Fault: Send + Sync + fmt::Debug + 'static,
     P: scheme::Pass<U, D> + Send + 'static,
@@ -839,7 +843,7 @@ fn start_source_root(
                 recv(stop_rx) -> _ => break,
                 recv(input_rx) -> msg => match msg {
                     Ok((revision, txn)) => {
-                        if source.apply_transaction(Arc::clone(&txn)).is_err() {
+                        if source.apply(Arc::clone(&txn)).is_err() {
                             continue;
                         }
 
@@ -881,7 +885,7 @@ fn start_source_root(
                                 };
                                 match resolution {
                                     scheme::ResolveOutcome::Done(txn) => {
-                                        let _ = source.apply_transaction(Arc::clone(&txn));
+                                        let _ = source.apply(Arc::clone(&txn));
                                         for (tx, _) in &clone_listeners(&listeners) {
                                             let _ = tx.send((u64::MAX, Arc::clone(&txn)));
                                         }
@@ -991,8 +995,9 @@ impl<Tree: TypedTree> ComposedCompiler<Tree> {
     where
         Tree: InstallTree + ListenerTree + SeededTree + TypedTree<Current = SourceText> + 'static,
         SourceText: Send + 'static,
-        <SourceText as IR>::Ix:
-            Clone + PartialEq + Send + Sync + Serialize + DeserializeOwned + 'static,
+        <SourceText as IR>::Query: Clone + PartialEq + Send + Sync + DeserializeOwned + 'static,
+        <SourceText as IR>::Answer: Clone + Send + Sync + 'static,
+        <SourceText as IR>::Index: Clone + Send + Sync + 'static,
         <SourceText as IR>::Value: Clone + Send + Sync + 'static,
         <SourceText as IR>::Fault: Send + Sync + fmt::Debug + 'static,
     {
@@ -1063,11 +1068,11 @@ fn query_handle_any<R>(
 ) -> RuntimeWireResult<utils::Payload>
 where
     R: IR,
-    R::Ix: DeserializeOwned + Clone + 'static,
-    R::Value: Send + Sync + 'static,
+    R::Query: DeserializeOwned + Clone + 'static,
+    R::Answer: Send + Sync + 'static,
     R::Fault: Send + Sync + 'static,
 {
-    let typed_index: R::Ix = if let Some(ix) = index.downcast_ref::<R::Ix>() {
+    let typed_index: R::Query = if let Some(ix) = index.downcast_ref::<R::Query>() {
         ix.clone()
     } else if let Some(json) = index.downcast_ref::<Value>() {
         serde_json::from_value(json.clone()).map_err(|err| {
@@ -1106,14 +1111,14 @@ fn send_layer_event<R>(
     txn: &scheme::Transaction<R>,
 ) where
     R: IR + 'static,
-    R::Ix: Serialize + Clone + Send + Sync + 'static,
+    R::Index: Clone + Send + Sync + 'static,
     R::Value: Clone + Send + Sync + 'static,
 {
     let Some(sender) = clone_event_sender(sender) else {
         return;
     };
 
-    // Clone the commands field-by-field; this only needs R::Ix: Clone and
+    // Clone the commands field-by-field; this only needs R::Index: Clone and
     // R::Value: Clone (not R: Clone).  Wrap in Arc so the payload type matches
     // `scheme::Transaction<R>` and `SubscriptionHandle::rev_as` can downcast it.
     let commands: scheme::Transaction<R> =
@@ -1157,7 +1162,7 @@ fn send_runtime_error_text(
 
 fn validate_source_txn_lens(
     current_lens: &HashMap<URI, usize>,
-    txn: &[scheme::Command<SourceText>],
+    txn: &[scheme::LayerCommand<SourceText>],
 ) -> RuntimeResult<HashMap<URI, usize>> {
     let mut lens = current_lens.clone();
     let mut staged: Vec<Option<usize>> = Vec::new();

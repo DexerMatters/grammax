@@ -16,7 +16,7 @@ use crate::{
     },
 };
 
-type CstCommand = crate::scheme::Command<ParseTreeIR>;
+type CstCommand = crate::scheme::LayerCommand<ParseTreeIR>;
 type MapperHandler = Arc<dyn Fn(&AstMapCtx<'_>, &NodeView) -> Option<AstMapIntent> + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -698,8 +698,8 @@ impl scheme::Pass<ParseTreeIR, AstArena<AstMapAny>> for IncrementalLowerer {
         &mut self,
         upstream: &LayerObserver<ParseTreeIR>,
         downstream: &AstArena<AstMapAny>,
-        txn: &[scheme::Command<ParseTreeIR>],
-    ) -> Vec<scheme::Command<AstArena<AstMapAny>>> {
+        txn: &[scheme::LayerCommand<ParseTreeIR>],
+    ) -> Vec<scheme::LayerCommand<AstArena<AstMapAny>>> {
         let upstream = QueriedParseTree::new(upstream);
         let Some(uri) = extract_uri_from_commands(txn) else {
             return Vec::new();

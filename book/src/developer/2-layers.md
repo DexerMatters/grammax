@@ -39,7 +39,7 @@ pub trait IR {
 
     fn query(&self, index: Self::Ix) -> LazyResult<Self::Value, Self::Fault>;
 
-    fn apply_transaction(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
+    fn apply(&mut self, transaction: Transaction<Self>) -> Result<(), Self::Fault>
     where
         Self: Sized;
 

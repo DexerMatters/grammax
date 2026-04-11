@@ -23,7 +23,7 @@ use crate::{
     },
 };
 
-pub type Command = crate::scheme::Command<ParseTreeIR>;
+pub type Command = crate::scheme::LayerCommand<ParseTreeIR>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReparseError {

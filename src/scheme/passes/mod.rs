@@ -8,22 +8,22 @@ pub(crate) mod strategy;
 pub use lowering::{AstMapAction, AstMapCtx, AstMapIntent, AstMapper, AstNode, IncrementalLowerer};
 pub use parsing::ParserPass;
 
-use crate::scheme::{Command, IR, LayerObserver, Pass};
+use crate::scheme::{IR, LayerCommand, LayerObserver, Pass};
 
 pub struct Identity;
 
 impl<U> Pass<U, U> for Identity
 where
     U: IR + Clone + Send + 'static,
-    U::Ix: Clone,
+    U::Index: Clone,
     U::Value: Clone,
 {
     fn push(
         &mut self,
         _upstream: &LayerObserver<U>,
         _downstream: &U,
-        txn: &[Command<U>],
-    ) -> Vec<Command<U>> {
-        txn.iter().map(Command::clone_fields).collect()
+        txn: &[LayerCommand<U>],
+    ) -> Vec<LayerCommand<U>> {
+        txn.iter().map(|cmd| cmd.clone_fields()).collect()
     }
 }

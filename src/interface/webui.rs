@@ -15,7 +15,7 @@ use crate::{
     },
     scheme::{
         Command,
-        layers::{DocumentNodePath, ParseTreeIR, ParseTreeQuery, ParseTreeValue, SourceText},
+        layers::{DocumentNodePath, ParseNodeValue, ParseTreeIR, SourceText},
     },
 };
 
@@ -267,7 +267,9 @@ fn is_port_free(host: &str, port: u16) -> bool {
     }
 }
 
-fn commands_to_web_json(commands: &[Command<ParseTreeQuery, ParseTreeValue>]) -> serde_json::Value {
+fn commands_to_web_json(
+    commands: &[Command<DocumentNodePath, ParseNodeValue>],
+) -> serde_json::Value {
     use crate::scheme::Command;
 
     fn path_to_json(path: &DocumentNodePath) -> serde_json::Value {
@@ -286,22 +288,15 @@ fn commands_to_web_json(commands: &[Command<ParseTreeQuery, ParseTreeValue>]) ->
                 let value_json = serde_json::to_value(value).ok()?;
                 Some(serde_json::json!({ "type": "create", "id": id, "value": value_json }))
             }
-            Command::Insert {
-                index: ParseTreeQuery::Path(path),
-                id,
-            } => Some(
-                serde_json::json!({ "type": "insert", "index": path_to_json(&path), "id": id }),
+            Command::Insert { index: path, id } => {
+                Some(serde_json::json!({ "type": "insert", "index": path_to_json(path), "id": id }))
+            }
+            Command::Delete { index: path } => {
+                Some(serde_json::json!({ "type": "delete", "index": path_to_json(path) }))
+            }
+            Command::Replace { index: path, id } => Some(
+                serde_json::json!({ "type": "replace", "index": path_to_json(path), "id": id }),
             ),
-            Command::Delete {
-                index: ParseTreeQuery::Path(path),
-            } => Some(serde_json::json!({ "type": "delete", "index": path_to_json(&path) })),
-            Command::Replace {
-                index: ParseTreeQuery::Path(path),
-                id,
-            } => Some(
-                serde_json::json!({ "type": "replace", "index": path_to_json(&path), "id": id }),
-            ),
-            _ => None,
         })
         .collect();
 

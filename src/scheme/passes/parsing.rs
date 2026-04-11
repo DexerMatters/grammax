@@ -5,7 +5,7 @@ use crate::{
     parsec::{Parser, ParserConfig},
     scheme::{
         self, DocumentSpan, LayerObserver, ObserveError, Span, URI,
-        layers::{ParseNodeValue, ParseTreeIR, ParseTreeValue, SourceText, source::SourceFault},
+        layers::{ParseNodeValue, ParseTreeIR, SourceText, source::SourceFault},
     },
 };
 
@@ -173,10 +173,10 @@ fn prepend_messages_command(
     let mut cmds = Vec::with_capacity(rest.len() + 1);
     cmds.push(scheme::Command::Create {
         id: 0,
-        value: ParseTreeValue::Node(ParseNodeValue::Messages {
+        value: ParseNodeValue::Messages {
             uri: *uri,
             messages: messages.clone(),
-        }),
+        },
     });
     cmds.extend(rest);
     cmds

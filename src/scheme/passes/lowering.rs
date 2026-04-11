@@ -430,9 +430,7 @@ impl IncrementalLowerer {
         for cmd in commands {
             match cmd {
                 CstCommand::Insert { index, .. } => {
-                    let ParseTreeQuery::Path(path) = index else {
-                        continue;
-                    };
+                    let path = index;
                     if path.1.is_empty() {
                         // Root insert: this is a full parse — DFS the whole tree.
                         if let Some(root) = upstream.view(&DocumentNodePath::root(*uri)) {
@@ -455,9 +453,7 @@ impl IncrementalLowerer {
                     }
                 }
                 CstCommand::Replace { index, .. } => {
-                    let ParseTreeQuery::Path(path) = index else {
-                        continue;
-                    };
+                    let path = index;
                     if let Some(anchor) =
                         self.resolve_anchor_or_ancestor(upstream, uri, path, &memo, &resolving)
                     {
@@ -721,10 +717,6 @@ fn extract_uri_from_commands(commands: &[CstCommand]) -> Option<URI> {
             CstCommand::Delete { index } => index,
             CstCommand::Create { .. } => return None,
         };
-        match index {
-            ParseTreeQuery::Path(dnp) => Some(dnp.0),
-            ParseTreeQuery::Message(uri) => Some(*uri),
-            ParseTreeQuery::Allocator => None,
-        }
+        Some(index.0)
     })
 }

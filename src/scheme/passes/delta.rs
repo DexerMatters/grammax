@@ -4,19 +4,15 @@ use crate::{
     parsec::tree::{Tag, TreeAllocRef, TreeAllocRefExt},
     scheme::{
         URI,
-        layers::{
-            DocumentNodePath, NodePath, ParseNodeValue, ParseTreeIR, ParseTreeQuery, ParseTreeValue,
-        },
+        layers::{DocumentNodePath, NodePath, ParseNodeValue, ParseTreeIR},
     },
 };
 
 const MAX_LCS_CELLS: usize = 4096;
 
-/// Wrap an internal `NodePath` into a `ParseTreeQuery::Path` with the given URI.
-/// This is the boundary between in-tree path arithmetic and addressable IR commands.
 #[inline(always)]
-fn path_query(uri: &URI, path: &NodePath) -> ParseTreeQuery {
-    ParseTreeQuery::Path(DocumentNodePath(*uri, path.0.clone()))
+fn path_query(uri: &URI, path: &NodePath) -> DocumentNodePath {
+    DocumentNodePath(*uri, path.0.clone())
 }
 
 type Command = crate::scheme::LayerCommand<ParseTreeIR>;
@@ -151,11 +147,11 @@ fn collect_full_tree_creates(
                 token_text_for_node(&node.tag, offset, node.width, source_text).unwrap_or_default();
             creates.push(Command::Create {
                 id: node_id,
-                value: ParseTreeValue::Node(ParseNodeValue::Token {
+                value: ParseNodeValue::Token {
                     rule_ix: *rule_ix,
                     text,
                     field,
-                }),
+                },
             });
         }
         Tag::Error(err) => {
@@ -163,21 +159,21 @@ fn collect_full_tree_creates(
                 token_text_for_node(&node.tag, offset, node.width, source_text).unwrap_or_default();
             creates.push(Command::Create {
                 id: node_id,
-                value: ParseTreeValue::Node(ParseNodeValue::Error {
+                value: ParseNodeValue::Error {
                     error: err.clone(),
                     text,
                     field,
-                }),
+                },
             });
         }
         Tag::Rule { rule_ix, .. } | Tag::Field { rule_ix, .. } => {
             creates.push(Command::Create {
                 id: node_id,
-                value: ParseTreeValue::Node(ParseNodeValue::Node {
+                value: ParseNodeValue::Node {
                     rule_ix: *rule_ix,
                     children: child_staging_ids,
                     field,
-                }),
+                },
             });
         }
     }
@@ -1357,11 +1353,11 @@ fn emit_create_commands_from_green_with_field(
                         .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseTreeValue::Node(ParseNodeValue::Token {
+                    value: ParseNodeValue::Token {
                         rule_ix: *rule_ix,
                         text,
                         field,
-                    }),
+                    },
                 });
             }
             Tag::Error(err) => {
@@ -1370,31 +1366,31 @@ fn emit_create_commands_from_green_with_field(
                         .unwrap_or_default();
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseTreeValue::Node(ParseNodeValue::Error {
+                    value: ParseNodeValue::Error {
                         error: err.clone(),
                         text,
                         field,
-                    }),
+                    },
                 });
             }
             Tag::Rule { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseTreeValue::Node(ParseNodeValue::Node {
+                    value: ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,
-                    }),
+                    },
                 });
             }
             Tag::Field { rule_ix, .. } => {
                 out.push(Command::Create {
                     id: node_id,
-                    value: ParseTreeValue::Node(ParseNodeValue::Node {
+                    value: ParseNodeValue::Node {
                         rule_ix: *rule_ix,
                         children: child_ids,
                         field,
-                    }),
+                    },
                 });
             }
         }

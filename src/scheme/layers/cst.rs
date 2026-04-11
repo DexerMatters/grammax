@@ -8,7 +8,7 @@ use crate::{
         tree::{ParsecError, Tag, TreeAllocRef, TreeAllocRefExt},
         view::{NodeView, Viewer},
     },
-    scheme::{self, LazyResult, SimpleIR, Span, URI},
+    scheme::{self, IR, LazyResult, Span, URI},
 };
 
 /// Internal path within a single document's parse tree.
@@ -625,9 +625,11 @@ impl ParseTreeIR {
     }
 }
 
-impl SimpleIR for ParseTreeIR {
-    type Index = ParseTreeQuery;
-    type Value = ParseTreeValue;
+impl IR for ParseTreeIR {
+    type Query = ParseTreeQuery;
+    type Answer = ParseTreeValue;
+    type Index = DocumentNodePath;
+    type Value = ParseNodeValue;
     type Fault = ParseTreeFault;
 
     fn query(&self, index: ParseTreeQuery) -> LazyResult<ParseTreeValue, ParseTreeFault> {
@@ -689,12 +691,6 @@ impl SimpleIR for ParseTreeIR {
         for command in transaction.iter() {
             match command {
                 scheme::Command::Create { id, value } => {
-                    // Extract the inner ParseNodeValue; skip non-node values.
-                    let value = match value {
-                        ParseTreeValue::Node(n) => n,
-                        _ => continue,
-                    };
-
                     // Messages variant carries forwarded parser-level errors for a URI.
                     if let ParseNodeValue::Messages { uri, messages } = value {
                         self.forwarded_messages.insert(*uri, messages.clone());
@@ -708,9 +704,6 @@ impl SimpleIR for ParseTreeIR {
                     }
                 }
                 scheme::Command::Insert { index, id } => {
-                    let ParseTreeQuery::Path(index) = index else {
-                        continue;
-                    };
                     let Some(&green) = self.created.get(id) else {
                         continue;
                     };
@@ -738,10 +731,6 @@ impl SimpleIR for ParseTreeIR {
                     pending_edits.push(PendingChildEdit::Insert { at, green });
                 }
                 scheme::Command::Delete { index } => {
-                    let ParseTreeQuery::Path(index) = index else {
-                        continue;
-                    };
-
                     let uri = &index.0;
                     let path = &index.1;
 
@@ -764,9 +753,6 @@ impl SimpleIR for ParseTreeIR {
                     pending_edits.push(PendingChildEdit::Delete { at });
                 }
                 scheme::Command::Replace { index, id } => {
-                    let ParseTreeQuery::Path(index) = index else {
-                        continue;
-                    };
                     let Some(&green) = self.created.get(id) else {
                         continue;
                     };

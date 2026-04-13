@@ -10,7 +10,7 @@ use std::{
 };
 
 use crossbeam::channel;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::protocol::{
@@ -328,7 +328,7 @@ where
     /// arguments; each branch is a self-contained pipeline description.
     /// Requires `U: Clone` (already imposed by `Fork`'s runtime).
     ///
-    /// ```
+    /// ```ignore
     /// b.fanout(
     ///     |b| b.then(pass_AB, seedB, |b, _| b.then(pass_BD, seedD, |b, _| b)),
     ///     |b| b.then(pass_AC, seedC, |b, _| b.then(pass_CE, seedE, |b, _| b)),
@@ -729,12 +729,14 @@ where
     P: scheme::Pass<U, D> + Send + 'static,
 {
     let (tap_tx, tap_rx) = channel::unbounded::<scheme::Transaction<D>>();
+    let (lazy_txn_tx, lazy_txn_rx) = channel::unbounded::<scheme::Transaction<D>>();
 
     let pipeline = Pipeline::connect_with_tap(
         LayerObserver::from_handle(upstream_query),
         move || pass,
         downstream,
         Some(tap_tx),
+        Some(lazy_txn_tx),
     );
 
     let downstream_query = pipeline.downstream_query_handle();
@@ -759,9 +761,32 @@ where
     // switch per operation (and the intermediate fwd channel), which meaningfully
     // reduces round-trip latency for incremental edits.
     let event_sender = Arc::clone(&core.event_sender);
+    let lazy_event_sender = Arc::clone(&core.event_sender);
     let coord_layer_path = downstream_layer_path.clone();
+    let lazy_layer_path = downstream_layer_path.clone();
     let coord_pass_path = pass_path.clone();
+    let lazy_pass_path = pass_path.clone();
     let (coord_stop_tx, coord_stop_rx) = channel::unbounded::<()>();
+    let lazy_output_tx = next_output_tx.clone();
+    let lazy_listeners = Arc::clone(&downstream_listeners);
+    let lazy_handle = thread::spawn(move || {
+        while let Ok(downstream_txn) = lazy_txn_rx.recv() {
+            for (tx, _) in &clone_listeners(&lazy_listeners) {
+                let _ = tx.send((u64::MAX, Arc::clone(&downstream_txn)));
+            }
+
+            send_layer_event::<D>(
+                &lazy_event_sender,
+                u64::MAX,
+                lazy_layer_path.clone(),
+                lazy_pass_path.clone(),
+                false,
+                &downstream_txn,
+            );
+
+            let _ = lazy_output_tx.send((u64::MAX, downstream_txn));
+        }
+    });
     let coord_handle = thread::spawn(move || {
         loop {
             // Wait for the next input txn (or a stop signal).
@@ -807,6 +832,7 @@ where
         let _ = coord_stop_tx.send(());
         pipeline.shutdown();
         let _ = coord_handle.join();
+        let _ = lazy_handle.join();
     }));
 
     core.push_layer(downstream_layer_path.clone());
@@ -1090,9 +1116,9 @@ where
         ObserveError::Fault(f) => RuntimeError::InvalidRequestFromTarget {
             err: utils::Payload::new(f),
         },
-        ObserveError::Impossible => RuntimeError::UndefinedBehavior {
-            message: "demand exhausted".to_string(),
-        },
+        // A query path that cannot be resolved by demand should surface as
+        // "absent" to callers rather than an internal UB classification.
+        ObserveError::Impossible => RuntimeError::ResourceAbsent,
     })?;
 
     Ok(utils::Payload::new(value))

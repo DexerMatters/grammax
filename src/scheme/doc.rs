@@ -289,12 +289,21 @@ use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::sync::{Mutex, OnceLock};
-use std::{fmt, fs, ops};
+use std::{fmt, ops};
 
 use serde::{Deserialize, Serialize};
 
-fn get_line_index_cache() -> &'static Mutex<HashMap<u64, Vec<usize>>> {
-    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<usize>>>> = OnceLock::new();
+const MAX_LINE_INDEX_CACHE_ENTRIES: usize = 2048;
+const MAX_HASH_BUCKET_ENTRIES: usize = 4;
+
+#[derive(Clone)]
+struct CachedLineIndex {
+    text: String,
+    line_starts: Vec<usize>,
+}
+
+fn get_line_index_cache() -> &'static Mutex<HashMap<u64, Vec<CachedLineIndex>>> {
+    static CACHE: OnceLock<Mutex<HashMap<u64, Vec<CachedLineIndex>>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -308,13 +317,30 @@ fn get_or_create_line_index(text: &str) -> Vec<usize> {
     let hash = hash_text(text);
     let cache = get_line_index_cache();
 
-    let mut map = cache.lock().unwrap();
-    if let Some(index) = map.get(&hash) {
-        return index.clone();
+    let mut map = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(bucket) = map.get(&hash) {
+        if let Some(found) = bucket.iter().find(|entry| entry.text == text) {
+            return found.line_starts.clone();
+        }
     }
 
     let index = build_line_index(text);
-    map.insert(hash, index.clone());
+    if map.len() >= MAX_LINE_INDEX_CACHE_ENTRIES {
+        // Keep the cache bounded under pathological document churn.
+        map.clear();
+    }
+
+    let bucket = map.entry(hash).or_default();
+    if bucket.len() >= MAX_HASH_BUCKET_ENTRIES {
+        bucket.remove(0);
+    }
+    bucket.push(CachedLineIndex {
+        text: text.to_string(),
+        line_starts: index.clone(),
+    });
+
     index
 }
 

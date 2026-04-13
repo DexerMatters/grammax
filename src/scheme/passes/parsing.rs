@@ -5,7 +5,7 @@ use crate::{
     parsec::{Parser, ParserConfig},
     scheme::{
         self, DocumentSpan, LayerObserver, ObserveError, Span, URI,
-        layers::{ParseNodeValue, ParseTreeIR, SourceText, source::SourceFault},
+        layers::{ParseNodeValue, ParseTreeIR, ParseTreeQuery, SourceText, source::SourceFault},
     },
 };
 
@@ -17,10 +17,6 @@ use super::{
 pub struct ParserPass {
     reparser: Reparser,
 }
-
-// SAFETY: ParserPass is moved into a single worker thread in the runtime
-// pipeline and not shared concurrently across threads.
-unsafe impl Send for ParserPass {}
 
 impl ParserPass {
     /// Create a pass for `grammar` with default parser/reparser settings.
@@ -85,6 +81,32 @@ impl scheme::Pass<SourceText, ParseTreeIR> for ParserPass {
 
         full_parse_transaction(self, &uri, new_text)
     }
+
+    fn resolve(
+        &mut self,
+        upstream: &LayerObserver<SourceText>,
+        _downstream: &ParseTreeIR,
+        index: ParseTreeQuery,
+    ) -> scheme::ResolveOutcome<ParseTreeIR> {
+        let uri = match index {
+            ParseTreeQuery::Path(path) => path.0,
+            ParseTreeQuery::Message(uri) => uri,
+            ParseTreeQuery::Allocator => return scheme::ResolveOutcome::Impossible,
+        };
+
+        let source = match full_source_text(upstream, &uri) {
+            Ok(source) => source,
+            Err(err) if err.is_resolvable() => return scheme::ResolveOutcome::Blocked,
+            Err(_) => return scheme::ResolveOutcome::Impossible,
+        };
+
+        let txn = full_parse_transaction(self, &uri, source.as_ref().as_str());
+        if txn.is_empty() {
+            scheme::ResolveOutcome::Impossible
+        } else {
+            scheme::ResolveOutcome::Done(std::sync::Arc::new(txn))
+        }
+    }
 }
 
 fn full_source_text(
@@ -103,7 +125,7 @@ fn full_parse_transaction(
     new_text: &str,
 ) -> Vec<scheme::LayerCommand<ParseTreeIR>> {
     let crate::parsec::Result { root, .. } = pass.reparser.parser.parse_text(new_text);
-    pass.reparser.current = std::rc::Rc::new(root.clone());
+    pass.reparser.current = std::sync::Arc::new(root.clone());
     let tree_cmds = delta::generate_commands_for_full_tree(
         &pass.reparser.parser.alloc,
         uri,

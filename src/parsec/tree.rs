@@ -1,9 +1,8 @@
 use rustc_hash::FxHashMap;
 use serde::Serialize;
-use std::cell::UnsafeCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::rc::Rc;
+use std::sync::{Arc, RwLock};
 
 use crate::grammar::Grammar;
 use crate::parsec::ParserConfig;
@@ -115,7 +114,7 @@ impl Tag {
 /// which includes parent references and offsets for easier traversal and error reporting.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RedNode {
-    pub parent: Option<Rc<RedNode>>,
+    pub parent: Option<Arc<RedNode>>,
     pub offset: usize,
     pub green: GreenId,
 }
@@ -142,13 +141,14 @@ pub(crate) struct GreenNode {
 }
 
 /// The tree allocator is responsible for managing the allocation and deduplication of green nodes.
+#[derive(Debug)]
 pub struct TreeAlloc {
     nodes: Vec<GreenNode>,
     dedup: FxHashMap<u64, Vec<usize>>,
 }
 
 /// A shared reference to the tree allocator.
-pub type TreeAllocRef = Rc<UnsafeCell<TreeAlloc>>;
+pub type TreeAllocRef = Arc<RwLock<TreeAlloc>>;
 
 /// A trait that extends the functionality of the tree allocator reference, providing methods for creating and managing green nodes.
 pub(crate) trait TreeAllocRefExt {
@@ -168,26 +168,23 @@ pub(crate) trait TreeAllocRefExt {
 
 impl TreeAllocRefExt for TreeAllocRef {
     fn create() -> Self {
-        Rc::new(UnsafeCell::new(TreeAlloc {
+        Arc::new(RwLock::new(TreeAlloc {
             nodes: Vec::new(),
             dedup: FxHashMap::default(),
         }))
     }
 
     fn snapshot(&self) -> Self {
-        // SAFETY: TreeAllocRef is single-threaded (`Rc`). We clone owned data
-        // out of the current allocator and return a detached copy.
-        let borrowed = unsafe { &*self.get() };
-        Rc::new(UnsafeCell::new(TreeAlloc {
+        let borrowed = self.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        Arc::new(RwLock::new(TreeAlloc {
             nodes: borrowed.nodes.clone(),
             dedup: borrowed.dedup.clone(),
         }))
     }
 
     fn get_node(&self, id: GreenId) -> GreenNode {
-        // SAFETY: TreeAllocRef is single-threaded (`Rc`) and tree reads return owned clones,
-        // so no references to inner storage escape across mutation boundaries.
-        unsafe { (&*self.get()).nodes[id].clone() }
+        let borrowed = self.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        borrowed.nodes[id].clone()
     }
 
     fn node(&self, id: GreenId) -> GreenNode {
@@ -195,8 +192,8 @@ impl TreeAllocRefExt for TreeAllocRef {
     }
 
     fn width_of(&self, id: GreenId) -> usize {
-        // SAFETY: see `get_node`.
-        unsafe { (&*self.get()).nodes[id].width }
+        let borrowed = self.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        borrowed.nodes[id].width
     }
 
     fn alloc_token(&self, tag: Tag, width: usize) -> GreenId {
@@ -213,36 +210,31 @@ impl TreeAllocRefExt for TreeAllocRef {
         // Deduplicate only errors. Tokens carry user text via source spans, so they
         // should remain distinct per allocation.
         let should_dedup = matches!(node.tag, Tag::Error(_));
-        if should_dedup {
-            let mut hasher = DefaultHasher::new();
-            node.hash(&mut hasher);
-            let hash = hasher.finish();
+        let mut borrowed = self
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !should_dedup {
+            let idx = borrowed.nodes.len();
+            borrowed.nodes.push(node);
+            return idx;
+        }
 
-            {
-                // SAFETY: see `get_node`.
-                let borrowed = unsafe { &*self.get() };
-                if let Some(indices) = borrowed.dedup.get(&hash) {
-                    for &idx in indices {
-                        if borrowed.nodes[idx] == node {
-                            return idx;
-                        }
-                    }
+        let mut hasher = DefaultHasher::new();
+        node.hash(&mut hasher);
+        let hash = hasher.finish();
+
+        if let Some(indices) = borrowed.dedup.get(&hash) {
+            for &idx in indices {
+                if borrowed.nodes[idx] == node {
+                    return idx;
                 }
             }
-
-            // SAFETY: see `get_node`.
-            let borrowed = unsafe { &mut *self.get() };
-            let idx = borrowed.nodes.len();
-            borrowed.nodes.push(node);
-            borrowed.dedup.entry(hash).or_default().push(idx);
-            idx
-        } else {
-            // SAFETY: see `get_node`.
-            let borrowed = unsafe { &mut *self.get() };
-            let idx = borrowed.nodes.len();
-            borrowed.nodes.push(node);
-            idx
         }
+
+        let idx = borrowed.nodes.len();
+        borrowed.nodes.push(node);
+        borrowed.dedup.entry(hash).or_default().push(idx);
+        idx
     }
 }
 

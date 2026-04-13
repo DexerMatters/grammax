@@ -13,6 +13,8 @@ use std::{
 
 use crossbeam::channel;
 
+const MAX_PENDING_QUERIES_PER_STAGE: usize = 4_096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[serde(transparent)]
 pub struct LayerName(u64);
@@ -175,6 +177,20 @@ pub trait Pass<U: IR, D: IR> {
         downstream: &D,
         txn: &[Command<U::Index, U::Value>],
     ) -> Vec<Command<D::Index, D::Value>>;
+
+    /// Lazily materialize downstream state for a missing query.
+    ///
+    /// This hook runs inside the stage when `downstream.query` returns `Absent`
+    /// in non-strict mode. Returning `Done(txn)` applies the transaction to
+    /// downstream immediately in this stage.
+    fn resolve(
+        &mut self,
+        _upstream: &LayerObserver<U>,
+        _downstream: &D,
+        _index: D::Query,
+    ) -> ResolveOutcome<D> {
+        ResolveOutcome::Impossible
+    }
 }
 
 pub(crate) struct QueryMsg<Repr: IR> {
@@ -285,28 +301,130 @@ impl<Repr: IR> LayerObserver<Repr> {
     }
 }
 
-fn resolve_query<U, D>(
-    upstream: &LayerObserver<U>,
-    downstream: &D,
-    index: D::Query,
-    strict: bool,
-) -> Result<D::Answer, ObserveError<D::Fault>>
+fn query_once<D>(downstream: &D, index: D::Query) -> Result<D::Answer, ObserveError<D::Fault>>
+where
+    D: IR,
+{
+    match downstream.query(index) {
+        LazyResult::Present(value) => Ok(value),
+        LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
+        LazyResult::Absent => Err(ObserveError::Absent),
+    }
+}
+
+fn apply_resolution_txn<D>(
+    downstream: &mut D,
+    txn: Transaction<D>,
+    lazy_txn_sender: Option<&channel::Sender<Transaction<D>>>,
+) -> Result<(), ObserveError<D::Fault>>
+where
+    D: IR,
+{
+    downstream
+        .apply(Arc::clone(&txn))
+        .map_err(ObserveError::Fault)?;
+    if !txn.is_empty() {
+        if let Some(tx) = lazy_txn_sender {
+            let _ = tx.send(txn);
+        }
+    }
+    Ok(())
+}
+
+fn consume_resolution<U, D>(
+    downstream: &mut D,
+    index: &D::Query,
+    outcome: ResolveOutcome<D>,
+    attempted_materialization: &mut bool,
+    blocked: &mut bool,
+    lazy_txn_sender: Option<&channel::Sender<Transaction<D>>>,
+) -> Result<Option<D::Answer>, ObserveError<D::Fault>>
 where
     U: IR,
     D: IR,
     D::Query: Clone + Demand<U>,
 {
-    match downstream.query(index.clone()) {
-        LazyResult::Present(value) => Ok(value),
-        LazyResult::Fault(f) => Err(ObserveError::Fault(f)),
-        LazyResult::Absent if strict => Err(ObserveError::Absent),
-        LazyResult::Absent => match index.upstream_index() {
-            None => Err(ObserveError::Impossible),
-            Some(u_ix) => match upstream.query(u_ix) {
-                Err(ObserveError::Impossible) => Err(ObserveError::Impossible),
-                _ => Err(ObserveError::Absent),
-            },
+    match outcome {
+        ResolveOutcome::Done(txn) => {
+            *attempted_materialization = true;
+            apply_resolution_txn(downstream, txn, lazy_txn_sender)?;
+            match query_once(downstream, index.clone()) {
+                Ok(value) => Ok(Some(value)),
+                Err(ObserveError::Absent) => Ok(None),
+                Err(err) => Err(err),
+            }
+        }
+        ResolveOutcome::Blocked => {
+            *blocked = true;
+            Ok(None)
+        }
+        ResolveOutcome::Impossible => Ok(None),
+    }
+}
+
+fn resolve_query<U, D, P>(
+    upstream: &LayerObserver<U>,
+    pass: &mut P,
+    downstream: &mut D,
+    index: D::Query,
+    strict: bool,
+    lazy_txn_sender: Option<&channel::Sender<Transaction<D>>>,
+) -> Result<D::Answer, ObserveError<D::Fault>>
+where
+    U: IR,
+    D: IR,
+    D::Query: Clone + Demand<U>,
+    P: Pass<U, D>,
+{
+    match query_once(downstream, index.clone()) {
+        Ok(value) => return Ok(value),
+        Err(ObserveError::Fault(f)) => return Err(ObserveError::Fault(f)),
+        Err(ObserveError::Absent) => {}
+        Err(other) => return Err(other),
+    }
+
+    if strict {
+        return Err(ObserveError::Absent);
+    }
+
+    let mut attempted_materialization = false;
+    let mut blocked = false;
+
+    let downstream_outcome = downstream.resolve(index.clone());
+    if let Some(value) = consume_resolution::<U, D>(
+        downstream,
+        &index,
+        downstream_outcome,
+        &mut attempted_materialization,
+        &mut blocked,
+        lazy_txn_sender,
+    )? {
+        return Ok(value);
+    }
+
+    let pass_outcome = pass.resolve(upstream, downstream, index.clone());
+    if let Some(value) = consume_resolution::<U, D>(
+        downstream,
+        &index,
+        pass_outcome,
+        &mut attempted_materialization,
+        &mut blocked,
+        lazy_txn_sender,
+    )? {
+        return Ok(value);
+    }
+
+    if attempted_materialization {
+        return Err(ObserveError::Impossible);
+    }
+
+    match index.upstream_index() {
+        Some(u_ix) => match upstream.query(u_ix) {
+            Err(ObserveError::Impossible) => Err(ObserveError::Impossible),
+            _ => Err(ObserveError::Absent),
         },
+        None if blocked => Err(ObserveError::Absent),
+        None => Err(ObserveError::Impossible),
     }
 }
 
@@ -358,6 +476,7 @@ where
         make_pass: PF,
         downstream: D,
         tap_sender: Option<channel::Sender<Transaction<D>>>,
+        lazy_sender: Option<channel::Sender<Transaction<D>>>,
     ) -> Self
     where
         PF: FnOnce() -> P + Send + 'static,
@@ -386,26 +505,45 @@ where
                             if let Some(tap) = &tap_sender {
                                 let _ = tap.send(tap_cmds);
                             }
-                            pending.retain_mut(|(index, reply)| {
-                                match downstream.query(index.clone()) {
-                                    LazyResult::Present(v) => { let _ = reply.send(Ok(v)); false }
-                                    LazyResult::Fault(f) => { let _ = reply.send(Err(ObserveError::Fault(f))); false }
-                                    LazyResult::Absent => {
-                                        let keep = index.upstream_index()
-                                            .map(|u_ix| !matches!(upstream.query(u_ix), Err(ObserveError::Impossible)))
-                                            .unwrap_or(false);
-                                        if !keep { let _ = reply.send(Err(ObserveError::Impossible)); }
-                                        keep
+                            let mut still_pending = Vec::with_capacity(pending.len());
+                            for (index, reply) in pending.drain(..) {
+                                match resolve_query(
+                                    &upstream,
+                                    &mut pass,
+                                    &mut downstream,
+                                    index.clone(),
+                                    false,
+                                    lazy_sender.as_ref(),
+                                ) {
+                                    Err(ObserveError::Absent) => still_pending.push((index, reply)),
+                                    other => {
+                                        let _ = reply.send(other);
                                     }
                                 }
-                            });
+                            }
+                            pending = still_pending;
                         }
                         Err(_) => break,
                     },
                     recv(query_rx) -> msg => match msg {
                         Ok(QueryMsg { index, strict, reply }) => {
-                            match resolve_query(&upstream, &downstream, index.clone(), strict) {
-                                Err(ObserveError::Absent) if !strict => pending.push((index, reply)),
+                            match resolve_query(
+                                &upstream,
+                                &mut pass,
+                                &mut downstream,
+                                index.clone(),
+                                strict,
+                                lazy_sender.as_ref(),
+                            ) {
+                                Err(ObserveError::Absent) if !strict => {
+                                    // Bound pending demand-waits so a hot query source cannot
+                                    // force unbounded growth when upstream data never arrives.
+                                    if pending.len() >= MAX_PENDING_QUERIES_PER_STAGE {
+                                        let _ = reply.send(Err(ObserveError::Absent));
+                                    } else {
+                                        pending.push((index, reply));
+                                    }
+                                }
                                 other => { let _ = reply.send(other); }
                             }
                         }
@@ -482,10 +620,10 @@ impl<I: Clone, V: Clone> Command<I, V> {
 }
 
 /// A [`Command`] parameterized by an IR layer's write-side index and value types.
-pub type LayerCommand<R: IR> = Command<R::Index, R::Value>;
+pub type LayerCommand<R> = Command<<R as IR>::Index, <R as IR>::Value>;
 
 /// A batch of [`LayerCommand`]s for a single layer.
-pub type Transaction<R: IR> = std::sync::Arc<Vec<LayerCommand<R>>>;
+pub type Transaction<R> = std::sync::Arc<Vec<LayerCommand<R>>>;
 
 /// A simplified IR where the read-side and write-side types are unified.
 ///

@@ -21,6 +21,8 @@ use super::{
 };
 
 type SourceTxn = scheme::Transaction<scheme::layers::SourceText>;
+const MAX_PARKED_QUERIES: usize = 16_384;
+const MAX_PARKED_FETCHES: usize = 16_384;
 
 struct PendingQuery {
     layer_path: RuntimePath,
@@ -31,17 +33,24 @@ struct PendingQuery {
 #[derive(Default)]
 struct WaitingRoom {
     queries_by_revision: BTreeMap<RevisionId, Vec<PendingQuery>>,
-    fetches_by_key: HashMap<(RevisionId, RuntimePath), Vec<RpcReplyPort<RuntimeWireResult>>>,
+    fetches_by_key: HashMap<(RevisionId, RuntimePath), RpcReplyPort<RuntimeWireResult>>,
 }
 
 impl WaitingRoom {
+    fn parked_query_count(&self) -> usize {
+        self.queries_by_revision.values().map(Vec::len).sum()
+    }
+
     fn park_query(
         &mut self,
         revision: RevisionId,
         layer_path: RuntimePath,
         index: utils::Payload,
         reply: RpcReplyPort<RuntimeWireResult>,
-    ) {
+    ) -> Result<(), RpcReplyPort<RuntimeWireResult>> {
+        if self.parked_query_count() >= MAX_PARKED_QUERIES {
+            return Err(reply);
+        }
         self.queries_by_revision
             .entry(revision)
             .or_default()
@@ -50,6 +59,7 @@ impl WaitingRoom {
                 index,
                 reply,
             });
+        Ok(())
     }
 
     fn park_fetch(
@@ -57,11 +67,16 @@ impl WaitingRoom {
         revision: RevisionId,
         layer_path: RuntimePath,
         reply: RpcReplyPort<RuntimeWireResult>,
-    ) {
-        self.fetches_by_key
-            .entry((revision, layer_path))
-            .or_default()
-            .push(reply);
+    ) -> Result<(), RpcReplyPort<RuntimeWireResult>> {
+        if self.fetches_by_key.len() >= MAX_PARKED_FETCHES {
+            return Err(reply);
+        }
+        let key = (revision, layer_path);
+        if self.fetches_by_key.contains_key(&key) {
+            return Err(reply);
+        }
+        self.fetches_by_key.insert(key, reply);
+        Ok(())
     }
 
     fn take_ready_queries(&mut self, settled_revision: RevisionId) -> Vec<PendingQuery> {
@@ -84,10 +99,8 @@ impl WaitingRoom {
         &mut self,
         revision: RevisionId,
         layer_path: &RuntimePath,
-    ) -> Vec<RpcReplyPort<RuntimeWireResult>> {
-        self.fetches_by_key
-            .remove(&(revision, layer_path.clone()))
-            .unwrap_or_default()
+    ) -> Option<RpcReplyPort<RuntimeWireResult>> {
+        self.fetches_by_key.remove(&(revision, layer_path.clone()))
     }
 
     fn fail_all(&mut self) {
@@ -99,10 +112,8 @@ impl WaitingRoom {
         }
 
         let fetches = std::mem::take(&mut self.fetches_by_key);
-        for (_, queued) in fetches {
-            for reply in queued {
-                let _ = reply.send(Err(RuntimeError::ChannelClosed));
-            }
+        for (_, reply) in fetches {
+            let _ = reply.send(Err(RuntimeError::ChannelClosed));
         }
     }
 }
@@ -129,7 +140,7 @@ impl GlobalEventDispatcher {
             runtime.block_on(async {
                 let state = GedState::new(compiler);
                 Actor::spawn(
-                    Some("runtime-supervisor".to_string()),
+                    None,
                     GedActor::<Tree> {
                         _marker: PhantomData,
                     },
@@ -144,13 +155,7 @@ impl GlobalEventDispatcher {
             (ActorRef<RuntimeEvent>, ractor::concurrency::JoinHandle<()>),
             _,
         > = runtime.block_on(async {
-            Actor::spawn_linked(
-                Some("runtime-event-ingestor".to_string()),
-                EventIngestorActor,
-                actor.clone(),
-                actor.get_cell(),
-            )
-            .await
+            Actor::spawn_linked(None, EventIngestorActor, actor.clone(), actor.get_cell()).await
         });
         let (ingestor, _ingestor_handle) =
             ingestor_spawned.expect("failed to spawn runtime event ingestor actor");
@@ -336,9 +341,13 @@ fn reduce_request<Tree: TypedTree>(
             index,
         } => {
             if revision.is_some_and(|target| target > state.settled_revision) {
-                state
-                    .waiting
-                    .park_query(revision.unwrap(), layer_path, index, reply);
+                if let Err(reply) =
+                    state
+                        .waiting
+                        .park_query(revision.unwrap(), layer_path, index, reply)
+                {
+                    let _ = reply.send(Err(RuntimeError::QueueFull));
+                }
                 Vec::new()
             } else {
                 vec![GedEffect::ReplyImmediateQuery {
@@ -405,7 +414,13 @@ fn apply_effects<Tree: TypedTree>(state: &mut GedState<Tree>, effects: Vec<GedEf
                 layer_path,
                 reply,
             } => match state.compiler.submit_source(txn) {
-                Ok(revision) => state.waiting.park_fetch(revision, layer_path, reply),
+                Ok(revision) => {
+                    if let Err(reply) = state.waiting.park_fetch(revision, layer_path, reply) {
+                        // Duplicate (revision, layer_path) or queue pressure.
+                        // In both cases, treat this as bounded backpressure.
+                        let _ = reply.send(Err(RuntimeError::QueueFull));
+                    }
+                }
                 Err(err) => {
                     let _ = reply.send(Err(to_wire_error(err)));
                 }
@@ -429,19 +444,12 @@ fn apply_effects<Tree: TypedTree>(state: &mut GedState<Tree>, effects: Vec<GedEf
                 layer_path,
                 payload,
             } => {
-                let mut replies = state
-                    .waiting
-                    .take_fetches_for(revision, &layer_path)
-                    .into_iter();
-                if let Some(primary) = replies.next() {
-                    let _ = primary.send(Ok(RuntimeSignal::EditResult {
+                if let Some(reply) = state.waiting.take_fetches_for(revision, &layer_path) {
+                    let _ = reply.send(Ok(RuntimeSignal::EditResult {
                         revision,
                         layer_path,
                         value: payload,
                     }));
-                    for reply in replies {
-                        let _ = reply.send(Err(RuntimeError::ChannelClosed));
-                    }
                 }
             }
             GedEffect::Shutdown { reply } => {

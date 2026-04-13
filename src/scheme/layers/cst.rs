@@ -191,16 +191,12 @@ impl Serialize for ParseTreeValue {
             // NodeView is not serialisable at the HTTP boundary.
             Self::View(_) => s.serialize_none(),
             Self::Messages(m) => m.serialize(s),
-            // TreeAllocRef is Rc-based and not serialisable; emit null at the
-            // HTTP boundary (it is only used internally by the CLI/tests).
+            // TreeAllocRef is an in-memory allocator snapshot and not
+            // serialisable; emit null at the HTTP boundary.
             Self::Allocator(_) => s.serialize_none(),
         }
     }
 }
-
-// SAFETY: see `SendableAlloc` above.
-unsafe impl Send for ParseTreeValue {}
-unsafe impl Sync for ParseTreeValue {}
 
 impl ParseNodeValue {
     pub fn field(&self) -> &str {
@@ -234,11 +230,6 @@ pub struct ParseTreeIR {
     pub forwarded_messages: FxHashMap<URI, ParserMessages>,
     messages_cache: FxHashMap<URI, ParserMessages>,
 }
-
-// SAFETY: ParseTreeIR is always owned by a single worker thread when used in
-// the concurrent runtime pipeline. It is moved across thread boundaries but
-// never shared concurrently.
-unsafe impl Send for ParseTreeIR {}
 
 impl fmt::Debug for ParseTreeIR {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

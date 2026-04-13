@@ -1,5 +1,6 @@
 pub(crate) mod delta;
 pub mod lowering;
+pub mod lowering_sg;
 pub(crate) mod metrics;
 pub mod parsing;
 pub mod reparser;

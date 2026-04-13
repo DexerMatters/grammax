@@ -7,12 +7,12 @@
 /// - Direct path-based storage via BTreeMap
 use std::{
     any::{Any, TypeId, type_name},
-    cell::Cell,
+    cell::RefCell,
     collections::BTreeMap,
     fmt,
     hash::{Hash, Hasher},
     marker::PhantomData,
-    ptr::NonNull,
+    sync::Arc,
 };
 
 use rustc_hash::FxHashMap;
@@ -21,12 +21,12 @@ use crate::scheme;
 use crate::scheme::{LazyResult, URI, layers::DocumentNodePath};
 
 thread_local! {
-    static AST_CELL_CLONE_ARENA: Cell<Option<NonNull<()>>> = const { Cell::new(None) };
+    static AST_CELL_CLONE_ARENA: RefCell<Option<Arc<AstArenaStorage>>> = const { RefCell::new(None) };
 }
 
 pub struct AstCell<T> {
     pub(crate) path: DocumentNodePath,
-    pub(crate) arena: Option<NonNull<()>>,
+    pub(crate) arena: Option<Arc<AstArenaStorage>>,
     pub(crate) arena_ty: Option<&'static str>,
     pub(crate) _marker: PhantomData<fn() -> T>,
 }
@@ -36,29 +36,35 @@ impl<T> Clone for AstCell<T> {
             path: self.path.clone(),
             arena: self
                 .arena
-                .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get())),
+                .clone()
+                .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.borrow().clone())),
             arena_ty: self.arena_ty,
             _marker: PhantomData,
         }
     }
 }
 
-unsafe impl<T: Send> Send for AstCell<T> {}
-unsafe impl<T: Sync> Sync for AstCell<T> {}
-
 impl<T: fmt::Debug + 'static> fmt::Debug for AstCell<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let arena = self
             .arena
-            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
+            .clone()
+            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.borrow().clone()));
 
-        if let Some(value) = self.deref_debug_value(arena) {
-            return AST_CELL_CLONE_ARENA.with(|current| {
-                let prev = current.replace(arena);
-                let result = value.fmt(f);
-                current.set(prev);
-                result
-            });
+        if let Some(storage) = arena.as_ref() {
+            if let Some(value) = storage
+                .nodes
+                .get(&self.path)
+                .and_then(ErasedAstNode::downcast_ref::<T>)
+            {
+                let arena_for_ctx = arena.clone();
+                return AST_CELL_CLONE_ARENA.with(|current| {
+                    let prev = current.replace(arena_for_ctx);
+                    let result = value.fmt(f);
+                    *current.borrow_mut() = prev;
+                    result
+                });
+            }
         }
 
         f.debug_struct("AstCell")
@@ -70,7 +76,7 @@ impl<T: fmt::Debug + 'static> fmt::Debug for AstCell<T> {
 
 impl<T> PartialEq for AstCell<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.path == other.path && self.arena == other.arena
+        self.path == other.path
     }
 }
 
@@ -79,7 +85,6 @@ impl<T> Eq for AstCell<T> {}
 impl<T> Hash for AstCell<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.path.hash(state);
-        self.arena.hash(state);
     }
 }
 
@@ -91,9 +96,7 @@ impl<T> PartialOrd for AstCell<T> {
 
 impl<T> Ord for AstCell<T> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.arena
-            .cmp(&other.arena)
-            .then_with(|| self.path.cmp(&other.path))
+        self.path.cmp(&other.path)
     }
 }
 
@@ -127,20 +130,6 @@ impl<T> AstCell<T> {
         T: Clone + 'static,
     {
         self.get(arena).cloned()
-    }
-
-    fn deref_debug_value(&self, arena: Option<NonNull<()>>) -> Option<&T>
-    where
-        T: fmt::Debug + 'static,
-    {
-        let storage = arena?.cast::<AstArenaStorage>();
-        // SAFETY: `arena` is only produced from `AstArena::storage_ptr()` and the
-        // storage outlives queried values for the duration of formatting.
-        let storage = unsafe { storage.as_ref() };
-        storage
-            .nodes
-            .get(&self.path)
-            .and_then(ErasedAstNode::downcast_ref::<T>)
     }
 
     /// Cast the phantom type parameter to `U`.
@@ -197,7 +186,7 @@ impl AstMapAny {
     /// Wrap any owned value in `AstMapAny`.
     pub fn new<T>(value: T) -> Self
     where
-        T: fmt::Debug + Clone + PartialEq + Send + 'static,
+        T: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
     {
         AstMapAny(ErasedAstNode::new(value))
     }
@@ -208,7 +197,7 @@ impl AstMapAny {
     }
 
     /// Consume the wrapper and return the inner value as `T`.
-    pub fn downcast<T: Send + 'static>(self) -> Option<T> {
+    pub fn downcast<T: Send + Sync + 'static>(self) -> Option<T> {
         self.0.into_downcast()
     }
 
@@ -239,12 +228,9 @@ impl PartialEq for AstMapAny {
     }
 }
 
-unsafe impl Send for AstMapAny {}
-unsafe impl Sync for AstMapAny {}
-
 pub struct AstVec<T> {
     pub(crate) base: DocumentNodePath,
-    pub(crate) arena: Option<NonNull<()>>,
+    pub(crate) arena: Option<Arc<AstArenaStorage>>,
     pub(crate) _marker: PhantomData<fn() -> T>,
 }
 
@@ -254,7 +240,8 @@ impl<T> Clone for AstVec<T> {
             base: self.base.clone(),
             arena: self
                 .arena
-                .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get())),
+                .clone()
+                .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.borrow().clone())),
             _marker: PhantomData,
         }
     }
@@ -273,21 +260,19 @@ impl<T> PartialEq for AstVec<T> {
 
 impl<T: fmt::Debug + 'static> fmt::Debug for AstVec<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let arena_ptr = self
+        let arena = self
             .arena
-            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
+            .clone()
+            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.borrow().clone()));
 
-        if let Some(ptr) = arena_ptr {
+        if let Some(storage) = arena {
             let mut list = f.debug_list();
-            // SAFETY: arena pointer is valid for the duration of formatting,
-            // same guarantee as in AstCell::deref_debug_value.
-            let storage = unsafe { ptr.cast::<AstArenaStorage>().as_ref() };
             for (path, node) in storage.iter_mapped_children(&self.base) {
                 if let Some(val) = node.downcast_ref::<T>() {
                     AST_CELL_CLONE_ARENA.with(|current| {
-                        let prev = current.replace(Some(ptr));
+                        let prev = current.replace(Some(Arc::clone(&storage)));
                         list.entry(val);
-                        current.set(prev);
+                        *current.borrow_mut() = prev;
                     });
                 } else {
                     list.entry(&format_args!("<type mismatch at {:?}>", path));
@@ -300,9 +285,6 @@ impl<T: fmt::Debug + 'static> fmt::Debug for AstVec<T> {
         }
     }
 }
-
-unsafe impl<T: Send> Send for AstVec<T> {}
-unsafe impl<T: Sync> Sync for AstVec<T> {}
 
 impl<T> AstVec<T> {
     /// Create a new `AstVec` rooted at `base`.
@@ -328,21 +310,20 @@ impl<T> AstVec<T> {
     /// Each element must have been stored by an `AstMapper` handler that emits
     /// a value of type `T` at a direct-child path of the base.
     pub fn cells(&self) -> Vec<AstCell<T>> {
-        let arena_ptr = self
+        let arena = self
             .arena
-            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.get()));
+            .clone()
+            .or_else(|| AST_CELL_CLONE_ARENA.with(|current| current.borrow().clone()));
 
-        let Some(ptr) = arena_ptr else {
+        let Some(storage) = arena else {
             return Vec::new();
         };
-        // SAFETY: same guarantee as AstCell::deref_debug_value.
-        let storage = unsafe { ptr.cast::<AstArenaStorage>().as_ref() };
         storage
             .iter_mapped_children(&self.base)
             .into_iter()
             .map(|(path, node)| AstCell {
                 path,
-                arena: Some(ptr),
+                arena: Some(Arc::clone(&storage)),
                 arena_ty: Some(node.type_name),
                 _marker: PhantomData,
             })
@@ -389,7 +370,7 @@ impl<T> serde::Serialize for AstVec<T> {
 
 pub(crate) struct AstTxnBuilder<T>
 where
-    T: fmt::Debug + Clone + PartialEq + Send + 'static,
+    T: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
 {
     ops: AstDelta<T>,
     next_staging_id: usize,
@@ -397,7 +378,7 @@ where
 
 impl<T> Default for AstTxnBuilder<T>
 where
-    T: fmt::Debug + Clone + PartialEq + Send + 'static,
+    T: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
 {
     fn default() -> Self {
         Self {
@@ -409,7 +390,7 @@ where
 
 impl<T> AstTxnBuilder<T>
 where
-    T: fmt::Debug + Clone + PartialEq + Send + 'static,
+    T: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
 {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -516,10 +497,10 @@ impl<T> Clone for AstArena<T> {
 pub(crate) struct ErasedAstNode {
     pub(crate) type_id: TypeId,
     pub(crate) type_name: &'static str,
-    pub(crate) value: Box<dyn Any + Send>,
-    pub(crate) clone_fn: fn(&Box<dyn Any + Send>) -> Box<dyn Any + Send>,
-    pub(crate) eq_fn: fn(&Box<dyn Any + Send>, &Box<dyn Any + Send>) -> bool,
-    pub(crate) debug_fn: fn(&Box<dyn Any + Send>, &mut fmt::Formatter<'_>) -> fmt::Result,
+    pub(crate) value: Box<dyn Any + Send + Sync>,
+    pub(crate) clone_fn: fn(&Box<dyn Any + Send + Sync>) -> Box<dyn Any + Send + Sync>,
+    pub(crate) eq_fn: fn(&Box<dyn Any + Send + Sync>, &Box<dyn Any + Send + Sync>) -> bool,
+    pub(crate) debug_fn: fn(&Box<dyn Any + Send + Sync>, &mut fmt::Formatter<'_>) -> fmt::Result,
 }
 
 impl fmt::Debug for ErasedAstNode {
@@ -546,11 +527,11 @@ impl Clone for ErasedAstNode {
 impl ErasedAstNode {
     pub(crate) fn new<U>(value: U) -> Self
     where
-        U: fmt::Debug + Clone + PartialEq + Send + 'static,
+        U: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
     {
-        fn clone_impl<U: Clone + Send + 'static>(
-            value: &Box<dyn Any + Send>,
-        ) -> Box<dyn Any + Send> {
+        fn clone_impl<U: Clone + Send + Sync + 'static>(
+            value: &Box<dyn Any + Send + Sync>,
+        ) -> Box<dyn Any + Send + Sync> {
             Box::new(
                 value
                     .downcast_ref::<U>()
@@ -558,14 +539,14 @@ impl ErasedAstNode {
                     .clone(),
             )
         }
-        fn eq_impl<U: PartialEq + Send + 'static>(
-            lhs: &Box<dyn Any + Send>,
-            rhs: &Box<dyn Any + Send>,
+        fn eq_impl<U: PartialEq + Send + Sync + 'static>(
+            lhs: &Box<dyn Any + Send + Sync>,
+            rhs: &Box<dyn Any + Send + Sync>,
         ) -> bool {
             lhs.downcast_ref::<U>() == rhs.downcast_ref::<U>()
         }
-        fn debug_impl<U: fmt::Debug + Send + 'static>(
-            value: &Box<dyn Any + Send>,
+        fn debug_impl<U: fmt::Debug + Send + Sync + 'static>(
+            value: &Box<dyn Any + Send + Sync>,
             f: &mut fmt::Formatter<'_>,
         ) -> fmt::Result {
             value
@@ -588,7 +569,7 @@ impl ErasedAstNode {
         self.value.downcast_ref::<U>()
     }
 
-    pub(crate) fn into_downcast<U: Send + 'static>(self) -> Option<U> {
+    pub(crate) fn into_downcast<U: Send + Sync + 'static>(self) -> Option<U> {
         self.value.downcast::<U>().ok().map(|value| *value)
     }
 }
@@ -622,7 +603,7 @@ impl<T> AstArena<T> {
     /// Insert a new value at the given path (path must not already exist)
     pub fn insert<U>(&mut self, path: DocumentNodePath, node: U) -> AstCell<U>
     where
-        U: fmt::Debug + Clone + PartialEq + Send + 'static,
+        U: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
     {
         let cell = self
             .insert_erased(path.clone(), ErasedAstNode::new(node))
@@ -634,7 +615,7 @@ impl<T> AstArena<T> {
     /// Update the value at the given path (path must exist)
     pub fn set<U>(&mut self, path: DocumentNodePath, node: U)
     where
-        U: fmt::Debug + Clone + PartialEq + Send + 'static,
+        U: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
     {
         self.set_erased(path, ErasedAstNode::new(node));
         self.refresh_roots();
@@ -643,7 +624,7 @@ impl<T> AstArena<T> {
     /// Remove the node at the given path
     pub fn remove<U>(&mut self, path: DocumentNodePath) -> Option<U>
     where
-        U: Send + 'static,
+        U: Send + Sync + 'static,
     {
         let removed = self
             .remove_erased(path)
@@ -715,7 +696,7 @@ impl<T> AstArena<T> {
         let resolved = self.resolve_path(path)?.clone();
         self.get_erased(&resolved).map(|node| AstCell {
             path: resolved,
-            arena: Some(self.storage_ptr()),
+            arena: Some(self.storage_snapshot()),
             arena_ty: Some(node.type_name),
             _marker: PhantomData,
         })
@@ -754,18 +735,18 @@ impl<T> AstArena<T> {
             .unwrap_or("unknown");
         AstCell {
             path,
-            arena: Some(self.storage_ptr()),
+            arena: Some(self.storage_snapshot()),
             arena_ty: Some(node_ty),
             _marker: PhantomData,
         }
     }
 
-    fn storage_ptr(&self) -> NonNull<()> {
-        NonNull::from(self.storage.as_ref()).cast()
+    fn storage_snapshot(&self) -> Arc<AstArenaStorage> {
+        Arc::new((*self.storage).clone())
     }
 }
 
-impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::SimpleIR for AstArena<T> {
+impl<T: fmt::Debug + Clone + PartialEq + Send + Sync + 'static> scheme::SimpleIR for AstArena<T> {
     type Index = DocumentNodePath;
     type Value = T;
     type Fault = AstArenaFault;
@@ -783,7 +764,7 @@ impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::SimpleIR for As
             expected: type_name::<T>(),
         };
         AST_CELL_CLONE_ARENA.with(|slot| {
-            let prev = slot.replace(Some(self.storage_ptr()));
+            let prev = slot.replace(Some(self.storage_snapshot()));
             let result = if TypeId::of::<T>() == TypeId::of::<AstMapAny>() {
                 let boxed: Box<dyn Any> = Box::new(AstMapAny(node.clone()));
                 boxed
@@ -796,7 +777,7 @@ impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::SimpleIR for As
                     .map(Present)
                     .unwrap_or(Fault(type_mismatch))
             };
-            slot.set(prev);
+            *slot.borrow_mut() = prev;
             result
         })
     }
@@ -816,7 +797,7 @@ impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> scheme::SimpleIR for As
                 scheme::Command::Create { id, value } => {
                     let erased = if is_any {
                         // SAFETY: is_any guarantees T == AstMapAny at runtime.
-                        let boxed: Box<dyn Any + Send> = Box::new(value.clone());
+                        let boxed: Box<dyn Any + Send + Sync> = Box::new(value.clone());
                         boxed.downcast::<AstMapAny>().expect("T==AstMapAny").0
                     } else {
                         ErasedAstNode::new(value.clone())

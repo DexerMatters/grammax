@@ -35,10 +35,7 @@ impl Demand<source::SourceText> for cst::ParseTreeQuery {
 
 impl Demand<cst::ParseTreeIR> for cst::DocumentNodePath {
     fn upstream_index(&self) -> Option<cst::ParseTreeQuery> {
-        Some(cst::ParseTreeQuery::Path(cst::DocumentNodePath(
-            self.0,
-            vec![],
-        )))
+        Some(cst::ParseTreeQuery::Path(self.clone()))
     }
 }
 
@@ -53,7 +50,7 @@ impl Demand<cst::ParseTreeIR> for cst::ParseTreeQuery {
         None
     }
 }
-impl<T: fmt::Debug + Clone + PartialEq + Send + 'static> Demand<ast::AstArena<T>>
+impl<T: fmt::Debug + Clone + PartialEq + Send + Sync + 'static> Demand<ast::AstArena<T>>
     for cst::DocumentNodePath
 {
     fn upstream_index(&self) -> Option<cst::DocumentNodePath> {

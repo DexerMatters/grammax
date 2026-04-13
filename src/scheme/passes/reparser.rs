@@ -1,4 +1,4 @@
-use std::{rc::Rc, sync::Arc};
+use std::sync::Arc;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -42,7 +42,7 @@ pub enum ReparseError {
 }
 
 pub struct Reparser {
-    pub(crate) current: Rc<RedNode>,
+    pub(crate) current: Arc<RedNode>,
     pub(crate) parser: Parser,
     alloc: TreeAllocRef,
     config: ReparserConfig,
@@ -70,7 +70,7 @@ impl Default for ReparserConfig {
 impl Reparser {
     pub(crate) fn init(root: RedNode, alloc: TreeAllocRef, parser: Parser) -> Self {
         Self {
-            current: Rc::new(root),
+            current: Arc::new(root),
             alloc,
             config: ReparserConfig::default(),
             parser,
@@ -146,14 +146,14 @@ impl Reparser {
         self.replace(start, end, "")
     }
 
-    fn get_context(&mut self, span: Span) -> (Rc<RedNode>, Vec<ZipperStep>, usize) {
+    fn get_context(&mut self, span: Span) -> (Arc<RedNode>, Vec<ZipperStep>, usize) {
         // 1. Ascend to enclose span
         while let Some(parent) = &self.current.parent {
             let width = self.alloc.get_node(self.current.green).width;
             if self.current.offset <= span.start && self.current.offset + width >= span.end {
                 break;
             }
-            self.current = Rc::clone(parent);
+            self.current = Arc::clone(parent);
         }
 
         let focus = self.current.clone();
@@ -176,10 +176,10 @@ impl Reparser {
             }
 
             steps.push(ZipperStep {
-                parent: Rc::clone(parent),
+                parent: Arc::clone(parent),
                 child_idx: found_idx.unwrap_or(0),
             });
-            temp = Rc::clone(parent);
+            temp = Arc::clone(parent);
             level += 1;
         }
 
@@ -641,7 +641,7 @@ impl Reparser {
 
     fn ascend_to_root(&mut self) {
         while let Some(parent) = &self.current.parent {
-            self.current = Rc::clone(parent);
+            self.current = Arc::clone(parent);
         }
     }
 
@@ -670,7 +670,7 @@ impl Reparser {
                             _ => false,
                         })
                 {
-                    Rc::make_mut(&mut self.current).green = child;
+                    Arc::make_mut(&mut self.current).green = child;
                     return;
                 }
             }
@@ -687,7 +687,7 @@ impl Reparser {
             };
 
             if is_placeholder_root || is_duplicate_rule {
-                Rc::make_mut(&mut self.current).green = child;
+                Arc::make_mut(&mut self.current).green = child;
             }
             return;
         }
@@ -706,7 +706,7 @@ impl Reparser {
                     });
 
             if let Some(&child) = valid_child {
-                Rc::make_mut(&mut self.current).green = child;
+                Arc::make_mut(&mut self.current).green = child;
             }
         }
     }
@@ -740,13 +740,13 @@ fn get_cached_root_candidate(
 
 #[derive(Debug, Clone)]
 pub(crate) struct ZipperStep {
-    pub parent: Rc<RedNode>,
+    pub parent: Arc<RedNode>,
     pub child_idx: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct Zipper {
-    pub node: Rc<RedNode>,
+    pub node: Arc<RedNode>,
     pub rule_ix: usize,
     pub offset: usize,
     pub old_width: usize,
@@ -757,7 +757,7 @@ pub(crate) struct Zipper {
 impl Zipper {
     pub fn replace_green(&self, alloc: &TreeAllocRef, new_green: usize) -> ReplaceResult {
         if self.steps.is_empty() {
-            let updated_root = Rc::new(RedNode {
+            let updated_root = Arc::new(RedNode {
                 parent: None,
                 offset: self.offset,
                 green: new_green,
@@ -782,7 +782,7 @@ impl Zipper {
 
         // Only the new root RedNode is needed; the intermediate ancestor chain
         // is not used by callers, so we do not construct it.
-        let root = Rc::new(RedNode {
+        let root = Arc::new(RedNode {
             parent: None,
             offset: self.steps[0].parent.offset,
             green: ancestor_greens[0],
@@ -793,11 +793,11 @@ impl Zipper {
 }
 
 pub struct ReplaceResult {
-    root: Rc<RedNode>,
+    root: Arc<RedNode>,
 }
 
 fn collect_affected_zippers(
-    root: Rc<RedNode>,
+    root: Arc<RedNode>,
     span: Span,
     alloc: &TreeAllocRef,
     parser: &Parser,
@@ -860,7 +860,7 @@ fn collect_affected_zippers(
 }
 
 fn collect_from(
-    node: Rc<RedNode>,
+    node: Arc<RedNode>,
     span: Span,
     alloc: &TreeAllocRef,
     steps: &mut Vec<ZipperStep>,
@@ -1064,7 +1064,7 @@ fn collect_from(
             child_idx,
         });
 
-        let child_node = Rc::new(RedNode {
+        let child_node = Arc::new(RedNode {
             parent: Some(node.clone()),
             offset: child_start,
             green: child_id,
@@ -1113,7 +1113,7 @@ fn collect_from(
                                 child_idx: remaining_idx,
                             });
 
-                            let tail_node = Rc::new(RedNode {
+                            let tail_node = Arc::new(RedNode {
                                 parent: Some(node.clone()),
                                 offset: remaining_start,
                                 green: remaining_id,

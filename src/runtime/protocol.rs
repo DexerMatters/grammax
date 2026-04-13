@@ -98,12 +98,18 @@ pub enum RuntimeError<Err = String> {
     QueueFull,
     ChannelClosed,
     InvalidQuery,
-    InvalidRequest { message: String },
-    InvalidRequestFromTarget { err: Err },
+    InvalidRequest {
+        message: String,
+    },
+    InvalidRequestFromTarget {
+        err: Err,
+    },
     /// The queried resource does not yet exist; demand may resolve it.
     ResourceAbsent,
     UnexpectedRequestType,
-    UndefinedBehavior { message: String },
+    UndefinedBehavior {
+        message: String,
+    },
 }
 
 impl<Err: Display> Display for RuntimeError<Err> {

@@ -14,11 +14,12 @@ use crate::{
 use super::{
     compiler::{ComposedCompiler, SourceResolveHook, TypedTree},
     dispatcher::GlobalEventDispatcher,
-    protocol::RuntimeEvent,
+    protocol::{RuntimeEvent, RuntimeRequest},
 };
 
 pub struct RuntimeService<Tree: TypedTree, Impl = BasicInterface<Tree>> {
     api: Arc<Impl>,
+    shutdown: Option<Box<dyn Fn() + Send + Sync>>,
     _marker: PhantomData<fn() -> Tree>,
 }
 
@@ -60,8 +61,15 @@ where
         if let Ok(mut guard) = resolver_ref.lock() {
             *guard = Arc::downgrade(&api);
         }
+        let shutdown = {
+            let api = Arc::clone(&api);
+            Box::new(move || {
+                let _ = api.ged().request(RuntimeRequest::Shutdown);
+            }) as Box<dyn Fn() + Send + Sync>
+        };
         Self {
             api,
+            shutdown: Some(shutdown),
             _marker: PhantomData,
         }
     }
@@ -79,5 +87,13 @@ impl<Tree: TypedTree, Impl> DerefMut for RuntimeService<Tree, Impl> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         Arc::get_mut(&mut self.api)
             .expect("runtime interface is shared; mutable access is not available")
+    }
+}
+
+impl<Tree: TypedTree, Impl> Drop for RuntimeService<Tree, Impl> {
+    fn drop(&mut self) {
+        if let Some(shutdown) = self.shutdown.take() {
+            shutdown();
+        }
     }
 }

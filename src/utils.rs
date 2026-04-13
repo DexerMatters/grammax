@@ -198,18 +198,6 @@ impl<K: Clone + Eq + std::hash::Hash, V: Clone> LruCache<K, V> {
 
 use std::any::Any;
 
-// ── ForceSync wrapper ─────────────────────────────────────────────────────────
-//
-// Used only by `Payload::new_any` for values that are not Send/Sync (e.g.
-// `TreeAllocRef = Rc<RefCell<...>>`).  The caller guarantees that the payload
-// is only accessed on the thread that created it.
-
-struct ForceSync<T>(T);
-// SAFETY: Payload::new_any callers (e.g. the IR query path) ensure the payload
-// is only materialised and consumed on the single IR worker thread.
-unsafe impl<T> Send for ForceSync<T> {}
-unsafe impl<T> Sync for ForceSync<T> {}
-
 // ── JSON helpers ──────────────────────────────────────────────────────────────
 
 fn json_for<T: serde::Serialize + 'static>(any: &dyn Any) -> serde_json::Value {
@@ -244,22 +232,14 @@ impl Payload {
         }))
     }
     pub fn downcast_ref<T: 'static>(&self) -> Option<&T> {
-        // Direct path (stored via `new`)
-        if let Some(v) = (*self.0.data).downcast_ref::<T>() {
-            return Some(v);
-        }
-        // ForceSync path (stored via `new_any`)
-        (*self.0.data).downcast_ref::<ForceSync<T>>().map(|w| &w.0)
+        (*self.0.data).downcast_ref::<T>()
     }
 
     pub fn downcast<T: 'static>(self) -> Option<T> {
         let Inner { data, .. } = *self.0;
         // Coerce Box<dyn Any + Send + Sync> → Box<dyn Any> to access downcast().
         let data: Box<dyn Any> = data;
-        match data.downcast::<T>() {
-            Ok(boxed) => Some(*boxed),
-            Err(data) => data.downcast::<ForceSync<T>>().ok().map(|b| b.0),
-        }
+        data.downcast::<T>().ok().map(|boxed| *boxed)
     }
 
     pub fn to_json(&self) -> serde_json::Value {

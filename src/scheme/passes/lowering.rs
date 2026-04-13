@@ -164,12 +164,12 @@ impl<'a> AstMapCtx<'a> {
 
     /// Type-erase and emit `value` as the AST result for this CST node.
     ///
-    /// Works for *any* `Debug + Clone + PartialEq + Send + 'static` type.
+    /// Works for *any* `Debug + Clone + PartialEq + Send + Sync + 'static` type.
     /// In a heterogeneous mapper you can call `ctx.emit(Expr::Num(1))` in
     /// one handler and `ctx.emit(Type::Int)` in another.
     pub fn emit<V>(&self, value: V) -> AstMapIntent
     where
-        V: fmt::Debug + Clone + PartialEq + Send + 'static,
+        V: fmt::Debug + Clone + PartialEq + Send + Sync + 'static,
     {
         AstMapIntent::emit(AstMapAny::new(value))
     }
@@ -705,6 +705,26 @@ impl scheme::Pass<ParseTreeIR, AstArena<AstMapAny>> for IncrementalLowerer {
             return Vec::new();
         }
         commands
+    }
+
+    fn resolve(
+        &mut self,
+        upstream: &LayerObserver<ParseTreeIR>,
+        downstream: &AstArena<AstMapAny>,
+        index: DocumentNodePath,
+    ) -> scheme::ResolveOutcome<AstArena<AstMapAny>> {
+        let probe = vec![scheme::Command::Replace {
+            index: index.clone(),
+            id: usize::MAX,
+        }];
+        let queried = QueriedParseTree::new(upstream);
+        let commands = self.apply_from_queries(&queried, &index.0, downstream, &probe);
+        match queried.take_failure() {
+            Some(true) => scheme::ResolveOutcome::Blocked,
+            Some(false) => scheme::ResolveOutcome::Impossible,
+            None if commands.is_empty() => scheme::ResolveOutcome::Impossible,
+            None => scheme::ResolveOutcome::Done(Arc::new(commands)),
+        }
     }
 }
 
